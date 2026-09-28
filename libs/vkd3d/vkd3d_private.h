@@ -7206,7 +7206,7 @@ static inline void vkd3d_mapped_memory_range_align(const struct d3d12_device *de
 /* device_workarounds.c */
 void vkd3d_instance_apply_application_workarounds(void);
 void vkd3d_instance_deduce_config_flags_from_environment(void);
-/* For the module that embeds libvkd3d (bc250vkd3d.dll); see device.c. */
+/* For the module that embeds libvkd3d (amdgpu_wddm_vkd3d.dll); see device.c. */
 void vkd3d_config_set_embedder_defaults(const char *config);
 void vkd3d_instance_apply_global_shader_quirks(void);
 void vkd3d_physical_device_info_apply_workarounds(struct vkd3d_physical_device_info *info, struct d3d12_device *device);

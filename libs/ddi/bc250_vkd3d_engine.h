@@ -2,7 +2,8 @@
  *
  * bc250_vkd3d_engine.h - boundary between the BC-250 system D3D12 user-mode driver ("shell", the D3D12 UMD
  * that the Microsoft runtime opens through OpenAdapter12) and its vkd3d-proton engine ("engine",
- * bc250vkd3d.dll, vkd3d-proton fork branch amdgpu-wddm/ddi-engine).
+ * amdgpu_wddm_vkd3d.dll, vkd3d-proton fork branch amdgpu-wddm/ddi-engine). The DLL was bc250vkd3d.dll before
+ * its file names took the project's amdgpu_wddm prefix; code identifiers keep their BC250 names.
  *
  * Revision r1, ABI 1.0. This file in the vkd3d-proton fork is the only copy; the shell includes it from the
  * fork checkout it builds against. vkd3d-proton is LGPL-2.1 and stays a separately loaded DLL; this header

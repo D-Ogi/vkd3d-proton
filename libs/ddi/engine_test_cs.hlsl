@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Compute shader of bc250vkd3d_engine_test: fills a raw UAV reached through a shader-visible descriptor table.
+// Compute shader of amdgpu_wddm_vkd3d_engine_test: fills a raw UAV reached through a shader-visible
+// descriptor table.
 // The root signature is embedded (RTS0 part of the DXIL container), so the test needs no serializer from the
 // system d3d12.dll. engine_test_cs.h is generated from this file (dxc from the Windows SDK 10.0.26100,
 // 1.8.2502.11):

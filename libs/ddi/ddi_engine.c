@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * bc250vkd3d.dll: vkd3d-proton as the engine behind the BC-250 system D3D12 user-mode driver.
+ * amdgpu_wddm_vkd3d.dll: vkd3d-proton as the engine behind the BC-250 system D3D12 user-mode driver.
  * The contract is bc250_vkd3d_engine.h; this file only adapts it to vkd3d-proton's public create path
  * (vkd3d_create_instance, vkd3d_create_device), the same path d3d12core.dll takes, without the DXGI
  * adapter lookup, the Vulkan loader and the WSI extensions: the shell owns adapter, driver and present.

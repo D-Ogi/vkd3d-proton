@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  *
- * bc250vkd3d_engine_test: checks bc250vkd3d.dll (bc250_vkd3d_engine.h, ABI 1.0) on its own, the way the
- * D3D12 shell will use it, without the Microsoft runtime:
+ * amdgpu_wddm_vkd3d_engine_test: checks amdgpu_wddm_vkd3d.dll (bc250_vkd3d_engine.h, ABI 1.0) on its own, the
+ * way the D3D12 shell will use it, without the Microsoft runtime:
  *   - the export and its version rules (E_NOINTERFACE, E_INVALIDARG);
  *   - CreateDevice over a caller-supplied Vulkan entry point, adapter chosen by LUID (V1, V2), an unknown LUID
  *     refused, two calls giving two devices (independent);
@@ -12,7 +12,8 @@
  *     shader-visible descriptor table at start + 3 * increment, word-exact compare; the handles are printed;
  *   - teardown: the device's final Release returns 0 (V4).
  *
- * Usage: bc250vkd3d_engine_test.exe <path to bc250vkd3d.dll> [adapter substring] [--icd <path>] [--fl <hex>]
+ * Usage: amdgpu_wddm_vkd3d_engine_test.exe <path to amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]
+ *        [--fl <hex>]
  *   adapter substring  picks the DXGI adapter whose description contains it (default: first hardware adapter)
  *   --icd              loads that Vulkan driver DLL directly (entry vk_icdGetInstanceProcAddr), as the shell
  *                      loads hosted RADV, instead of the Vulkan loader (vulkan-1.dll)
@@ -492,7 +493,8 @@ int main(int argc, char **argv)
 
     if (argc < 2)
     {
-        printf("usage: bc250vkd3d_engine_test <bc250vkd3d.dll> [adapter substring] [--icd <path>] [--fl <hex>]\n");
+        printf("usage: amdgpu_wddm_vkd3d_engine_test <amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]"
+                " [--fl <hex>]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);

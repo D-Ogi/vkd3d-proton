@@ -597,8 +597,8 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
 };
 
 /* Config defaults of the module that embeds libvkd3d, in VKD3D_CONFIG syntax, added to VKD3D_CONFIG before the
- * environment is deduced. d3d12core.dll never sets them; bc250vkd3d.dll (libs/ddi) sets them once, before its
- * first vkd3d_create_instance. Setting them after the flags were initialized changes nothing. */
+ * environment is deduced. d3d12core.dll never sets them; amdgpu_wddm_vkd3d.dll (libs/ddi) sets them once,
+ * before its first vkd3d_create_instance. Setting them after the flags were initialized changes nothing. */
 static char vkd3d_config_embedder_defaults[VKD3D_PATH_MAX];
 
 void vkd3d_config_set_embedder_defaults(const char *config)
