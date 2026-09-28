@@ -2271,6 +2271,55 @@ static void vkd3d_trace_physical_device_features(const struct vkd3d_physical_dev
     TRACE("    micromap: %#x\n", info->opacity_micromap_features.micromap);
 }
 
+/* Optional device extensions that extend VK_KHR_swapchain. d3d12core always enables VK_KHR_swapchain, but an
+ * embedder without WSI does not, and enabling any of these without it is invalid
+ * (VUID-vkCreateDevice-ppEnabledExtensionNames-01387). NV_low_latency2 needs one of the present_id extensions,
+ * so it goes with them. */
+static uint32_t vkd3d_disable_swapchain_extensions(struct vkd3d_vulkan_info *vulkan_info,
+        const struct vkd3d_device_create_info *create_info, const bool *user_extension_supported)
+{
+    static const ptrdiff_t swapchain_extension_offsets[] =
+    {
+        offsetof(struct vkd3d_vulkan_info, KHR_present_mode_fifo_latest_ready),
+        offsetof(struct vkd3d_vulkan_info, KHR_present_id),
+        offsetof(struct vkd3d_vulkan_info, KHR_present_wait),
+        offsetof(struct vkd3d_vulkan_info, KHR_present_id2),
+        offsetof(struct vkd3d_vulkan_info, KHR_present_wait2),
+        offsetof(struct vkd3d_vulkan_info, EXT_present_timing),
+        offsetof(struct vkd3d_vulkan_info, EXT_hdr_metadata),
+        offsetof(struct vkd3d_vulkan_info, NV_low_latency2),
+    };
+    uint32_t disabled_count = 0;
+    unsigned int i;
+    bool *enabled;
+
+    for (i = 0; i < create_info->device_extension_count; ++i)
+    {
+        if (!strcmp(create_info->device_extensions[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+            return 0;
+    }
+    for (i = 0; i < create_info->optional_device_extension_count; ++i)
+    {
+        if (user_extension_supported[i] &&
+                !strcmp(create_info->optional_device_extensions[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+            return 0;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(swapchain_extension_offsets); ++i)
+    {
+        enabled = (void *)((uintptr_t)vulkan_info + swapchain_extension_offsets[i]);
+        if (*enabled)
+        {
+            *enabled = false;
+            ++disabled_count;
+        }
+    }
+
+    if (disabled_count)
+        INFO("VK_KHR_swapchain is not enabled, not enabling %u extensions that depend on it.\n", disabled_count);
+    return disabled_count;
+}
+
 static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
         const struct vkd3d_device_create_info *create_info,
         uint32_t *device_extension_count, bool *user_extension_supported)
@@ -2310,6 +2359,7 @@ static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
             create_info->optional_device_extensions,
             create_info->optional_device_extension_count,
             user_extension_supported, vulkan_info, "device");
+    *device_extension_count -= vkd3d_disable_swapchain_extensions(vulkan_info, create_info, user_extension_supported);
 
     if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
         vulkan_info->EXT_vertex_attribute_divisor = false;
