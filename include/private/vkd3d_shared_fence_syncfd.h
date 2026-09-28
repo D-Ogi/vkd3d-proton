@@ -31,7 +31,7 @@ kmt_handle kmt_device_create_fence(kmt_device device, uint64_t initial_value);
 void kmt_device_destroy_fence(kmt_device device, kmt_handle fence);
 
 /* ID3D12Fence::Signal() */
-bool kmt_device_register_signal_immediate(kmt_device device, kmt_handle fence, uint64_t value);
+void kmt_device_signal_fence_immediate(kmt_device device, kmt_handle fence, uint64_t value);
 
 /* Called after a submit. Signal a binary semaphore, then export SYNC_FD payload. */
 bool kmt_device_register_sync_file(kmt_device device, kmt_handle fence, int fd, uint64_t value);
