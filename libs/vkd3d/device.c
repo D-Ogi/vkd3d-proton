@@ -11093,34 +11093,52 @@ static HRESULT d3d12_device_validate_inline_mode(const struct vkd3d_device_creat
     return S_OK;
 }
 
+/* RenderDoc does not support multiple VkDevices active.
+ * The independent devices APIs exposes this scenario. */
+static bool d3d12_device_renderdoc_forces_singletons(void)
+{
+    char env[64];
+
+    return vkd3d_get_env_var("ENABLE_VULKAN_RENDERDOC_CAPTURE", env, sizeof(env)) && strcmp(env, "1") == 0;
+}
+
+/* amdgpu-wddm fork: a device in the inline queue mode or on a private instance belongs to one embedder. A singleton
+ * would share the embedder's queue callbacks or instance with every caller. vkd3d_create_adapter_caps() refuses
+ * the same. */
+static HRESULT d3d12_device_validate_single_owner(struct vkd3d_instance *instance,
+        const struct vkd3d_device_create_info *create_info)
+{
+    if (!create_info->inline_queue_callbacks && !instance->private_instance)
+        return S_OK;
+
+    if (!create_info->independent || d3d12_device_renderdoc_forces_singletons())
+    {
+        WARN("Inline queue mode and private instances cannot use a singleton device.\n");
+        return E_INVALIDARG;
+    }
+
+    return S_OK;
+}
+
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
         const struct vkd3d_device_create_info *create_info, struct d3d12_device **device)
 {
     bool reject_existing_device = false;
     bool forced_singletons = false;
     struct d3d12_device *object;
-    char env[64];
     HRESULT hr;
 
     if (create_info->inline_queue_callbacks && FAILED(hr = d3d12_device_validate_inline_mode(create_info)))
         return hr;
+    if (FAILED(hr = d3d12_device_validate_single_owner(instance, create_info)))
+        return hr;
 
     if (create_info->independent)
     {
-        /* RenderDoc does not support multiple VkDevices active.
-         * The independent devices APIs exposes this scenario. */
-        forced_singletons = vkd3d_get_env_var("ENABLE_VULKAN_RENDERDOC_CAPTURE", env, sizeof(env)) &&
-                strcmp(env, "1") == 0;
+        forced_singletons = d3d12_device_renderdoc_forces_singletons();
 
         if (forced_singletons)
             INFO("Forcing singleton device due to RenderDoc being enabled.\n");
-
-        /* A singleton would share one embedder's queue callbacks with every caller. */
-        if (forced_singletons && create_info->inline_queue_callbacks)
-        {
-            WARN("Inline queue mode cannot use a singleton device.\n");
-            return E_INVALIDARG;
-        }
 
         if (forced_singletons &&
             (create_info->device_factory_flags &
@@ -11543,6 +11561,11 @@ HRESULT vkd3d_create_adapter_caps(const struct vkd3d_device_create_info *create_
     {
         WARN("Failed to create instance, hr %#x.\n", (int)hr);
         return E_FAIL;
+    }
+    if (FAILED(hr = d3d12_device_validate_single_owner(instance, create_info)))
+    {
+        vkd3d_instance_decref(instance);
+        return hr;
     }
 
     if (!(object = vkd3d_calloc(1, sizeof(*object))) || !(device = vkd3d_malloc_aligned(sizeof(*device), 64)))
