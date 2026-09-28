@@ -26683,16 +26683,6 @@ static HRESULT d3d12_command_queue_inline_init(struct d3d12_command_queue *queue
     if (FAILED(hr = d3d12_command_queue_transition_pool_init(queue->inline_transition_pool, queue)))
         goto fail;
 
-    pthread_mutex_lock(&device->inline_mutex);
-    if (!vkd3d_array_reserve((void **)&device->inline_command_queues, &device->inline_command_queue_size,
-            device->inline_command_queue_count + 1, sizeof(*device->inline_command_queues)))
-    {
-        pthread_mutex_unlock(&device->inline_mutex);
-        hr = E_OUTOFMEMORY;
-        goto fail;
-    }
-    pthread_mutex_unlock(&device->inline_mutex);
-
     /* The VkQueue is ours alone (d3d12_device_allocate_vkd3d_queue); bind it before any submission. */
     if (FAILED(hr = device->inline_callbacks.pfn_bind_queue(device->inline_callbacks.userdata,
             queue->inline_cookie, queue->vkd3d_queue->vk_queue)))
@@ -26702,7 +26692,20 @@ static HRESULT d3d12_command_queue_inline_init(struct d3d12_command_queue *queue
     }
     queue->vkd3d_queue->inline_bound = true;
 
+    /* Grow and append in one critical section, since queues can be created on several threads at once.
+     * BindQueue is the embedder's callback and runs before it, outside inline_mutex, which every
+     * retirement takes. */
     pthread_mutex_lock(&device->inline_mutex);
+    if (!vkd3d_array_reserve((void **)&device->inline_command_queues, &device->inline_command_queue_size,
+            device->inline_command_queue_count + 1, sizeof(*device->inline_command_queues)))
+    {
+        pthread_mutex_unlock(&device->inline_mutex);
+        device->inline_callbacks.pfn_unbind_queue(device->inline_callbacks.userdata,
+                queue->inline_cookie, queue->vkd3d_queue->vk_queue);
+        queue->vkd3d_queue->inline_bound = false;
+        hr = E_OUTOFMEMORY;
+        goto fail;
+    }
     device->inline_command_queues[device->inline_command_queue_count++] = queue;
     pthread_mutex_unlock(&device->inline_mutex);
     return S_OK;
