@@ -10721,7 +10721,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     {
         ERR("Failed to initialize mutex, error %d.\n", rc);
         hr = hresult_from_errno(rc);
-        goto out_free_instance;
+        goto out_free_inline_mutex;
     }
 
     spinlock_init(&device->low_latency_swapchain_spinlock);
@@ -10910,16 +10910,17 @@ out_free_vk_resources:
     d3d12_device_destroy_vkd3d_queues(device);
     vk_procs = &device->vk_procs;
     VK_CALL(vkDestroyDevice(device->vk_device, NULL));
-out_free_instance:
-    vkd3d_instance_decref(device->vkd3d_instance);
 out_free_fragment_output_lock:
     rwlock_destroy(&device->fragment_output_lock);
 out_free_vertex_input_lock:
     rwlock_destroy(&device->vertex_input_lock);
 out_free_mutex:
     pthread_mutex_destroy(&device->mutex);
+out_free_inline_mutex:
     if (device->inline_queues)
         pthread_mutex_destroy(&device->inline_mutex);
+out_free_instance:
+    vkd3d_instance_decref(device->vkd3d_instance);
     return hr;
 }
 
