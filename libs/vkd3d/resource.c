@@ -11217,6 +11217,26 @@ static uint32_t vkd3d_memory_info_filter_sysmem_memory_types(struct d3d12_device
     return result_mask;
 }
 
+/* amdgpu-wddm fork: the decisions of vkd3d_memory_info_init() that need the physical device only. An object of
+ * vkd3d_create_adapter_caps() runs this part alone, so that has_gpu_upload_heap, which the capability policy
+ * reads, comes from the same code in both. */
+void vkd3d_memory_info_init_policy(struct vkd3d_memory_info *info,
+        struct d3d12_device *device)
+{
+    struct vkd3d_memory_topology topology;
+    bool is_hvv_use_allowed;
+
+    vkd3d_memory_info_get_topology(&topology, device);
+    is_hvv_use_allowed = vkd3d_memory_info_decide_hvv_usage(&topology, device);
+    info->upload_heap_memory_properties =
+            vkd3d_memory_info_upload_hvv_memory_properties(&topology, device, is_hvv_use_allowed);
+    info->has_gpu_upload_heap = vkd3d_memory_info_decide_gpu_upload_heap(is_hvv_use_allowed);
+    info->descriptor_heap_memory_properties =
+            vkd3d_memory_info_descriptor_heap_memory_properties(&topology, device);
+    vkd3d_memory_info_init_budgets(info, &topology, device);
+    info->has_used_gpu_upload_heap = 0;
+}
+
 HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
         struct d3d12_device *device)
 {
@@ -11231,18 +11251,11 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     uint32_t host_visible_mask;
     uint32_t buffer_type_mask;
     uint32_t rt_ds_type_mask;
-    bool is_hvv_use_allowed;
     uint32_t i;
 
+    vkd3d_memory_info_init_policy(info, device);
+    /* The fallback domain below needs the topology again; computing it is free of side effects. */
     vkd3d_memory_info_get_topology(&topology, device);
-    is_hvv_use_allowed = vkd3d_memory_info_decide_hvv_usage(&topology, device);
-    info->upload_heap_memory_properties =
-            vkd3d_memory_info_upload_hvv_memory_properties(&topology, device, is_hvv_use_allowed);
-    info->has_gpu_upload_heap = vkd3d_memory_info_decide_gpu_upload_heap(is_hvv_use_allowed);
-    info->descriptor_heap_memory_properties =
-            vkd3d_memory_info_descriptor_heap_memory_properties(&topology, device);
-    vkd3d_memory_info_init_budgets(info, &topology, device);
-    info->has_used_gpu_upload_heap = 0;
 
     if (pthread_mutex_init(&info->budget_lock, NULL) != 0)
         return E_OUTOFMEMORY;
@@ -11372,12 +11385,10 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     return S_OK;
 }
 
-HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffer *global_descriptor_buffer,
-        struct d3d12_device *device)
+/* amdgpu-wddm fork: the decision part of vkd3d_global_descriptor_buffer_init(), which needs the physical device
+ * only; an object of vkd3d_create_adapter_caps() makes it without allocating the buffers. */
+bool vkd3d_global_descriptor_buffer_is_used(struct d3d12_device *device)
 {
-    VkBufferUsageFlags2KHR vk_usage_flags;
-    HRESULT hr;
-
     bool requires_offset_buffer = device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment > 4;
     bool uses_ssbo = device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment <= 16;
     if (!uses_ssbo)
@@ -11390,7 +11401,7 @@ HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffe
             !device->device_info.descriptor_buffer_features.descriptorBufferPushDescriptors ||
             !device->device_info.vulkan_1_2_features.shaderUniformBufferArrayNonUniformIndexing ||
             requires_offset_buffer)
-        return S_OK;
+        return false;
 
     if (device->device_info.mutable_descriptor_features.mutableDescriptorType)
     {
@@ -11416,9 +11427,21 @@ HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffe
                 required_resource_descriptors * mutable_desc_size)
         {
             INFO("Small descriptor heap detected, falling back to MUTABLE_SINGLE_SET.\n");
-            return S_OK;
+            return false;
         }
     }
+
+    return true;
+}
+
+HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffer *global_descriptor_buffer,
+        struct d3d12_device *device)
+{
+    VkBufferUsageFlags2KHR vk_usage_flags;
+    HRESULT hr;
+
+    if (!vkd3d_global_descriptor_buffer_is_used(device))
+        return S_OK;
 
     vk_usage_flags = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -11448,6 +11471,8 @@ HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffe
     global_descriptor_buffer->resource.va =
             vkd3d_get_buffer_device_address(device, global_descriptor_buffer->resource.vk_buffer);
     global_descriptor_buffer->resource.usage = vk_usage_flags;
+    /* From here on, as when the predicate read this VA. */
+    global_descriptor_buffer->enabled = true;
 
     vk_usage_flags = VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;

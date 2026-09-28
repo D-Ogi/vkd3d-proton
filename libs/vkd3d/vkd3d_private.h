@@ -4123,6 +4123,9 @@ void vkd3d_sampler_state_free_descriptor_set(struct vkd3d_sampler_state *state,
 
 struct vkd3d_global_descriptor_buffer
 {
+    /* Decided by vkd3d_global_descriptor_buffer_is_used() from the physical device; the device uses
+     * descriptor buffers exactly when this is set (d3d12_device_uses_descriptor_buffers). */
+    bool enabled;
     struct
     {
         VkBuffer vk_buffer;
@@ -4132,6 +4135,7 @@ struct vkd3d_global_descriptor_buffer
     } resource, sampler;
 };
 
+bool vkd3d_global_descriptor_buffer_is_used(struct d3d12_device *device);
 HRESULT vkd3d_global_descriptor_buffer_init(struct vkd3d_global_descriptor_buffer *global_descriptor_buffer,
         struct d3d12_device *device);
 void vkd3d_global_descriptor_buffer_cleanup(struct vkd3d_global_descriptor_buffer *global_descriptor_buffer,
@@ -4626,6 +4630,8 @@ struct vkd3d_bindless_state
     } heap;
 };
 
+HRESULT vkd3d_bindless_state_init_caps(struct vkd3d_bindless_state *bindless_state,
+        struct d3d12_device *device);
 HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
         struct d3d12_device *device);
 void vkd3d_bindless_state_cleanup(struct vkd3d_bindless_state *bindless_state,
@@ -4710,6 +4716,8 @@ struct vkd3d_memory_info
     uint32_t has_used_gpu_upload_heap;
 };
 
+void vkd3d_memory_info_init_policy(struct vkd3d_memory_info *info,
+        struct d3d12_device *device);
 HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
         struct d3d12_device *device);
 void vkd3d_memory_info_cleanup(struct vkd3d_memory_info *info,
@@ -6057,7 +6065,7 @@ VkPipelineStageFlags2 vk_queue_shader_stages(struct d3d12_device *device, VkQueu
 
 static inline bool d3d12_device_uses_descriptor_buffers(const struct d3d12_device *device)
 {
-    return device->global_descriptor_buffer.resource.va != 0;
+    return device->global_descriptor_buffer.enabled;
 }
 
 static inline bool is_cpu_accessible_heap(const D3D12_HEAP_PROPERTIES *properties)

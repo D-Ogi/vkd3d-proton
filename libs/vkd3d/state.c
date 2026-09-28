@@ -8333,7 +8333,10 @@ fail:
     return hr;
 }
 
-HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
+/* amdgpu-wddm fork: the part of vkd3d_bindless_state_init() that needs the physical device only, the part the
+ * capability policy reads: S_OK when the descriptor heap path is taken (VKD3D_BINDLESS_HEAP), S_FALSE when
+ * the legacy path would be. */
+static HRESULT vkd3d_bindless_state_init_policy(struct vkd3d_bindless_state *bindless_state,
         struct d3d12_device *device)
 {
     const struct vkd3d_physical_device_info *device_info = &device->device_info;
@@ -8353,6 +8356,28 @@ HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
     }
 
     if (SUCCEEDED(vkd3d_bindless_state_init_heap(bindless_state, device)))
+        return S_OK;
+    return S_FALSE;
+}
+
+/* An object of vkd3d_create_adapter_caps() stops here: the legacy path creates descriptor set layouts, and no
+ * capability answer depends on its flags (only d3d12_device_use_descriptor_heap() is read). */
+HRESULT vkd3d_bindless_state_init_caps(struct vkd3d_bindless_state *bindless_state,
+        struct d3d12_device *device)
+{
+    HRESULT hr = vkd3d_bindless_state_init_policy(bindless_state, device);
+
+    return FAILED(hr) ? hr : S_OK;
+}
+
+HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
+        struct d3d12_device *device)
+{
+    HRESULT hr;
+
+    if (FAILED(hr = vkd3d_bindless_state_init_policy(bindless_state, device)))
+        return hr;
+    if (hr == S_OK)
         return S_OK;
     return vkd3d_bindless_state_init_legacy(bindless_state, device);
 }
