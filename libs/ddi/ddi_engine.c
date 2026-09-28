@@ -130,20 +130,58 @@ static bool bc250_abi_served(UINT32 version)
             && (version & 0xffffu) <= BC250_VKD3D_ENGINE_ABI_MINOR;
 }
 
+/* Sizes, fields included, up to which a 1.1 structure is read (V7). */
+#define BC250_DEVICE_CREATE_INFO_SIZE_1_1 \
+        ((UINT32)(FIELD_OFFSET(BC250_VKD3D_DEVICE_CREATE_INFO, Services) + sizeof(const BC250_VKD3D_SHELL_SERVICES *)))
+#define BC250_SHELL_SERVICES_SIZE_1_1 \
+        ((UINT32)(FIELD_OFFSET(BC250_VKD3D_SHELL_SERVICES, UnbindQueue) + sizeof(void *)))
+#define BC250_COMMAND_QUEUE_DESC_SIZE_1_1 \
+        ((UINT32)(FIELD_OFFSET(BC250_VKD3D_COMMAND_QUEUE_DESC, NodeMask) + sizeof(UINT32)))
+
 static HRESULT APIENTRY bc250_create_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, REFIID riid, void **device)
 {
     struct vkd3d_instance_create_info instance_create_info;
     struct vkd3d_device_create_info device_create_info;
+    struct vkd3d_inline_queue_callbacks inline_callbacks;
+    const BC250_VKD3D_SHELL_SERVICES *services = NULL;
+    UINT32 queue_mode = BC250_VKD3D_QUEUE_MODE_THREADED;
     struct vkd3d_instance *instance;
     VkPhysicalDevice vk_physical_device;
     HRESULT hr;
 
     if (device)
         *device = NULL;
-    if (!info || !riid || !device || info->Size < sizeof(*info) || !info->GetInstanceProcAddr)
+    /* A 1.0 shell passes the 1.0 structure: compare with its size, not with this header's. */
+    if (!info || !riid || !device || info->Size < BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_0 || !info->GetInstanceProcAddr)
         return E_INVALIDARG;
     if (!bc250_abi_served(info->AbiVersion))
         return E_NOINTERFACE;
+
+    /* 1.1 fields: only when the structure has them and the shell requires 1.1. */
+    if ((info->AbiVersion & 0xffffu) >= 1 && info->Size >= BC250_DEVICE_CREATE_INFO_SIZE_1_1)
+    {
+        queue_mode = info->QueueMode;
+        services = info->Services;
+    }
+
+    switch (queue_mode)
+    {
+        case BC250_VKD3D_QUEUE_MODE_THREADED:
+            break;
+
+        case BC250_VKD3D_QUEUE_MODE_INLINE:
+            if (!services || services->Size < BC250_SHELL_SERVICES_SIZE_1_1
+                    || !services->BindQueue || !services->UnbindQueue)
+            {
+                WARN("The inline queue mode needs Services with BindQueue and UnbindQueue.\n");
+                return E_INVALIDARG;
+            }
+            break;
+
+        default:
+            WARN("Unknown queue mode %u.\n", queue_mode);
+            return E_INVALIDARG;
+    }
 
     InitOnceExecuteOnce(&bc250_config_once, bc250_set_config_defaults, NULL, NULL);
 
@@ -172,6 +210,15 @@ static HRESULT APIENTRY bc250_create_device(const BC250_VKD3D_DEVICE_CREATE_INFO
     device_create_info.adapter_luid = info->AdapterLuid;
     device_create_info.independent = true;
 
+    /* V7: the shell's services have the calling convention of libvkd3d's callbacks (vkd3d.h). */
+    if (queue_mode == BC250_VKD3D_QUEUE_MODE_INLINE)
+    {
+        inline_callbacks.userdata = services->Shell;
+        inline_callbacks.pfn_bind_queue = (PFN_vkd3d_bind_queue)services->BindQueue;
+        inline_callbacks.pfn_unbind_queue = (PFN_vkd3d_unbind_queue)services->UnbindQueue;
+        device_create_info.inline_queue_callbacks = &inline_callbacks;
+    }
+
     hr = vkd3d_create_device(&device_create_info, riid, device);
     /* The device holds its own reference to the instance. */
     vkd3d_instance_decref(instance);
@@ -181,21 +228,45 @@ static HRESULT APIENTRY bc250_create_device(const BC250_VKD3D_DEVICE_CREATE_INFO
     return hr;
 }
 
+static HRESULT APIENTRY bc250_create_command_queue(void *device, const BC250_VKD3D_COMMAND_QUEUE_DESC *desc,
+        void *queueCookie, REFIID riid, void **queue)
+{
+    D3D12_COMMAND_QUEUE_DESC d3d12_desc;
+
+    if (queue)
+        *queue = NULL;
+    if (!device || !desc || !riid || !queue || desc->Size < BC250_COMMAND_QUEUE_DESC_SIZE_1_1)
+        return E_INVALIDARG;
+
+    d3d12_desc.Type = (D3D12_COMMAND_LIST_TYPE)desc->Type;
+    d3d12_desc.Priority = desc->Priority;
+    d3d12_desc.Flags = (D3D12_COMMAND_QUEUE_FLAGS)desc->Flags;
+    d3d12_desc.NodeMask = desc->NodeMask;
+
+    /* E_INVALIDARG for a device in another mode or an unsupported type. */
+    return vkd3d_create_inline_command_queue((ID3D12Device *)device, &d3d12_desc, queueCookie, riid, queue);
+}
+
 HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_FUNCS *funcs)
 {
     BC250_VKD3D_ENGINE_FUNCS out;
+    UINT32 size;
 
-    if (!funcs || funcs->Size < sizeof(out))
+    /* A 1.0 shell passes the 1.0 structure: compare with its size, not with this header's. */
+    if (!funcs || funcs->Size < BC250_VKD3D_ENGINE_FUNCS_SIZE_1_0)
         return E_INVALIDARG;
     if (!bc250_abi_served(abiVersion))
         return E_NOINTERFACE;
 
+    size = funcs->Size;
     memset(&out, 0, sizeof(out));
-    out.Size = funcs->Size;
+    out.Size = size;
     out.AbiVersion = BC250_VKD3D_ENGINE_ABI_VERSION;
     out.CreateDevice = bc250_create_device;
-    /* 1.0 is the whole structure; a larger caller structure keeps its zeroed tail. */
-    memset(funcs, 0, funcs->Size);
-    memcpy(funcs, &out, sizeof(out));
+    out.CreateCommandQueue = bc250_create_command_queue;
+    /* Fill at most Size bytes: a 1.0 structure ends before CreateCommandQueue, a larger one keeps its
+     * zeroed tail. */
+    memset(funcs, 0, size);
+    memcpy(funcs, &out, size < sizeof(out) ? size : sizeof(out));
     return S_OK;
 }
