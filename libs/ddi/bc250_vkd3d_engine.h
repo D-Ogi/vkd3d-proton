@@ -161,7 +161,9 @@ typedef struct BC250_VKD3D_DEVICE_CREATE_INFO
     PFN_vkGetInstanceProcAddr GetInstanceProcAddr; /* V1: hosted RADV's entry, possibly a shell wrapper */
     LUID AdapterLuid;                              /* V2 */
     UINT32 MinimumFeatureLevel;                    /* a D3D_FEATURE_LEVEL; CreateDevice fails below it */
-    /* 1.1: read only when Size covers them and AbiVersion is 1.1 or later. */
+    /* 1.1: read only when Size covers them and AbiVersion is 1.1 or later. One exception: a Size that covers
+     * them, AbiVersion 1.0 and QueueMode INLINE is E_INVALIDARG, because INLINE is 1.1; below 1.1 other
+     * values are ignored and the device is THREADED. */
     UINT32 QueueMode;                              /* BC250_VKD3D_QUEUE_MODE_*; other values: E_INVALIDARG */
     const BC250_VKD3D_SHELL_SERVICES *Services;    /* INLINE: required, BindQueue and UnbindQueue non-NULL */
 } BC250_VKD3D_DEVICE_CREATE_INFO;

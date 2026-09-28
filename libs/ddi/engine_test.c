@@ -17,7 +17,8 @@
  *   - one GPU round trip: UPLOAD -> DEFAULT -> READBACK copy on a direct queue, fence wait, word-exact compare;
  *   - one compute dispatch: DXIL cs_6_0 with an embedded root signature writes a raw UAV reached through a
  *     shader-visible descriptor table at start + 3 * increment, word-exact compare; the handles are printed;
- *   - AbiVersion 1.0 with a 1.1-sized CreateInfo asking for INLINE, and 1.1 asking for THREADED: both THREADED;
+ *   - AbiVersion 1.0 with a 1.1-sized CreateInfo: INLINE refused, QueueMode 7 ignored (THREADED); 1.1 asking
+ *     for THREADED: THREADED;
  *   - teardown: the device's final Release returns 0 (V4).
  * --inline, ABI 1.1 and the INLINE queue mode (V7, V8), with a logging BindQueue/UnbindQueue:
  *   - thread census (Toolhelp32 snapshot, start address from NtQueryInformationThread): no thread of the
@@ -1390,18 +1391,25 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
     printf("device final Release: %lu\n", refs);
     check(refs == 0, "device final Release returns 0");
 
-    /* The 1.1 fields count only from AbiVersion 1.1: a 1.0 shell with a larger structure gets THREADED. */
+    /* INLINE is 1.1: asking for it with AbiVersion 1.0 fails and creates nothing. */
     info = *base;
     info.Size = sizeof(info);
     info.AbiVersion = ABI_1_0;
     info.QueueMode = BC250_VKD3D_QUEUE_MODE_INLINE;
     info.Services = NULL;
+    other = (ID3D12Device *)(void *)1;
+    check(funcs->CreateDevice(&info, &IID_ID3D12Device, (void **)&other) == E_INVALIDARG && !other,
+            "AbiVersion 1.0 with a 1.1-sized CreateInfo asking for INLINE -> E_INVALIDARG, no device");
+
+    /* Other QueueMode values count only from AbiVersion 1.1: below it, the device is THREADED. */
+    info.QueueMode = 7;
     memset(&queue_desc, 0, sizeof(queue_desc));
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    other = NULL;
     queue = NULL;
     check(SUCCEEDED(funcs->CreateDevice(&info, &IID_ID3D12Device, (void **)&other)) && other
             && SUCCEEDED(ID3D12Device_CreateCommandQueue(other, &queue_desc, &IID_ID3D12CommandQueue, (void **)&queue)),
-            "AbiVersion 1.0 with a 1.1-sized CreateInfo asking for INLINE: a THREADED device");
+            "AbiVersion 1.0 with a 1.1-sized CreateInfo and QueueMode 7: a THREADED device");
     if (queue)
         ID3D12CommandQueue_Release(queue);
     if (other)

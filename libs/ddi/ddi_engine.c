@@ -157,11 +157,21 @@ static HRESULT APIENTRY bc250_create_device(const BC250_VKD3D_DEVICE_CREATE_INFO
     if (!bc250_abi_served(info->AbiVersion))
         return E_NOINTERFACE;
 
-    /* 1.1 fields: only when the structure has them and the shell requires 1.1. */
-    if ((info->AbiVersion & 0xffffu) >= 1 && info->Size >= BC250_DEVICE_CREATE_INFO_SIZE_1_1)
+    /* 1.1 fields: only when the structure has them and the shell requires 1.1. INLINE is 1.1: a shell that asks
+     * for it while requiring 1.0 would get a THREADED device it cannot use (V3), so it fails. Other values are
+     * ignored below 1.1, as a 1.0 shell does not know the field. */
+    if (info->Size >= BC250_DEVICE_CREATE_INFO_SIZE_1_1)
     {
-        queue_mode = info->QueueMode;
-        services = info->Services;
+        if ((info->AbiVersion & 0xffffu) >= 1)
+        {
+            queue_mode = info->QueueMode;
+            services = info->Services;
+        }
+        else if (info->QueueMode == BC250_VKD3D_QUEUE_MODE_INLINE)
+        {
+            WARN("The inline queue mode needs AbiVersion 1.1.\n");
+            return E_INVALIDARG;
+        }
     }
 
     switch (queue_mode)
