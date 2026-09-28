@@ -136,6 +136,9 @@ IUnknown *vkd3d_get_device_parent(ID3D12Device *device);
 VkDevice vkd3d_get_vk_device(ID3D12Device *device);
 VkPhysicalDevice vkd3d_get_vk_physical_device(ID3D12Device *device);
 struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device);
+/* amdgpu-wddm fork: the Vulkan queue family of the device's DIRECT queues (and of its internal queue in the
+ * inline queue mode). */
+uint32_t vkd3d_get_vk_direct_queue_family_index(ID3D12Device *device);
 
 uint32_t vkd3d_get_vk_queue_family_index(ID3D12CommandQueue *queue);
 uint32_t vkd3d_get_vk_queue_index(ID3D12CommandQueue *queue);

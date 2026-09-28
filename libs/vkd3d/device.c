@@ -11340,6 +11340,14 @@ VkPhysicalDevice vkd3d_get_vk_physical_device(ID3D12Device *device)
     return d3d12_device->vk_physical_device;
 }
 
+uint32_t vkd3d_get_vk_direct_queue_family_index(ID3D12Device *device)
+{
+    struct d3d12_device *d3d12_device = impl_from_ID3D12Device((d3d12_device_iface *)device);
+
+    /* vkd3d_select_queues() fails the device without a graphics family. */
+    return d3d12_device->queue_families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index;
+}
+
 struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device)
 {
     struct d3d12_device *d3d12_device = impl_from_ID3D12Device((d3d12_device_iface *)device);
