@@ -1,0 +1,4 @@
+LIBRARY bc250vkd3d.dll
+
+EXPORTS
+    Bc250Vkd3dEngineGetFuncs
