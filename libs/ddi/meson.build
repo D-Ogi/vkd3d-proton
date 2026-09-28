@@ -1,6 +1,14 @@
 # bc250vkd3d.dll: vkd3d-proton as the engine behind the BC-250 system D3D12 user-mode driver
 # (bc250_vkd3d_engine.h). Built only with -Denable_ddi_engine=true, on Windows.
 
+# The engine is loaded into every D3D12 process: its C runtime is linked statically, so that it needs no
+# VC++ runtime on the machine and shares no CRT state with the application.
+if vkd3d_compiler.get_argument_syntax() == 'msvc'
+  if get_option('b_vscrt') not in [ 'mt', 'static_from_buildtype' ]
+    error('enable_ddi_engine needs the static C runtime: -Db_vscrt=mt')
+  endif
+endif
+
 bc250vkd3d_lib = shared_library('bc250vkd3d', 'ddi_engine.c',
   name_prefix         : '',
   dependencies        : [ vkd3d_dep ],

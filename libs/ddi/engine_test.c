@@ -8,6 +8,8 @@
  *   - the capabilities the shell's GetCaps will mirror: feature level, the FL 12_0/12_1 tiers, shader model,
  *     ray tracing tier;
  *   - one GPU round trip: UPLOAD -> DEFAULT -> READBACK copy on a direct queue, fence wait, word-exact compare;
+ *   - one compute dispatch: DXIL cs_6_0 with an embedded root signature writes a raw UAV reached through a
+ *     shader-visible descriptor table at start + 3 * increment, word-exact compare; the handles are printed;
  *   - teardown: the device's final Release returns 0 (V4).
  *
  * Usage: bc250vkd3d_engine_test.exe <path to bc250vkd3d.dll> [adapter substring] [--icd <path>] [--fl <hex>]
