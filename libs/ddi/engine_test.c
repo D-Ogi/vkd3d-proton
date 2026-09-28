@@ -4,9 +4,20 @@
  * D3D12 shell will use it, without the Microsoft runtime.
  *
  * Both runs:
- *   - the export and its version rules (E_NOINTERFACE, E_INVALIDARG); a 1.0-sized function table, whose 1.1 tail
- *     the engine must leave alone;
- *   - CreateInfo checks that create nothing: sizes, queue modes, missing services.
+ *   - the export and its version rules (E_NOINTERFACE, E_INVALIDARG); 1.0- and 1.1-sized function tables, whose
+ *     tails the engine must leave alone; GetFuncs(1.1) leaves the 1.2 entries NULL, GetFuncs(1.2) fills them, and
+ *     the suites use that table;
+ *   - CreateInfo checks that create nothing: sizes, queue modes, missing services; QueryAdapterCaps with no query
+ *     array and MapHeap(NULL) fail with E_INVALIDARG.
+ * Both suites, on their main device (1.2, V10, V11):
+ *   - QueryAdapterCaps against ID3D12Device::CheckFeatureSupport of that device, made from the same CreateInfo:
+ *     HRESULT and every byte for every feature QueryAdapterCaps answers (all DXGI formats for FORMAT_SUPPORT and
+ *     FORMAT_INFO, eight formats at 1 to 16 samples); the key answers are printed;
+ *   - imported memory: GetVulkanHandles; UPLOAD, DEFAULT (buffers), DEFAULT (textures) and READBACK heaps over
+ *     memory the test allocates on the engine's VkDevice (CreateHeapFromMemory); a placed UPLOAD buffer at 64 KiB
+ *     filled through MapHeap at the address its Map returns; a placed buffer and a placed texture round trip,
+ *     word-exact through MapHeap of the READBACK heap; MapHeap on a heap of ID3D12Device::CreateHeap; the safe
+ *     order before vkFreeMemory (fence wait, final Releases returning 0, vkFreeMemory).
  * Default run, ABI 1.0 and the THREADED queue mode (V3), as a 1.0 shell uses it:
  *   - CreateDevice with a 1.0-sized CreateInfo over a caller-supplied Vulkan entry point, adapter chosen by LUID
  *     (V1, V2), an unknown LUID refused, two calls giving two devices (independent);
@@ -29,8 +40,9 @@
  *     process may start inside amdgpu_wddm_vkd3d.dll, before CreateDevice, after it, after queue creation, after
  *     ExecuteCommandLists and after fence waits;
  *   - admission: with the graphics family capped at 1 and 2 VkQueues, CreateDevice fails with
- *     DXGI_ERROR_UNSUPPORTED and binds nothing; at 3 the device has two DIRECT queues at once, and a third finds
- *     none free;
+ *     DXGI_ERROR_UNSUPPORTED and binds nothing, and QueryAdapterCaps fails with the same HRESULT; at 3 QueryAdapterCaps
+ *     succeeds, the device has two DIRECT queues at once, and a third finds none free;
+ *   - QueryAdapterCaps creates no VkDevice, calls no Services and starts no thread;
  *   - binding: the internal queue at CreateDevice (cookie NULL), every queue on a thread that makes engine
  *     calls, a BindQueue failure returned as is with nothing bound, every BindQueue balanced by UnbindQueue
  *     before the VkQueue is bound again;
@@ -82,6 +94,7 @@
 
 #define ABI_1_0 0x00010000u
 #define ABI_1_1 0x00010001u
+#define ABI_1_2 0x00010002u
 
 static unsigned int failures;
 
@@ -292,6 +305,7 @@ static struct
     PFN_vkGetPhysicalDeviceQueueFamilyProperties queue_family_properties;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties2 queue_family_properties2;
     volatile LONG graphics_queue_cap;   /* nonzero: graphics families report at most this queueCount */
+    volatile LONG device_creates;       /* successful vkCreateDevice calls */
 } vkw;
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkw_ResetCommandPool(VkDevice device, VkCommandPool pool,
@@ -382,7 +396,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkw_CreateDevice(VkPhysicalDevice physical
     VkResult vr = vkw.create_device(physical_device, create_info, allocator, device);
 
     if (vr == VK_SUCCESS)
+    {
         vkw.device = *device;
+        InterlockedIncrement(&vkw.device_creates);
+    }
     return vr;
 }
 
@@ -1106,6 +1123,676 @@ done:
         ID3D12RootSignature_Release(rs);
 }
 
+/* Executes list on queue, signals a new fence to 1 and waits for it (mode as for copy_round_trip()). */
+static BOOL execute_and_wait(ID3D12Device *device, ID3D12CommandQueue *queue, ID3D12GraphicsCommandList *list,
+        enum wait_mode mode, const char *tag)
+{
+    ID3D12Fence *fence = NULL;
+    HANDLE event;
+    BOOL done;
+
+    if (FAILED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence)))
+    {
+        checkf(FALSE, "%screate a fence", tag);
+        return FALSE;
+    }
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+    checkf(SUCCEEDED(ID3D12CommandQueue_Signal(queue, fence, 1)), "%squeue Signal(fence, 1)", tag);
+    if (mode == WAIT_EVENT)
+    {
+        event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        done = event && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(fence, 1, event))
+                && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0 && ID3D12Fence_GetCompletedValue(fence) >= 1;
+        checkf(done, "%sfence reaches 1 within 5 s", tag);
+        if (event)
+            CloseHandle(event);
+    }
+    else
+    {
+        done = wait_fence_inline(fence, 1, mode, tag);
+    }
+    ID3D12Fence_Release(fence);
+    return done;
+}
+
+/* V10: heaps over memory that the test allocates on the engine's VkDevice, as the shell will. */
+#define IMPORT_HEAP_SIZE (2u << 20)
+#define IMPORT_OFFSET 0x10000u              /* 64 KiB: where the second resource of a heap goes */
+#define IMPORT_WORDS 16384u                 /* 64 KiB: one buffer, or a 128 x 128 R8G8B8A8_UINT texture */
+#define IMPORT_EDGE 128u
+
+struct import_ctx
+{
+    const BC250_VKD3D_ENGINE_FUNCS *funcs;
+    ID3D12Device *device;
+    VkDevice vk_device;
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    PFN_vkAllocateMemory allocate_memory;
+    PFN_vkFreeMemory free_memory;
+};
+
+struct import_heap
+{
+    ID3D12Heap *heap;
+    VkDeviceMemory memory;
+};
+
+/* A heap of IMPORT_HEAP_SIZE bytes over a VkDeviceMemory of its own, allocated with
+ * VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. The engine takes only a memory type it would pick for such a heap itself
+ * (V10), so the test offers the types with the wanted properties first, then the others, and keeps the first
+ * that CreateHeapFromMemory takes; a refused allocation is freed at once. */
+static BOOL import_heap_create(const struct import_ctx *ctx, D3D12_HEAP_TYPE type, D3D12_HEAP_FLAGS flags,
+        VkMemoryPropertyFlags wanted, struct import_heap *out, const char *what)
+{
+    BC250_VKD3D_IMPORTED_MEMORY imported;
+    VkMemoryAllocateFlagsInfo flags_info;
+    VkMemoryAllocateInfo alloc_info;
+    VkMemoryPropertyFlags properties;
+    D3D12_HEAP_DESC desc;
+    unsigned int pass, i;
+
+    memset(out, 0, sizeof(*out));
+    memset(&flags_info, 0, sizeof(flags_info));
+    flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    memset(&desc, 0, sizeof(desc));
+    desc.SizeInBytes = IMPORT_HEAP_SIZE;
+    desc.Properties.Type = type;
+    desc.Flags = flags;
+
+    for (pass = 0; pass < 2; ++pass)
+    {
+        for (i = 0; i < ctx->memory_properties.memoryTypeCount; ++i)
+        {
+            properties = ctx->memory_properties.memoryTypes[i].propertyFlags;
+            if (((properties & wanted) == wanted) == !!pass)
+                continue;
+            memset(&alloc_info, 0, sizeof(alloc_info));
+            alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            alloc_info.pNext = &flags_info;
+            alloc_info.allocationSize = IMPORT_HEAP_SIZE;
+            alloc_info.memoryTypeIndex = i;
+            if (ctx->allocate_memory(ctx->vk_device, &alloc_info, NULL, &out->memory) != VK_SUCCESS)
+                continue;
+
+            memset(&imported, 0, sizeof(imported));
+            imported.Size = sizeof(imported);
+            imported.Memory = out->memory;
+            imported.AllocationSize = IMPORT_HEAP_SIZE;
+            imported.MemoryTypeIndex = i;
+            imported.Flags = BC250_VKD3D_IMPORTED_MEMORY_FLAG_DEVICE_ADDRESS;
+            if (SUCCEEDED(ctx->funcs->CreateHeapFromMemory(ctx->device, &imported, &desc, &IID_ID3D12Heap,
+                    (void **)&out->heap)) && out->heap)
+            {
+                printf("import: %s heap %p over VkDeviceMemory %p, memory type %u (property flags %#x)\n", what,
+                        (void *)out->heap, (void *)out->memory, i, (unsigned int)properties);
+                return TRUE;
+            }
+            out->heap = NULL;
+            ctx->free_memory(ctx->vk_device, out->memory, NULL);
+            out->memory = VK_NULL_HANDLE;
+        }
+    }
+    printf("import: no memory type makes a %s heap\n", what);
+    return FALSE;
+}
+
+static ID3D12Resource *place_resource(ID3D12Device *device, const struct import_heap *heap, UINT64 offset,
+        const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state)
+{
+    ID3D12Resource *resource = NULL;
+
+    if (!heap->heap || FAILED(ID3D12Device_CreatePlacedResource(device, heap->heap, offset, desc, state, NULL,
+            &IID_ID3D12Resource, (void **)&resource)))
+        return NULL;
+    return resource;
+}
+
+static void set_footprint(D3D12_TEXTURE_COPY_LOCATION *location, ID3D12Resource *buffer)
+{
+    memset(location, 0, sizeof(*location));
+    location->pResource = buffer;
+    location->Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    location->PlacedFootprint.Offset = 0;
+    location->PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    location->PlacedFootprint.Footprint.Width = IMPORT_EDGE;
+    location->PlacedFootprint.Footprint.Height = IMPORT_EDGE;
+    location->PlacedFootprint.Footprint.Depth = 1;
+    location->PlacedFootprint.Footprint.RowPitch = IMPORT_EDGE * 4;
+}
+
+/* V10 on one device: GetVulkanHandles; four heaps over memory the test allocated on the engine's VkDevice
+ * (UPLOAD, DEFAULT for buffers, DEFAULT for textures, READBACK); a placed UPLOAD buffer filled through MapHeap at
+ * the address its Map returns; one command list copying it to a placed DEFAULT buffer and, by footprint, to a
+ * placed texture, and both back to placed READBACK buffers; a word-exact compare through MapHeap; MapHeap on a heap
+ * from ID3D12Device::CreateHeap; then the safe order: fence wait, final Releases, vkFreeMemory. given_queue and
+ * mode as for copy_round_trip(); the list type is DIRECT. */
+static void imported_memory(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *device,
+        PFN_vkGetInstanceProcAddr gipa, ID3D12CommandQueue *given_queue, enum wait_mode mode, const char *tag)
+{
+    const UINT64 size = IMPORT_WORDS * sizeof(UINT32);
+    ID3D12Resource *src = NULL, *gpu = NULL, *texture = NULL, *dst_buffer = NULL, *dst_texture = NULL;
+    struct import_heap upload, buffers, textures, readback;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties get_families;
+    PFN_vkGetPhysicalDeviceMemoryProperties get_memory_properties;
+    D3D12_TEXTURE_COPY_LOCATION copy_dst, copy_src;
+    D3D12_RESOURCE_DESC buffer_desc, texture_desc;
+    D3D12_RESOURCE_ALLOCATION_INFO allocation;
+    VkQueueFamilyProperties families[32];
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    D3D12_COMMAND_QUEUE_DESC queue_desc;
+    D3D12_RESOURCE_BARRIER barriers[2];
+    ID3D12CommandQueue *queue = NULL;
+    VkPhysicalDevice vk_physical_device;
+    PFN_vkGetDeviceProcAddr gdpa;
+    ID3D12Heap *engine_heap = NULL;
+    D3D12_HEAP_DESC heap_desc;
+    struct import_ctx ctx;
+    void *heap_address, *map_address;
+    unsigned int i, bad_buffer = 0, bad_texture = 0, nonzero = 0;
+    const UINT32 *words;
+    UINT32 family = ~0u;
+    uint32_t family_count;
+    VkInstance vk_instance;
+    D3D12_RANGE range;
+    BOOL done = FALSE;
+    HRESULT hr;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&upload, 0, sizeof(upload));
+    memset(&buffers, 0, sizeof(buffers));
+    memset(&textures, 0, sizeof(textures));
+    memset(&readback, 0, sizeof(readback));
+
+    hr = funcs->GetVulkanHandles(device, &vk_instance, &vk_physical_device, &ctx.vk_device, &family);
+    printf("%sGetVulkanHandles: hr %08lx, VkInstance %p, VkPhysicalDevice %p, VkDevice %p, queue family %u\n", tag,
+            (unsigned long)hr, (void *)vk_instance, (void *)vk_physical_device, (void *)ctx.vk_device, family);
+    checkf(hr == S_OK && vk_instance && vk_physical_device && ctx.vk_device,
+            "%sGetVulkanHandles returns the engine's VkInstance, VkPhysicalDevice and VkDevice", tag);
+    checkf(funcs->GetVulkanHandles(device, &vk_instance, &vk_physical_device, NULL, &family) == E_INVALIDARG,
+            "%sGetVulkanHandles with a NULL out pointer -> E_INVALIDARG", tag);
+    if (hr != S_OK)
+        return;
+    get_families = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(vk_instance,
+            "vkGetPhysicalDeviceQueueFamilyProperties");
+    get_memory_properties = (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(vk_instance,
+            "vkGetPhysicalDeviceMemoryProperties");
+    gdpa = (PFN_vkGetDeviceProcAddr)gipa(vk_instance, "vkGetDeviceProcAddr");
+    if (!get_families || !get_memory_properties || !gdpa)
+    {
+        checkf(FALSE, "%sVulkan entry points of the engine's instance", tag);
+        return;
+    }
+    family_count = ARRAYSIZE(families);
+    get_families(vk_physical_device, &family_count, families);
+    checkf(family < family_count && (families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT),
+            "%sthe queue family of the DIRECT queues (%u) has VK_QUEUE_GRAPHICS_BIT", tag, family);
+
+    ctx.funcs = funcs;
+    ctx.device = device;
+    get_memory_properties(vk_physical_device, &ctx.memory_properties);
+    ctx.allocate_memory = (PFN_vkAllocateMemory)gdpa(ctx.vk_device, "vkAllocateMemory");
+    ctx.free_memory = (PFN_vkFreeMemory)gdpa(ctx.vk_device, "vkFreeMemory");
+    if (!ctx.allocate_memory || !ctx.free_memory)
+    {
+        checkf(FALSE, "%svkAllocateMemory and vkFreeMemory of the engine's VkDevice", tag);
+        return;
+    }
+
+    checkf(import_heap_create(&ctx, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &upload, "UPLOAD")
+            && import_heap_create(&ctx, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &buffers, "DEFAULT buffer")
+            && import_heap_create(&ctx, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &textures, "DEFAULT texture")
+            && import_heap_create(&ctx, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &readback, "READBACK"),
+            "%sCreateHeapFromMemory: UPLOAD, DEFAULT (buffers), DEFAULT (textures) and READBACK heaps of %u MiB over "
+            "memory the test allocated", tag, IMPORT_HEAP_SIZE >> 20);
+    if (!upload.heap || !buffers.heap || !textures.heap || !readback.heap)
+        goto release;
+
+    memset(&buffer_desc, 0, sizeof(buffer_desc));
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = size;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    memset(&texture_desc, 0, sizeof(texture_desc));
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Width = IMPORT_EDGE;
+    texture_desc.Height = IMPORT_EDGE;
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    /* In C on Windows the SDK declares the struct return as a hidden out parameter. */
+    ID3D12Device_GetResourceAllocationInfo(device, &allocation, 0, 1, &texture_desc);
+    printf("%stexture: %llu bytes, alignment %llu, placed at offset %llu\n", tag,
+            (unsigned long long)allocation.SizeInBytes, (unsigned long long)allocation.Alignment,
+            (unsigned long long)allocation.Alignment);
+
+    /* Second resources at nonzero offsets: the UPLOAD buffer and the texture. */
+    src = place_resource(device, &upload, IMPORT_OFFSET, &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+    gpu = place_resource(device, &buffers, 0, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (allocation.Alignment && allocation.Alignment + allocation.SizeInBytes <= IMPORT_HEAP_SIZE)
+        texture = place_resource(device, &textures, allocation.Alignment, &texture_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+    dst_buffer = place_resource(device, &readback, 0, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    dst_texture = place_resource(device, &readback, IMPORT_OFFSET, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    checkf(src && gpu && texture && dst_buffer && dst_texture, "%sCreatePlacedResource on the imported heaps: "
+            "UPLOAD buffer at 64 KiB, DEFAULT buffer, texture at its alignment, two READBACK buffers", tag);
+    if (!src || !gpu || !texture || !dst_buffer || !dst_texture)
+        goto release;
+    checkf(ID3D12Resource_GetGPUVirtualAddress(src) && ID3D12Resource_GetGPUVirtualAddress(gpu)
+            && ID3D12Resource_GetGPUVirtualAddress(dst_buffer),
+            "%splaced buffers on imported heaps have GPU virtual addresses", tag);
+
+    /* MapHeap: offset 0 of the heap; the buffer placed at 64 KiB maps at that address plus 64 KiB. */
+    heap_address = map_address = NULL;
+    hr = funcs->MapHeap(upload.heap, &heap_address);
+    memset(&range, 0, sizeof(range));
+    if (FAILED(ID3D12Resource_Map(src, 0, &range, &map_address)))
+        map_address = NULL;
+    printf("%sMapHeap(UPLOAD) %p, Map of the buffer at 64 KiB %p\n", tag, heap_address, map_address);
+    checkf(hr == S_OK && heap_address && map_address == (BYTE *)heap_address + IMPORT_OFFSET,
+            "%sMapHeap(UPLOAD): the heap's address plus 64 KiB is the address Map returns for the buffer placed "
+            "there", tag);
+    if (hr != S_OK || !heap_address)
+        goto release;
+    for (i = 0; i < IMPORT_WORDS; ++i)
+        ((UINT32 *)((BYTE *)heap_address + IMPORT_OFFSET))[i] = 0x9e3779b9u * (i + 7);
+    if (map_address)
+        ID3D12Resource_Unmap(src, 0, NULL);
+    checkf(funcs->UnmapHeap(upload.heap) == S_OK, "%sUnmapHeap(UPLOAD)", tag);
+
+    if (given_queue)
+    {
+        queue = given_queue;
+        ID3D12CommandQueue_AddRef(queue);
+    }
+    else
+    {
+        memset(&queue_desc, 0, sizeof(queue_desc));
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12Device_CreateCommandQueue(device, &queue_desc, &IID_ID3D12CommandQueue, (void **)&queue);
+    }
+    checkf(queue && SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void **)&allocator))
+            && SUCCEEDED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL,
+                    &IID_ID3D12GraphicsCommandList, (void **)&list)),
+            "%screate a queue, allocator and command list", tag);
+    if (!queue || !allocator || !list)
+        goto release;
+
+    /* UPLOAD -> DEFAULT buffer and texture -> READBACK, all placed on imported heaps. */
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, gpu, 0, src, 0, size);
+    memset(&copy_dst, 0, sizeof(copy_dst));
+    copy_dst.pResource = texture;
+    copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    copy_dst.SubresourceIndex = 0;
+    set_footprint(&copy_src, src);
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &copy_dst, 0, 0, 0, &copy_src, NULL);
+    memset(barriers, 0, sizeof(barriers));
+    for (i = 0; i < ARRAYSIZE(barriers); ++i)
+    {
+        barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[i].Transition.pResource = i ? texture : gpu;
+        barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    ID3D12GraphicsCommandList_ResourceBarrier(list, ARRAYSIZE(barriers), barriers);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, dst_buffer, 0, gpu, 0, size);
+    set_footprint(&copy_dst, dst_texture);
+    memset(&copy_src, 0, sizeof(copy_src));
+    copy_src.pResource = texture;
+    copy_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    copy_src.SubresourceIndex = 0;
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &copy_dst, 0, 0, 0, &copy_src, NULL);
+    checkf(SUCCEEDED(ID3D12GraphicsCommandList_Close(list)), "%srecord buffer and texture copies", tag);
+
+    /* Safe order, step 1 (V10): the fence of the queue that used the heaps. */
+    if (!(done = execute_and_wait(device, queue, list, mode, tag)))
+        goto release;
+
+    heap_address = NULL;
+    hr = funcs->MapHeap(readback.heap, &heap_address);
+    checkf(hr == S_OK && heap_address, "%sMapHeap(READBACK)", tag);
+    if (hr == S_OK && heap_address)
+    {
+        words = heap_address;
+        for (i = 0; i < IMPORT_WORDS; ++i)
+        {
+            nonzero += !!words[i];
+            bad_buffer += words[i] != 0x9e3779b9u * (i + 7);
+            bad_texture += words[IMPORT_WORDS + i] != 0x9e3779b9u * (i + 7);
+        }
+        checkf(funcs->UnmapHeap(readback.heap) == S_OK, "%sUnmapHeap(READBACK)", tag);
+        printf("%sbuffer: %u of %u words differ, texture: %u differ, %u nonzero\n", tag, bad_buffer,
+                IMPORT_WORDS, bad_texture, nonzero);
+        checkf(!bad_buffer && nonzero, "%splaced buffer round trip UPLOAD -> DEFAULT -> READBACK: word-exact", tag);
+        checkf(!bad_texture, "%splaced texture round trip UPLOAD -> texture (footprint) -> READBACK: word-exact",
+                tag);
+    }
+
+    /* MapHeap works on heaps of ID3D12Device::CreateHeap too. */
+    memset(&heap_desc, 0, sizeof(heap_desc));
+    heap_desc.SizeInBytes = IMPORT_OFFSET;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    heap_address = NULL;
+    checkf(SUCCEEDED(ID3D12Device_CreateHeap(device, &heap_desc, &IID_ID3D12Heap, (void **)&engine_heap))
+            && funcs->MapHeap(engine_heap, &heap_address) == S_OK && heap_address
+            && funcs->UnmapHeap(engine_heap) == S_OK && !ID3D12Heap_Release(engine_heap),
+            "%sMapHeap and UnmapHeap on an UPLOAD heap of ID3D12Device::CreateHeap (%p)", tag, heap_address);
+
+release:
+    /* Safe order, steps 2 and 3 (V10). Without the fence wait, nothing is released: the GPU may use it. */
+    if (list)
+        ID3D12GraphicsCommandList_Release(list);
+    if (allocator)
+        ID3D12CommandAllocator_Release(allocator);
+    if (queue)
+        ID3D12CommandQueue_Release(queue);
+    if (list && !done)
+    {
+        checkf(FALSE, "%sthe imported memory stays allocated: its work did not complete", tag);
+        return;
+    }
+    {
+        ID3D12Resource *resources[] = {src, gpu, texture, dst_buffer, dst_texture};
+        struct import_heap *heaps[] = {&upload, &buffers, &textures, &readback};
+        unsigned int zero = 0, count = 0;
+
+        for (i = 0; i < ARRAYSIZE(resources); ++i)
+        {
+            count += !!resources[i];
+            if (resources[i] && !ID3D12Resource_Release(resources[i]))
+                ++zero;
+        }
+        for (i = 0; i < ARRAYSIZE(heaps); ++i)
+        {
+            count += !!heaps[i]->heap;
+            if (heaps[i]->heap && !ID3D12Heap_Release(heaps[i]->heap))
+                ++zero;
+        }
+        for (i = 0; i < ARRAYSIZE(heaps); ++i)
+        {
+            if (heaps[i]->memory)
+                ctx.free_memory(ctx.vk_device, heaps[i]->memory, NULL);
+        }
+        if (done)
+            checkf(zero == count, "%ssafe order: after the fence wait, the %u placed resources and heaps return 0 "
+                    "from their final Release, then vkFreeMemory", tag, count);
+    }
+}
+
+/* V11: QueryAdapterCaps against CheckFeatureSupport of a device made from the same CreateInfo. Every feature that
+ * QueryAdapterCaps answers, with the inputs of each set: the SDK's up to OPTIONS21 and 56, 57, 61, and three that
+ * vkd3d-proton's IDL has beyond the SDK (54, 64, 65, with its layouts). */
+#define CAPS_MAX 512u
+#define CAPS_SLOT_WORDS 40u                 /* 320 bytes, above the largest (SHADER_CACHE_ABI_SUPPORT, 288) */
+#define TEST_FEATURE_TIGHT_ALIGNMENT ((D3D12_FEATURE)54)
+#define TEST_FEATURE_BARRIER_LAYOUT ((D3D12_FEATURE)64)
+#define TEST_FEATURE_OPTIONS22 ((D3D12_FEATURE)65)
+
+struct test_barrier_layout
+{
+    UINT32 CommandListType;
+    UINT32 Layout;
+    BOOL Supported;
+};
+
+static struct caps_table
+{
+    unsigned int count;
+    struct
+    {
+        D3D12_FEATURE feature;
+        UINT32 size;
+        const char *name;
+    } cases[CAPS_MAX];
+    UINT64 data[CAPS_MAX][CAPS_SLOT_WORDS];
+} caps_query, caps_device;
+
+static unsigned int caps_add(struct caps_table *t, D3D12_FEATURE feature, const char *name, const void *input,
+        UINT32 size)
+{
+    unsigned int i = t->count;
+
+    if (i >= CAPS_MAX || size > sizeof(t->data[0]))
+        return ~0u;
+    ++t->count;
+    t->cases[i].feature = feature;
+    t->cases[i].size = size;
+    t->cases[i].name = name;
+    memset(t->data[i], 0, sizeof(t->data[i]));
+    if (input)
+        memcpy(t->data[i], input, size);
+    return i;
+}
+
+#define CAPS_OUT(t, feature, type) caps_add(t, feature, #feature, NULL, sizeof(type))
+
+/* The SDK's DXGI formats: 0 to DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_P208 to DXGI_FORMAT_V408 and
+ * DXGI_FORMAT_A4B4G4R4_UNORM; the values in between are no formats. */
+static UINT32 next_format(UINT32 format)
+{
+    if (format == DXGI_FORMAT_B4G4R4A4_UNORM)
+        return DXGI_FORMAT_P208;
+    if (format == DXGI_FORMAT_V408)
+        return DXGI_FORMAT_A4B4G4R4_UNORM;
+    return format + 1;
+}
+
+struct caps_index
+{
+    unsigned int options, levels, model, root_signature, options5;
+};
+
+static void caps_build(struct caps_table *t, struct caps_index *index)
+{
+    static const D3D_FEATURE_LEVEL levels[] =
+    {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
+        D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2,
+    };
+    static const DXGI_FORMAT msaa_formats[] =
+    {
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_D32_FLOAT,
+        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_BC1_UNORM,
+    };
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msaa;
+    D3D12_FEATURE_DATA_COMMAND_QUEUE_PRIORITY priority;
+    D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT session;
+    D3D12_FEATURE_DATA_FEATURE_LEVELS feature_levels;
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE root_signature;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support;
+    D3D12_FEATURE_DATA_SHADER_MODEL shader_model;
+    D3D12_FEATURE_DATA_ARCHITECTURE1 architecture1;
+    D3D12_FEATURE_DATA_ARCHITECTURE architecture;
+    D3D12_FEATURE_DATA_SERIALIZATION serialization;
+    D3D12_FEATURE_DATA_FORMAT_INFO format_info;
+    struct test_barrier_layout barrier_layout;
+    unsigned int i, j;
+    UINT32 format;
+
+    t->count = 0;
+    index->options = CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS);
+    memset(&architecture, 0, sizeof(architecture));
+    caps_add(t, D3D12_FEATURE_ARCHITECTURE, "D3D12_FEATURE_ARCHITECTURE", &architecture, sizeof(architecture));
+    memset(&feature_levels, 0, sizeof(feature_levels));
+    feature_levels.NumFeatureLevels = ARRAYSIZE(levels);
+    feature_levels.pFeatureLevelsRequested = levels;
+    index->levels = caps_add(t, D3D12_FEATURE_FEATURE_LEVELS, "D3D12_FEATURE_FEATURE_LEVELS", &feature_levels,
+            sizeof(feature_levels));
+    for (format = 0; format <= DXGI_FORMAT_A4B4G4R4_UNORM; format = next_format(format))
+    {
+        memset(&format_support, 0, sizeof(format_support));
+        format_support.Format = (DXGI_FORMAT)format;
+        caps_add(t, D3D12_FEATURE_FORMAT_SUPPORT, "D3D12_FEATURE_FORMAT_SUPPORT", &format_support,
+                sizeof(format_support));
+    }
+    for (i = 0; i < ARRAYSIZE(msaa_formats); ++i)
+    {
+        for (j = 1; j <= 16; j *= 2)
+        {
+            memset(&msaa, 0, sizeof(msaa));
+            msaa.Format = msaa_formats[i];
+            msaa.SampleCount = j;
+            caps_add(t, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, "D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS", &msaa,
+                    sizeof(msaa));
+        }
+    }
+    for (format = 0; format <= DXGI_FORMAT_A4B4G4R4_UNORM; format = next_format(format))
+    {
+        memset(&format_info, 0, sizeof(format_info));
+        format_info.Format = (DXGI_FORMAT)format;
+        caps_add(t, D3D12_FEATURE_FORMAT_INFO, "D3D12_FEATURE_FORMAT_INFO", &format_info, sizeof(format_info));
+    }
+    CAPS_OUT(t, D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT, D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT);
+    memset(&shader_model, 0, sizeof(shader_model));
+    shader_model.HighestShaderModel = D3D_HIGHEST_SHADER_MODEL;
+    index->model = caps_add(t, D3D12_FEATURE_SHADER_MODEL, "D3D12_FEATURE_SHADER_MODEL", &shader_model,
+            sizeof(shader_model));
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1);
+    memset(&session, 0, sizeof(session));
+    caps_add(t, D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT, "D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT",
+            &session, sizeof(session));
+    memset(&root_signature, 0, sizeof(root_signature));
+    root_signature.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_2;
+    index->root_signature = caps_add(t, D3D12_FEATURE_ROOT_SIGNATURE, "D3D12_FEATURE_ROOT_SIGNATURE",
+            &root_signature, sizeof(root_signature));
+    memset(&architecture1, 0, sizeof(architecture1));
+    caps_add(t, D3D12_FEATURE_ARCHITECTURE1, "D3D12_FEATURE_ARCHITECTURE1", &architecture1, sizeof(architecture1));
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS2, D3D12_FEATURE_DATA_D3D12_OPTIONS2);
+    CAPS_OUT(t, D3D12_FEATURE_SHADER_CACHE, D3D12_FEATURE_DATA_SHADER_CACHE);
+    memset(&priority, 0, sizeof(priority));
+    priority.CommandListType = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    priority.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    caps_add(t, D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, "D3D12_FEATURE_COMMAND_QUEUE_PRIORITY", &priority,
+            sizeof(priority));
+    priority.CommandListType = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    priority.Priority = D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME;
+    caps_add(t, D3D12_FEATURE_COMMAND_QUEUE_PRIORITY, "D3D12_FEATURE_COMMAND_QUEUE_PRIORITY", &priority,
+            sizeof(priority));
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS3, D3D12_FEATURE_DATA_D3D12_OPTIONS3);
+    CAPS_OUT(t, D3D12_FEATURE_EXISTING_HEAPS, D3D12_FEATURE_DATA_EXISTING_HEAPS);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS4, D3D12_FEATURE_DATA_D3D12_OPTIONS4);
+    memset(&serialization, 0, sizeof(serialization));
+    caps_add(t, D3D12_FEATURE_SERIALIZATION, "D3D12_FEATURE_SERIALIZATION", &serialization, sizeof(serialization));
+    CAPS_OUT(t, D3D12_FEATURE_CROSS_NODE, D3D12_FEATURE_DATA_CROSS_NODE);
+    index->options5 = CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS6, D3D12_FEATURE_DATA_D3D12_OPTIONS6);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS8, D3D12_FEATURE_DATA_D3D12_OPTIONS8);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS9, D3D12_FEATURE_DATA_D3D12_OPTIONS9);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS10, D3D12_FEATURE_DATA_D3D12_OPTIONS10);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS11, D3D12_FEATURE_DATA_D3D12_OPTIONS11);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS12, D3D12_FEATURE_DATA_D3D12_OPTIONS12);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS13, D3D12_FEATURE_DATA_D3D12_OPTIONS13);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS14, D3D12_FEATURE_DATA_D3D12_OPTIONS14);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS15, D3D12_FEATURE_DATA_D3D12_OPTIONS15);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS16, D3D12_FEATURE_DATA_D3D12_OPTIONS16);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS17, D3D12_FEATURE_DATA_D3D12_OPTIONS17);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS18, D3D12_FEATURE_DATA_D3D12_OPTIONS18);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS19, D3D12_FEATURE_DATA_D3D12_OPTIONS19);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS20, D3D12_FEATURE_DATA_D3D12_OPTIONS20);
+    CAPS_OUT(t, D3D12_FEATURE_D3D12_OPTIONS21, D3D12_FEATURE_DATA_D3D12_OPTIONS21);
+    caps_add(t, TEST_FEATURE_TIGHT_ALIGNMENT, "D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT (54)", NULL, sizeof(UINT32));
+    CAPS_OUT(t, D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE, D3D12_FEATURE_DATA_APPLICATION_SPECIFIC_DRIVER_STATE);
+    CAPS_OUT(t, D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED, D3D12_FEATURE_DATA_BYTECODE_BYPASS_HASH_SUPPORTED);
+    CAPS_OUT(t, D3D12_FEATURE_SHADER_CACHE_ABI_SUPPORT, D3D12_FEATURE_DATA_SHADERCACHE_ABI_SUPPORT);
+    memset(&barrier_layout, 0, sizeof(barrier_layout));
+    barrier_layout.CommandListType = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    barrier_layout.Layout = D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+    caps_add(t, TEST_FEATURE_BARRIER_LAYOUT, "D3D12_FEATURE_BARRIER_LAYOUT (64)", &barrier_layout,
+            sizeof(barrier_layout));
+    barrier_layout.CommandListType = D3D12_COMMAND_LIST_TYPE_COPY;
+    caps_add(t, TEST_FEATURE_BARRIER_LAYOUT, "D3D12_FEATURE_BARRIER_LAYOUT (64)", &barrier_layout,
+            sizeof(barrier_layout));
+    caps_add(t, TEST_FEATURE_OPTIONS22, "D3D12_FEATURE_D3D12_OPTIONS22 (65)", NULL, 2 * sizeof(BOOL)
+            + 2 * sizeof(UINT));
+}
+
+/* Returns whether every answer was equal. */
+static BOOL adapter_caps_equality(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3D_DEVICE_CREATE_INFO *info,
+        ID3D12Device *device, const char *tag)
+{
+    static BC250_VKD3D_FEATURE_QUERY queries[CAPS_MAX];
+    static HRESULT device_hr[CAPS_MAX];
+    const D3D12_FEATURE_DATA_D3D12_OPTIONS5 *options5;
+    const D3D12_FEATURE_DATA_D3D12_OPTIONS *options;
+    unsigned int i, j, differ, first, answered = 0, all_differ = 0;
+    struct caps_index index;
+    HRESULT hr;
+
+    caps_build(&caps_query, &index);
+    caps_device = caps_query;
+    for (i = 0; i < caps_query.count; ++i)
+    {
+        memset(&queries[i], 0, sizeof(queries[i]));
+        queries[i].Feature = (UINT32)caps_query.cases[i].feature;
+        queries[i].DataSize = caps_query.cases[i].size;
+        queries[i].pData = caps_query.data[i];
+        queries[i].Result = E_PENDING;
+    }
+    hr = funcs->QueryAdapterCaps(info, caps_query.count, queries);
+    checkf(hr == S_OK, "%sQueryAdapterCaps answers %u queries (hr %08lx)", tag, caps_query.count, (unsigned long)hr);
+    if (hr != S_OK)
+        return FALSE;
+    for (i = 0; i < caps_device.count; ++i)
+    {
+        device_hr[i] = ID3D12Device_CheckFeatureSupport(device, caps_device.cases[i].feature, caps_device.data[i],
+                caps_device.cases[i].size);
+        answered += device_hr[i] == S_OK && queries[i].Result == S_OK;
+    }
+
+    /* One check per feature: HRESULT and every byte of the data, for each of its queries. */
+    for (i = 0; i < caps_query.count; i = j)
+    {
+        differ = 0;
+        first = ~0u;
+        for (j = i; j < caps_query.count && !strcmp(caps_query.cases[j].name, caps_query.cases[i].name); ++j)
+        {
+            if (queries[j].Result != device_hr[j]
+                    || memcmp(caps_query.data[j], caps_device.data[j], caps_query.cases[j].size))
+            {
+                if (first == ~0u)
+                    first = j;
+                ++differ;
+            }
+        }
+        if (first != ~0u)
+            printf("caps: %s query %u: QueryAdapterCaps hr %08lx, CheckFeatureSupport hr %08lx\n",
+                    caps_query.cases[first].name, first - i, (unsigned long)queries[first].Result,
+                    (unsigned long)device_hr[first]);
+        all_differ += differ;
+        checkf(!differ, "%s%s: QueryAdapterCaps equals CheckFeatureSupport, HRESULT and every byte (%u of %u "
+                "queries)", tag, caps_query.cases[i].name, j - i - differ, j - i);
+    }
+    printf("%s%u queries, %u S_OK on both, %u different\n", tag, caps_query.count, answered, all_differ);
+
+    options = (const D3D12_FEATURE_DATA_D3D12_OPTIONS *)caps_query.data[index.options];
+    options5 = (const D3D12_FEATURE_DATA_D3D12_OPTIONS5 *)caps_query.data[index.options5];
+    printf("%sQueryAdapterCaps: MaxSupportedFeatureLevel %x HighestShaderModel %x RootSignature %x "
+            "ResourceBindingTier %u TiledResourcesTier %u ResourceHeapTier %u RaytracingTier %u\n", tag,
+            (unsigned int)((const D3D12_FEATURE_DATA_FEATURE_LEVELS *)caps_query.data[index.levels])
+                    ->MaxSupportedFeatureLevel,
+            (unsigned int)((const D3D12_FEATURE_DATA_SHADER_MODEL *)caps_query.data[index.model])->HighestShaderModel,
+            (unsigned int)((const D3D12_FEATURE_DATA_ROOT_SIGNATURE *)caps_query.data[index.root_signature])
+                    ->HighestVersion,
+            (unsigned int)options->ResourceBindingTier, (unsigned int)options->TiledResourcesTier,
+            (unsigned int)options->ResourceHeapTier, (unsigned int)options5->RaytracingTier);
+    return !all_differ;
+}
+
 /* The logging shell of the inline suite: records every BindQueue and UnbindQueue, checks that they come on a
  * thread of the test that makes engine calls (never on a thread of the engine) and that a VkQueue is never bound
  * twice. The test's threads mark themselves in tls_engine_caller. */
@@ -1800,7 +2487,7 @@ static void inline_admission(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_
     ID3D12CommandQueue *q1 = NULL, *q2 = NULL, *q3 = NULL;
     ID3D12Device *device;
     unsigned int binds, cap, released = 0;
-    HRESULT hr, hr3;
+    HRESULT hr, hr3, query_hr;
 
     for (cap = 1; cap < BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES; ++cap)
     {
@@ -1808,10 +2495,13 @@ static void inline_admission(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_
         vkw.graphics_queue_cap = (LONG)cap;
         device = (ID3D12Device *)(void *)1;
         hr = funcs->CreateDevice(info, &IID_ID3D12Device, (void **)&device);
+        query_hr = funcs->QueryAdapterCaps(info, 0, NULL);
         vkw.graphics_queue_cap = 0;
         checkf(hr == DXGI_ERROR_UNSUPPORTED && !device && shell.binds + shell.failed_binds == binds,
                 "admission: INLINE with the graphics family capped at %u VkQueue(s) -> DXGI_ERROR_UNSUPPORTED, "
                 "nothing bound (hr %08lx)", cap, (unsigned long)hr);
+        checkf(query_hr == hr, "admission: QueryAdapterCaps at that cap fails as CreateDevice does (V11, hr %08lx)",
+                (unsigned long)query_hr);
         if (SUCCEEDED(hr) && device && device != (void *)1)
             ID3D12Device_Release(device);
     }
@@ -1819,7 +2509,10 @@ static void inline_admission(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_
     vkw.graphics_queue_cap = BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES;
     device = NULL;
     hr = funcs->CreateDevice(info, &IID_ID3D12Device, (void **)&device);
+    query_hr = funcs->QueryAdapterCaps(info, 0, NULL);
     vkw.graphics_queue_cap = 0;
+    checkf(query_hr == S_OK, "admission: QueryAdapterCaps with the graphics family capped at %u VkQueues -> S_OK "
+            "(hr %08lx)", (unsigned int)BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES, (unsigned long)query_hr);
     checkf(SUCCEEDED(hr) && device, "admission: INLINE with the graphics family capped at %u VkQueues -> a device "
             "(hr %08lx)", (unsigned int)BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES, (unsigned long)hr);
     if (FAILED(hr) || !device)
@@ -1911,6 +2604,14 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
     check(shell.bound_count == 1 && internal, "CreateDevice bound one VkQueue, the internal queue (cookie NULL)");
     census_expect_none("after CreateDevice");
 
+    /* V11 in INLINE: the answers of the device just made, with no VkDevice, Services call or thread. */
+    n = shell.binds + shell.failed_binds + shell.unbinds;
+    refs = (ULONG)vkw.device_creates;
+    adapter_caps_equality(funcs, &info, device, "INLINE: ");
+    check(shell.binds + shell.failed_binds + shell.unbinds == n && (ULONG)vkw.device_creates == refs,
+            "QueryAdapterCaps (INLINE) creates no VkDevice and calls no Services");
+    census_expect_none("after QueryAdapterCaps");
+
     /* V7 refusals. */
     memset(&d3d12_desc, 0, sizeof(d3d12_desc));
     d3d12_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -1995,6 +2696,7 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
     census_expect_none("after fence waits");
     allocator_reuse(device, qa);
     multiple_fence_waits(device);
+    imported_memory(funcs, device, info.GetInstanceProcAddr, qa, WAIT_NULL_EVENT, "INLINE imported memory: ");
 
     check(ID3D12CommandQueue_Release(qc) == 0 && !shell_queue_of(COOKIE(0xc0)), "queue C: final Release 0, unbound");
     check(ID3D12CommandQueue_Release(qb) == 0 && !shell_queue_of(COOKIE(0xb0)), "queue B: final Release 0, unbound");
@@ -2278,8 +2980,10 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
         check(ID3D12Device_Release(second) == 0, "second device final Release returns 0");
 
     print_caps(device);
+    adapter_caps_equality(funcs, &info, device, "THREADED: ");
     copy_round_trip(device, NULL, D3D12_COMMAND_LIST_TYPE_DIRECT, WAIT_EVENT, "");
     compute_dispatch(device, NULL, WAIT_EVENT, "");
+    imported_memory(funcs, device, info.GetInstanceProcAddr, NULL, WAIT_EVENT, "THREADED imported memory: ");
 
     /* CreateCommandQueue is for INLINE devices only. */
     memset(&qdesc, 0, sizeof(qdesc));
@@ -2438,12 +3142,30 @@ int main(int argc, char **argv)
         tail_kept &= ((const BYTE *)&funcs)[k] == 0x5e;
     checkf(funcs.Size == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_0 && tail_kept,
             "GetFuncs(1.0) with the 1.0 Size (%u) writes nothing past it", (unsigned int)BC250_VKD3D_ENGINE_FUNCS_SIZE_1_0);
-    memset(&funcs, 0, sizeof(funcs));
+    /* A 1.1 shell's table ends before GetVulkanHandles; a shell that requires 1.1 gets no 1.2 entry even in a
+     * 1.2-sized table. */
+    memset(&funcs, 0x5e, sizeof(funcs));
+    funcs.Size = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_1;
+    check(get_funcs(ABI_1_1, &funcs) == S_OK && funcs.CreateDevice && funcs.CreateCommandQueue,
+            "GetFuncs(1.1) with the 1.1 Size");
+    for (k = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_1, tail_kept = TRUE; k < sizeof(funcs); ++k)
+        tail_kept &= ((const BYTE *)&funcs)[k] == 0x5e;
+    checkf(funcs.Size == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_1 && tail_kept,
+            "GetFuncs(1.1) with the 1.1 Size (%u) writes nothing past it",
+            (unsigned int)BC250_VKD3D_ENGINE_FUNCS_SIZE_1_1);
+    memset(&funcs, 0x5e, sizeof(funcs));
     funcs.Size = sizeof(funcs);
     check(get_funcs(ABI_1_1, &funcs) == S_OK && funcs.CreateDevice && funcs.CreateCommandQueue
-            && funcs.AbiVersion == BC250_VKD3D_ENGINE_ABI_VERSION,
-            "GetFuncs(1.1) fills CreateDevice and CreateCommandQueue");
-    if (!funcs.CreateDevice || !funcs.CreateCommandQueue)
+            && !funcs.GetVulkanHandles && !funcs.CreateHeapFromMemory && !funcs.MapHeap && !funcs.UnmapHeap
+            && !funcs.QueryAdapterCaps && funcs.AbiVersion == BC250_VKD3D_ENGINE_ABI_VERSION,
+            "GetFuncs(1.1) with a 1.2-sized table fills CreateDevice and CreateCommandQueue, and the 1.2 entries NULL");
+    memset(&funcs, 0, sizeof(funcs));
+    funcs.Size = sizeof(funcs);
+    check(get_funcs(ABI_1_2, &funcs) == S_OK && funcs.AbiVersion == ABI_1_2 && funcs.CreateDevice
+            && funcs.CreateCommandQueue && funcs.GetVulkanHandles && funcs.CreateHeapFromMemory && funcs.MapHeap
+            && funcs.UnmapHeap && funcs.QueryAdapterCaps, "GetFuncs(1.2) fills every entry");
+    if (!funcs.CreateDevice || !funcs.CreateCommandQueue || !funcs.GetVulkanHandles || !funcs.CreateHeapFromMemory
+            || !funcs.MapHeap || !funcs.UnmapHeap || !funcs.QueryAdapterCaps)
         return 1;
 
     memset(&info, 0, sizeof(info));
@@ -2480,6 +3202,9 @@ int main(int argc, char **argv)
         services.UnbindQueue = NULL;
         check(funcs.CreateDevice(&bad, &IID_ID3D12Device, (void **)&device) == E_INVALIDARG && !device,
                 "INLINE without UnbindQueue -> E_INVALIDARG");
+        check(funcs.QueryAdapterCaps(&info, 1, NULL) == E_INVALIDARG,
+                "QueryAdapterCaps(1 query, NULL) -> E_INVALIDARG");
+        check(funcs.MapHeap(NULL, (void **)&device) == E_INVALIDARG && !device, "MapHeap(NULL) -> E_INVALIDARG");
     }
 
     /* The Vulkan wrapper's driver; the THREADED suite puts the wrapper in front only where it says so. */
