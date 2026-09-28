@@ -2898,10 +2898,44 @@ static void d3d12_device_destroy_vkd3d_queues(struct d3d12_device *device)
     }
 }
 
+/* amdgpu-wddm fork: what queue family i of a queue selection gives the capability policy. These are the numbers
+ * d3d12_device_create_vkd3d_queues() creates the family with; it reads them from here. Families that resolve to
+ * one Vulkan family share the first one's vkd3d_queue_family_info, and so its numbers. */
+static void vkd3d_queue_info_get_family_caps(const struct d3d12_device *device,
+        const struct vkd3d_device_queue_info *queue_info, unsigned int i, struct vkd3d_queue_family_caps *caps)
+{
+    unsigned int first, k;
+
+    memset(caps, 0, sizeof(*caps));
+    if (queue_info->family_index[i] == VK_QUEUE_FAMILY_IGNORED)
+        return;
+
+    for (first = 0; first < i; first++)
+    {
+        if (queue_info->family_index[first] == queue_info->family_index[i])
+            break;
+    }
+
+    for (k = 0; k < queue_info->vk_family_count; k++)
+    {
+        if (queue_info->vk_queue_create_info[k].queueFamilyIndex == queue_info->family_index[i])
+            caps->queue_count = queue_info->vk_queue_create_info[k].queueCount;
+    }
+
+    /* Unless the queue family only has a single queue to allocate, when NV_low_latency2
+     * is enabled one queue is reserved for out of band work */
+    if (device->vk_info.NV_low_latency2 && vkd3d_queue_family_needs_out_of_band_queue(first) &&
+            queue_info->vk_properties[first].queueCount > 1)
+        caps->queue_count--;
+
+    caps->present = true;
+    caps->timestamp_bits = queue_info->vk_properties[first].timestampValidBits;
+}
+
 static HRESULT d3d12_device_create_vkd3d_queues(struct d3d12_device *device,
         const struct vkd3d_device_queue_info *queue_info)
 {
-    unsigned int i, j, k;
+    unsigned int i, j;
     HRESULT hr;
 
     device->unique_queue_mask = 0;
@@ -2914,7 +2948,7 @@ static HRESULT d3d12_device_create_vkd3d_queues(struct d3d12_device *device,
         device->concurrent_queue_family_indices_image[i] = VK_QUEUE_FAMILY_IGNORED;
     }
 
-    for (i = 0, k = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
+    for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
     {
         struct vkd3d_queue_family_info *info;
 
@@ -2936,13 +2970,8 @@ static HRESULT d3d12_device_create_vkd3d_queues(struct d3d12_device *device,
             goto out_destroy_queues;
         }
 
-        info->queue_count = queue_info->vk_queue_create_info[k++].queueCount;
-
-        /* Unless the queue family only has a single queue to allocate, when NV_low_latency2
-         * is enabled one queue is reserved for out of band work */
-        if (device->vk_info.NV_low_latency2 && vkd3d_queue_family_needs_out_of_band_queue(i) &&
-                queue_info->vk_properties[i].queueCount > 1)
-            info->queue_count--;
+        /* vkd3d_plan_vk_device() recorded the count, the out-of-band queue of NV_low_latency2 excluded. */
+        info->queue_count = device->queue_family_caps[i].queue_count;
 
         if (!(info->queues = vkd3d_calloc(info->queue_count, sizeof(*info->queues))))
         {
@@ -3239,23 +3268,35 @@ static void d3d12_device_cleanup_vendor_hacks(struct d3d12_device *device)
 #endif
 }
 
-static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
-        const struct vkd3d_device_create_info *create_info)
+/* amdgpu-wddm fork: what vkd3d_create_vk_device() decides before vkCreateDevice. */
+struct vkd3d_vk_device_plan
+{
+    struct vkd3d_device_queue_info queue_info;
+    bool *user_extension_supported;
+    uint32_t extension_count;
+};
+
+static void vkd3d_vk_device_plan_cleanup(struct vkd3d_vk_device_plan *plan)
+{
+    vkd3d_free(plan->user_extension_supported);
+    plan->user_extension_supported = NULL;
+}
+
+/* amdgpu-wddm fork: everything of vkd3d_create_vk_device() before vkCreateDevice: the physical device, its
+ * extensions, features and properties with vkd3d-proton's clamps and workarounds, and the queue selection with
+ * what each family gives the capability policy (queue_family_caps). vkd3d_create_adapter_caps() stops here, so
+ * the two see the same inputs. */
+static HRESULT vkd3d_plan_vk_device(struct d3d12_device *device,
+        const struct vkd3d_device_create_info *create_info, struct vkd3d_vk_device_plan *plan)
 {
     const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
-    struct vkd3d_device_queue_info device_queue_info;
+    struct vkd3d_device_queue_info *device_queue_info = &plan->queue_info;
     VkPhysicalDeviceProperties device_properties;
-    bool *user_extension_supported = NULL;
     VkPhysicalDevice physical_device;
-    VkDeviceCreateInfo device_info;
-    unsigned int device_index;
-    uint32_t extension_count;
-    const char **extensions;
-    VkDevice vk_device;
-    VkResult vr;
+    unsigned int device_index, i;
     HRESULT hr;
 
-    TRACE("device %p, create_info %p.\n", device, create_info);
+    memset(plan, 0, sizeof(*plan));
 
     physical_device = create_info->vk_physical_device;
     device_index = vkd3d_env_var_as_uint("VKD3D_VULKAN_DEVICE", ~0u);
@@ -3272,14 +3313,14 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
 
     if (create_info->optional_device_extension_count)
     {
-        if (!(user_extension_supported = vkd3d_calloc(create_info->optional_device_extension_count, sizeof(bool))))
+        if (!(plan->user_extension_supported = vkd3d_calloc(create_info->optional_device_extension_count, sizeof(bool))))
             return E_OUTOFMEMORY;
     }
 
     if (FAILED(hr = vkd3d_init_device_extensions(device, create_info,
-            &extension_count, user_extension_supported)))
+            &plan->extension_count, plan->user_extension_supported)))
     {
-        vkd3d_free(user_extension_supported);
+        vkd3d_vk_device_plan_cleanup(plan);
         return hr;
     }
 
@@ -3288,58 +3329,86 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
     vkd3d_mark_enabled_user_extensions(&device->vk_info,
             create_info->optional_device_extensions,
             create_info->optional_device_extension_count,
-            user_extension_supported);
+            plan->user_extension_supported);
 
     vkd3d_physical_device_info_init(&device->device_info, device);
     vkd3d_physical_device_info_apply_workarounds(&device->device_info, device);
 
     if (FAILED(hr = vkd3d_init_device_caps(device, create_info, &device->device_info)))
     {
-        vkd3d_free(user_extension_supported);
+        vkd3d_vk_device_plan_cleanup(plan);
         return hr;
-    }
-
-    if (!(extensions = vkd3d_calloc(extension_count, sizeof(*extensions))))
-    {
-        vkd3d_free(user_extension_supported);
-        return E_OUTOFMEMORY;
     }
 
     device->concurrent_transfer_queue = d3d12_device_has_fast_concurrent_transfer_queue(device);
 
-    if (FAILED(hr = vkd3d_select_queues(device, physical_device, &device_queue_info)))
+    if (FAILED(hr = vkd3d_select_queues(device, physical_device, device_queue_info)))
     {
-        vkd3d_free(user_extension_supported);
-        vkd3d_free(extensions);
+        vkd3d_vk_device_plan_cleanup(plan);
         return hr;
     }
 
     TRACE("Using queue family %u for direct command queues.\n",
-            device_queue_info.family_index[VKD3D_QUEUE_FAMILY_GRAPHICS]);
+            device_queue_info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS]);
     TRACE("Using queue family %u for compute command queues.\n",
-            device_queue_info.family_index[VKD3D_QUEUE_FAMILY_COMPUTE]);
+            device_queue_info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE]);
     TRACE("Using queue family %u for copy command queues.\n",
-            device_queue_info.family_index[VKD3D_QUEUE_FAMILY_TRANSFER]);
+            device_queue_info->family_index[VKD3D_QUEUE_FAMILY_TRANSFER]);
     TRACE("Using queue family %u for sparse binding.\n",
-            device_queue_info.family_index[VKD3D_QUEUE_FAMILY_SPARSE_BINDING]);
+            device_queue_info->family_index[VKD3D_QUEUE_FAMILY_SPARSE_BINDING]);
     TRACE("Using queue family %u for optical flow.\n",
-            device_queue_info.family_index[VKD3D_QUEUE_FAMILY_OPTICAL_FLOW]);
+            device_queue_info->family_index[VKD3D_QUEUE_FAMILY_OPTICAL_FLOW]);
 
-    if (device_queue_info.family_index[VKD3D_QUEUE_FAMILY_TRANSFER] ==
-        device_queue_info.family_index[VKD3D_QUEUE_FAMILY_COMPUTE] ||
-        device_queue_info.family_index[VKD3D_QUEUE_FAMILY_TRANSFER] ==
-        device_queue_info.family_index[VKD3D_QUEUE_FAMILY_GRAPHICS])
+    if (device_queue_info->family_index[VKD3D_QUEUE_FAMILY_TRANSFER] ==
+        device_queue_info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE] ||
+        device_queue_info->family_index[VKD3D_QUEUE_FAMILY_TRANSFER] ==
+        device_queue_info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS])
     {
         /* If we emulate TRANSFER queue, we're implicitly concurrent. */
         device->concurrent_transfer_queue = true;
+    }
+
+    for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
+        vkd3d_queue_info_get_family_caps(device, device_queue_info, i, &device->queue_family_caps[i]);
+
+    return S_OK;
+}
+
+static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
+        const struct vkd3d_device_create_info *create_info)
+{
+    const struct vkd3d_vk_instance_procs *vk_procs = &device->vkd3d_instance->vk_procs;
+    struct vkd3d_device_queue_info *device_queue_info;
+    bool *user_extension_supported;
+    struct vkd3d_vk_device_plan plan;
+    VkPhysicalDevice physical_device;
+    VkDeviceCreateInfo device_info;
+    const char **extensions;
+    VkDevice vk_device;
+    VkResult vr;
+    HRESULT hr;
+
+    TRACE("device %p, create_info %p.\n", device, create_info);
+
+    if (FAILED(hr = vkd3d_plan_vk_device(device, create_info, &plan)))
+        return hr;
+
+    physical_device = device->vk_physical_device;
+    device_queue_info = &plan.queue_info;
+    user_extension_supported = plan.user_extension_supported;
+
+    if (!(extensions = vkd3d_calloc(plan.extension_count, sizeof(*extensions))))
+    {
+        vkd3d_vk_device_plan_cleanup(&plan);
+        return E_OUTOFMEMORY;
     }
 
     /* Create device */
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.pNext = device->device_info.features2.pNext;
     device_info.flags = 0;
-    device_info.queueCreateInfoCount = device_queue_info.vk_family_count;
-    device_info.pQueueCreateInfos = device_queue_info.vk_queue_create_info;
+    device_info.queueCreateInfoCount = device_queue_info->vk_family_count;
+    device_info.pQueueCreateInfos = device_queue_info->vk_queue_create_info;
     device_info.enabledLayerCount = 0;
     device_info.ppEnabledLayerNames = NULL;
     device_info.enabledExtensionCount = vkd3d_enable_extensions(extensions, NULL, 0,
@@ -3351,7 +3420,7 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
             user_extension_supported, &device->vk_info);
     device_info.ppEnabledExtensionNames = extensions;
     device_info.pEnabledFeatures = &device->device_info.features2.features;
-    vkd3d_free(user_extension_supported);
+    vkd3d_vk_device_plan_cleanup(&plan);
 
     vr = VK_CALL(vkCreateDevice(physical_device, &device_info, NULL, &vk_device));
     if (vr == VK_ERROR_INITIALIZATION_FAILED &&
@@ -3378,7 +3447,7 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
 
     device->vk_device = vk_device;
 
-    if (FAILED(hr = d3d12_device_create_vkd3d_queues(device, &device_queue_info)))
+    if (FAILED(hr = d3d12_device_create_vkd3d_queues(device, device_queue_info)))
     {
         ERR("Failed to create queues, hr %#x.\n", (int)hr);
         device->vk_procs.vkDestroyDevice(vk_device, NULL);
@@ -9029,8 +9098,8 @@ static D3D12_TILED_RESOURCES_TIER d3d12_device_determine_tiled_resources_tier(st
     if (!features->sparseBinding || !features->sparseResidencyAliased ||
             !features->sparseResidencyBuffer || !features->sparseResidencyImage2D ||
             !sparse_properties->residencyStandard2DBlockShape ||
-            !device->queue_families[VKD3D_QUEUE_FAMILY_SPARSE_BINDING] ||
-            !device->queue_families[VKD3D_QUEUE_FAMILY_SPARSE_BINDING]->queue_count)
+            !device->queue_family_caps[VKD3D_QUEUE_FAMILY_SPARSE_BINDING].present ||
+            !device->queue_family_caps[VKD3D_QUEUE_FAMILY_SPARSE_BINDING].queue_count)
         return D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
 
     if (!features->shaderResourceResidency || !features->shaderResourceMinLod ||
@@ -9431,7 +9500,7 @@ static void d3d12_device_caps_init_feature_options3(struct d3d12_device *device)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS3 *options3 = &device->d3d12_caps.options3;
 
-    options3->CopyQueueTimestampQueriesSupported = !!device->queue_families[VKD3D_QUEUE_FAMILY_TRANSFER]->timestamp_bits;
+    options3->CopyQueueTimestampQueriesSupported = !!device->queue_family_caps[VKD3D_QUEUE_FAMILY_TRANSFER].timestamp_bits;
     options3->CastingFullyTypedFormatSupported = TRUE;
     options3->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
             D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY |

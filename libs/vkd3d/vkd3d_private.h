@@ -5878,6 +5878,14 @@ struct d3d12_device
     struct vkd3d_physical_device_info device_info;
 
     struct vkd3d_queue_family_info *queue_families[VKD3D_QUEUE_FAMILY_COUNT];
+    /* What each queue family gives the capability policy (d3d12_device_caps_init), decided from the queue
+     * selection before any VkQueue exists, so that an adapter query without a VkDevice answers the same. */
+    struct vkd3d_queue_family_caps
+    {
+        bool present;
+        uint32_t queue_count;
+        uint32_t timestamp_bits;
+    } queue_family_caps[VKD3D_QUEUE_FAMILY_COUNT];
     uint32_t concurrent_queue_family_indices_buffer[VKD3D_QUEUE_FAMILY_COUNT];
     uint32_t concurrent_queue_family_buffer_count;
     uint32_t concurrent_queue_family_indices_image[VKD3D_QUEUE_FAMILY_COUNT];
