@@ -4805,7 +4805,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
         if (heap_offset + desc->Width > heap->allocation.resource.size)
         {
             ERR("Heap too small for the buffer (heap=%"PRIu64", offset=%"PRIu64", size=%"PRIu64").\n",
-                heap->allocation.resource.size, heap_offset, memory_requirements.size);
+                heap->allocation.resource.size, heap_offset, desc->Width);
             hr = E_INVALIDARG;
             goto fail;
         }
