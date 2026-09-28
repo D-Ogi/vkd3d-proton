@@ -2866,6 +2866,15 @@ static void d3d12_device_destroy_vkd3d_queues(struct d3d12_device *device)
             vkd3d_queue_drain(queue_family->out_of_band_queue, device);
     }
 
+    /* Inline queue mode: the internal queue is idle now, give it back to the embedder. */
+    if (device->inline_internal_queue && device->inline_internal_queue->inline_bound)
+    {
+        device->inline_callbacks.pfn_unbind_queue(device->inline_callbacks.userdata,
+                NULL, device->inline_internal_queue->vk_queue);
+        device->inline_internal_queue->inline_bound = false;
+    }
+    device->inline_internal_queue = NULL;
+
     for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
     {
         struct vkd3d_queue_family_info *queue_family = device->queue_families[i];
@@ -2994,11 +3003,14 @@ out_destroy_queues:
 }
 
 #define VKD3D_MAX_QUEUE_COUNT_PER_FAMILY (4u)
+/* Inline queue mode: every D3D12 queue needs a VkQueue of its own, so take what the family has. */
+#define VKD3D_MAX_QUEUE_COUNT_PER_FAMILY_INLINE (16u)
 
-/* The queue priorities list contains VKD3D_MAX_QUEUE_COUNT_PER_FAMILY + 1 priorities
+/* The queue priorities list contains VKD3D_MAX_QUEUE_COUNT_PER_FAMILY_INLINE + 1 priorities
  * because it is possible for low latency to add an additional queue for out of band work
  * submission. */
-static float queue_priorities[] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+static float queue_priorities[] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 
 static uint32_t vkd3d_find_queue(unsigned int count, const VkQueueFamilyProperties *properties,
         VkQueueFlags mask, VkQueueFlags flags)
@@ -3098,6 +3110,18 @@ static HRESULT vkd3d_select_queues(const struct d3d12_device *device,
 
     info->family_index[VKD3D_QUEUE_FAMILY_INTERNAL_COMPUTE] = info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE];
 
+    /* Inline queue mode: memory transfers and sparse initialization share one internal queue,
+     * which the embedder binds like any other. It is a graphics queue, so a dedicated sparse
+     * family (a context of its own for the embedder) is not requested. Without sparse binding
+     * on the graphics family, sparse stays off (tiled resources tier 0). */
+    if (device->inline_queues && info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS] != VK_QUEUE_FAMILY_IGNORED)
+    {
+        info->family_index[VKD3D_QUEUE_FAMILY_INTERNAL_COMPUTE] = info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS];
+        info->family_index[VKD3D_QUEUE_FAMILY_SPARSE_BINDING] =
+                (queue_properties[info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS]].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT)
+                ? info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS] : VK_QUEUE_FAMILY_IGNORED;
+    }
+
     if (single_queue)
     {
         info->family_index[VKD3D_QUEUE_FAMILY_COMPUTE] = info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS];
@@ -3125,7 +3149,8 @@ static HRESULT vkd3d_select_queues(const struct d3d12_device *device,
         queue_info->pNext = NULL;
         queue_info->flags = 0;
         queue_info->queueFamilyIndex = info->family_index[i];
-        queue_info->queueCount = min(info->vk_properties[i].queueCount, VKD3D_MAX_QUEUE_COUNT_PER_FAMILY);
+        queue_info->queueCount = min(info->vk_properties[i].queueCount, device->inline_queues ?
+                VKD3D_MAX_QUEUE_COUNT_PER_FAMILY_INLINE : VKD3D_MAX_QUEUE_COUNT_PER_FAMILY);
         queue_info->pQueuePriorities = queue_priorities;
 
         if (single_queue)
@@ -3947,6 +3972,10 @@ static void d3d12_device_destroy(struct d3d12_device *device)
 
     d3d_destruction_notifier_free(&device->destruction_notifier);
 
+    /* Inline queue mode: release what the clear tracker still holds while the allocator lives. */
+    if (device->inline_queues)
+        vkd3d_memory_transfer_queue_retire(&device->memory_transfers, true);
+
     if (device->internal_sparse_queue)
         d3d12_device_unmap_vkd3d_queue(device->internal_sparse_queue, NULL);
 
@@ -4003,6 +4032,11 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     rwlock_destroy(&device->fragment_output_lock);
     rwlock_destroy(&device->vertex_input_lock);
     pthread_mutex_destroy(&device->mutex);
+    if (device->inline_queues)
+    {
+        vkd3d_free(device->inline_command_queues);
+        pthread_mutex_destroy(&device->inline_mutex);
+    }
     d3d12_device_close_kmt(device);
     if (device->parent)
         IUnknown_Release(device->parent);
@@ -7364,6 +7398,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_SetEventOnMultipleFenceCompletion(
         ID3D12Fence *const *fences, const UINT64 *values, UINT fence_count,
         D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event)
 {
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
     enum vkd3d_waiting_event_type wait_type;
     vkd3d_native_sync_handle handle;
     uint32_t *payload = NULL;
@@ -7390,6 +7425,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_SetEventOnMultipleFenceCompletion(
 
     if (!event && wait_type == VKD3D_WAITING_EVENT_MULTI_ANY)
     {
+        /* Inline queue mode: the temporary event would be set by a fence worker, and there is none. */
+        if (device->inline_queues)
+        {
+            WARN("WAIT_ANY without an event is not supported in inline queue mode.\n");
+            return E_NOTIMPL;
+        }
+
         /* We need to stall the calling thread if any fence gets signaled.
          * Create a temporary event and wait for it later. */
         hr = vkd3d_native_sync_handle_create(0, VKD3D_NATIVE_SYNC_HANDLE_TYPE_EVENT, &handle);
@@ -10553,6 +10595,19 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     device->vk_device = VK_NULL_HANDLE;
 
+    /* Inline queue mode: decided before the queues are selected (vkd3d_select_queues). */
+    if (create_info->inline_queue_callbacks)
+    {
+        if ((rc = pthread_mutex_init(&device->inline_mutex, NULL)))
+        {
+            hr = hresult_from_errno(rc);
+            goto out_free_instance;
+        }
+
+        device->inline_queues = true;
+        device->inline_callbacks = *create_info->inline_queue_callbacks;
+    }
+
     if ((rc = pthread_mutex_init(&device->mutex, NULL)))
     {
         ERR("Failed to initialize mutex, error %d.\n", rc);
@@ -10588,6 +10643,19 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     if (FAILED(hr = vkd3d_memory_transfer_queue_init(&device->memory_transfers, device)))
         goto out_free_private_store;
+
+    /* Inline queue mode: bind the internal queue before anything can submit to it.
+     * d3d12_device_destroy_vkd3d_queues() unbinds it. */
+    if (device->inline_queues)
+    {
+        if (FAILED(hr = device->inline_callbacks.pfn_bind_queue(device->inline_callbacks.userdata,
+                NULL, device->inline_internal_queue->vk_queue)))
+        {
+            WARN("Failed to bind the internal queue, hr %#x.\n", (int)hr);
+            goto out_free_memory_transfers;
+        }
+        device->inline_internal_queue->inline_bound = true;
+    }
 
     if (FAILED(hr = vkd3d_memory_allocator_init(&device->memory_allocator, device)))
         goto out_free_memory_transfers;
@@ -10732,6 +10800,8 @@ out_free_vertex_input_lock:
     rwlock_destroy(&device->vertex_input_lock);
 out_free_mutex:
     pthread_mutex_destroy(&device->mutex);
+    if (device->inline_queues)
+        pthread_mutex_destroy(&device->inline_mutex);
     return hr;
 }
 
@@ -10870,6 +10940,35 @@ bool d3d12_device_validate_shader_meta(struct d3d12_device *device, const struct
     return true;
 }
 
+/* Inline queue mode (amdgpu-wddm fork): the device may start no thread. The fence workers, the
+ * submission threads and the clear tracker have inline variants; refuse what would start any other. */
+static HRESULT d3d12_device_validate_inline_mode(const struct vkd3d_device_create_info *create_info)
+{
+    const struct vkd3d_inline_queue_callbacks *callbacks = create_info->inline_queue_callbacks;
+    char env[64];
+
+    if (!callbacks->pfn_bind_queue || !callbacks->pfn_unbind_queue || !create_info->independent)
+    {
+        WARN("Inline queue mode needs both queue callbacks and an independent device.\n");
+        return E_INVALIDARG;
+    }
+
+    if (vkd3d_get_env_var("VKD3D_SHADER_DEBUG_RING_SIZE_LOG2", env, sizeof(env)) ||
+            vkd3d_descriptor_debug_active_instruction_qa_checks() ||
+            vkd3d_descriptor_debug_active_descriptor_qa_checks() ||
+#ifdef VKD3D_ENABLE_PROFILING
+            vkd3d_get_env_var("VKD3D_TIMESTAMP_PROFILE", env, sizeof(env)) ||
+#endif
+            !VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_APP_CACHE_ONLY))
+    {
+        WARN("The shader debug ring, descriptor QA, the timestamp profiler and the disk cache "
+                "start threads, which the inline queue mode does not allow.\n");
+        return E_INVALIDARG;
+    }
+
+    return S_OK;
+}
+
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
         const struct vkd3d_device_create_info *create_info, struct d3d12_device **device)
 {
@@ -10878,6 +10977,9 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
     struct d3d12_device *object;
     char env[64];
     HRESULT hr;
+
+    if (create_info->inline_queue_callbacks && FAILED(hr = d3d12_device_validate_inline_mode(create_info)))
+        return hr;
 
     if (create_info->independent)
     {
@@ -10888,6 +10990,13 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
 
         if (forced_singletons)
             INFO("Forcing singleton device due to RenderDoc being enabled.\n");
+
+        /* A singleton would share one embedder's queue callbacks with every caller. */
+        if (forced_singletons && create_info->inline_queue_callbacks)
+        {
+            WARN("Inline queue mode cannot use a singleton device.\n");
+            return E_INVALIDARG;
+        }
 
         if (forced_singletons &&
             (create_info->device_factory_flags &
@@ -11218,4 +11327,38 @@ struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device)
     struct d3d12_device *d3d12_device = impl_from_ID3D12Device((d3d12_device_iface *)device);
 
     return d3d12_device->vkd3d_instance;
+}
+
+HRESULT vkd3d_create_inline_command_queue(ID3D12Device *device, const D3D12_COMMAND_QUEUE_DESC *desc,
+        void *queue_cookie, REFIID iid, void **command_queue)
+{
+    struct d3d12_device *d3d12_device = impl_from_ID3D12Device((d3d12_device_iface *)device);
+    struct d3d12_command_queue *object;
+    HRESULT hr;
+
+    TRACE("device %p, desc %p, queue_cookie %p, iid %s, command_queue %p.\n",
+            device, desc, queue_cookie, debugstr_guid(iid), command_queue);
+
+    if (!command_queue)
+        return E_INVALIDARG;
+    *command_queue = NULL;
+
+    if (!d3d12_device || !desc || !d3d12_device->inline_queues)
+    {
+        WARN("Not a device in inline queue mode, or no queue description.\n");
+        return E_INVALIDARG;
+    }
+
+    if ((desc->Type != D3D12_COMMAND_LIST_TYPE_DIRECT && desc->Type != D3D12_COMMAND_LIST_TYPE_COMPUTE &&
+            desc->Type != D3D12_COMMAND_LIST_TYPE_COPY) || desc->NodeMask > 1)
+    {
+        WARN("Unsupported queue type %#x or node mask %#x.\n", desc->Type, desc->NodeMask);
+        return E_INVALIDARG;
+    }
+
+    if (FAILED(hr = d3d12_command_queue_create_inline(d3d12_device, desc, queue_cookie, &object)))
+        return hr;
+
+    return return_interface(&object->ID3D12CommandQueue_iface, &IID_ID3D12CommandQueue,
+            iid, command_queue);
 }

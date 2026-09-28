@@ -39,6 +39,9 @@ static void d3d12_fence_iface_inc_ref(d3d12_fence_iface *iface);
 static void d3d12_fence_iface_dec_ref(d3d12_fence_iface *iface);
 static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator);
 static HRESULT d3d12_fence_signal_cpu_timeline_semaphore(struct d3d12_fence *fence, uint64_t value);
+static void d3d12_command_queue_process_inline_locked(struct d3d12_command_queue *queue,
+        const struct d3d12_command_queue_submission *sub);
+static void d3d12_command_queue_inline_teardown(struct d3d12_command_queue *queue);
 
 /* This must be at least twice the number of texture region batches, since we must be able to resolve
  * a source + destination memory barrier per copy without incurring a barrier flush.
@@ -251,6 +254,15 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
     if (!(vk_queue = vkd3d_queue_acquire(queue)))
     {
         ERR("Failed to acquire queue %p.\n", queue);
+        return;
+    }
+
+    /* Inline queue mode: a VkQueue the embedder has not bound (or has got back) must not be
+     * touched. Its pending waits only order later submissions, and there are none. */
+    if (device->inline_queues && !queue->inline_bound)
+    {
+        queue->wait_count = 0u;
+        vkd3d_queue_release(queue);
         return;
     }
 
@@ -762,6 +774,11 @@ static HRESULT vkd3d_fence_worker_start(struct vkd3d_fence_worker *worker,
         return hresult_from_errno(rc);
     }
 
+    /* Inline queue mode: the worker keeps the list of in-flight submissions, and the device's
+     * entry points retire it (d3d12_device_inline_retire). It has no thread. */
+    if (device->inline_queues)
+        return S_OK;
+
     if (pthread_create(&worker->thread, NULL, vkd3d_fence_worker_main, worker))
     {
         pthread_mutex_destroy(&worker->mutex);
@@ -788,7 +805,8 @@ static HRESULT vkd3d_fence_worker_stop(struct vkd3d_fence_worker *worker,
     worker->should_exit = true;
     pthread_cond_signal(&worker->cond);
     pthread_mutex_unlock(&worker->mutex);
-    pthread_join(worker->thread, NULL);
+    if (!device->inline_queues)
+        pthread_join(worker->thread, NULL);
 
     pthread_mutex_destroy(&worker->mutex);
     pthread_cond_destroy(&worker->cond);
@@ -1008,6 +1026,24 @@ static bool d3d12_fence_block_until_pending_value_reaches_locked(
 
         if (pending_value > fence->max_pending_virtual_timeline_value)
         {
+            /* Inline queue mode: this is the caller's thread; blocking here could wait for a signal
+             * that only this thread would submit. d3d12_command_queue_Wait() refuses a wait before
+             * its signal; a rewind since then drops the wait. */
+            if (command_queue->device->inline_queues)
+            {
+                ERR("Dropping a wait on fence %p for 0x%"PRIx64", which has no pending signal.\n",
+                        fence, pending_value);
+                for (i = 0; i < fence->wait_tickets_count; i++)
+                {
+                    if (fence->wait_tickets[i].ticket == ticket)
+                    {
+                        fence->wait_tickets[i] = fence->wait_tickets[--fence->wait_tickets_count];
+                        break;
+                    }
+                }
+                return false;
+            }
+
             TRACE("Blocking wait on fence %p until it reaches 0x%"PRIx64".\n", fence, pending_value);
             pthread_cond_wait(&fence->cond, &fence->mutex);
 
@@ -1371,6 +1407,10 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface 
 
     TRACE("iface %p.\n", iface);
 
+    /* Inline queue mode: no fence worker signals the fence, poll the queues instead. */
+    if (fence->device->inline_queues)
+        d3d12_device_inline_retire(fence->device);
+
     if ((rc = pthread_mutex_lock(&fence->mutex)))
     {
         ERR("Failed to lock mutex, error %d.\n", rc);
@@ -1381,6 +1421,71 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface 
     return completed_value;
 }
 
+/* Inline queue mode: a wait with no event blocks the caller, and no fence worker will signal the
+ * fence. Wait for the GPU timeline of the pending signal that reaches the value first, then retire.
+ * With no pending signal, only another thread (CPU Signal or queue Signal) can reach the value. */
+static HRESULT d3d12_fence_inline_wait_for_event(struct d3d12_fence *fence, const struct vkd3d_waiting_event *event)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &fence->device->vk_procs;
+    VkSemaphoreWaitInfo wait_info;
+    VkSemaphore vk_semaphore;
+    uint64_t update_count;
+    uint64_t vk_value = 0;
+    HRESULT hr;
+    VkResult vr;
+    size_t i;
+
+    for (;;)
+    {
+        d3d12_device_inline_retire(fence->device);
+
+        pthread_mutex_lock(&fence->mutex);
+
+        if (event->value <= fence->virtual_value)
+        {
+            hr = vkd3d_waiting_event_signal(fence->device, NULL, event);
+            pthread_mutex_unlock(&fence->mutex);
+            return hr;
+        }
+
+        vk_semaphore = VK_NULL_HANDLE;
+        update_count = UINT64_MAX;
+
+        for (i = 0; i < fence->pending_updates_count; i++)
+        {
+            if (fence->pending_updates[i].virtual_value >= event->value &&
+                    fence->pending_updates[i].update_count < update_count)
+            {
+                update_count = fence->pending_updates[i].update_count;
+                vk_semaphore = fence->pending_updates[i].vk_semaphore;
+                vk_value = fence->pending_updates[i].vk_semaphore_value;
+            }
+        }
+
+        if (vk_semaphore == VK_NULL_HANDLE)
+        {
+            pthread_cond_wait(&fence->cond, &fence->mutex);
+            pthread_mutex_unlock(&fence->mutex);
+            continue;
+        }
+
+        pthread_mutex_unlock(&fence->mutex);
+
+        memset(&wait_info, 0, sizeof(wait_info));
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &vk_semaphore;
+        wait_info.pValues = &vk_value;
+
+        if ((vr = VK_CALL(vkWaitSemaphores(fence->device->vk_device, &wait_info, UINT64_MAX))))
+        {
+            ERR("Failed to wait for timeline semaphore, vr %d.\n", vr);
+            VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(fence->device, vr == VK_ERROR_DEVICE_LOST);
+            return hresult_from_vk_result(vr);
+        }
+    }
+}
+
 static HRESULT d3d12_fence_set_native_sync_handle_on_completion_explicit(struct d3d12_fence *fence,
         enum vkd3d_waiting_event_type wait_type, UINT64 value, vkd3d_native_sync_handle handle, uint32_t *payload)
 {
@@ -1389,6 +1494,23 @@ static HRESULT d3d12_fence_set_native_sync_handle_on_completion_explicit(struct 
     HRESULT hr;
     bool latch;
     int rc;
+
+    /* Inline queue mode: an event is set when an entry point observes completion (V8). */
+    if (fence->device->inline_queues)
+    {
+        if (!vkd3d_native_sync_handle_is_valid(handle))
+        {
+            memset(&event, 0, sizeof(event));
+            event.wait_type = wait_type;
+            event.value = value;
+            event.handle = handle;
+            event.latch = &latch;
+            event.payload = payload;
+            return d3d12_fence_inline_wait_for_event(fence, &event);
+        }
+
+        d3d12_device_inline_retire(fence->device);
+    }
 
     if ((rc = pthread_mutex_lock(&fence->mutex)))
     {
@@ -1994,6 +2116,13 @@ HRESULT d3d12_shared_fence_create(struct d3d12_device *device,
 {
     struct d3d12_shared_fence *object;
     HRESULT hr;
+
+    /* Inline queue mode: a shared fence's event wait needs a thread of its own. */
+    if (device->inline_queues)
+    {
+        WARN("Shared fences are not supported in inline queue mode.\n");
+        return E_INVALIDARG;
+    }
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
@@ -2926,6 +3055,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
         TRACE("Resetting command list %p.\n", list);
     }
 
+    /* Inline queue mode: submissions release their allocator references when an entry point
+     * observes their completion, so observe it before counting them. */
+    if (allocator->device->inline_queues)
+        d3d12_device_inline_retire(allocator->device);
+
     /* We only expect there to be only one internal ref live, the public refcount. */
     if ((internal_refs = vkd3d_atomic_uint32_load_explicit(&allocator->internal_refcount, vkd3d_memory_order_acquire)) > 1)
     {
@@ -3051,6 +3185,32 @@ struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_
             queue = queue_family->queues[i];
     }
 
+    /* Inline queue mode: the embedder binds each VkQueue to one context, so a D3D12 queue never
+     * shares one. The device's internal users (memory transfers, sparse initialization) share a
+     * single internal queue. NULL means that no VkQueue of this family is free. */
+    if (queue->device->inline_queues)
+    {
+        struct d3d12_device *device = queue->device;
+
+        if (!command_queue && device->inline_internal_queue)
+        {
+            /* Any internal queue is in the internal family; vkd3d_select_queues() ensures it. */
+            queue = device->inline_internal_queue->vk_family_index == queue_family->vk_family_index
+                    ? device->inline_internal_queue : NULL;
+        }
+        else if (queue->virtual_queue_count)
+        {
+            queue = NULL;
+        }
+        else if (!command_queue)
+        {
+            device->inline_internal_queue = queue;
+        }
+
+        if (!queue)
+            goto unlock;
+    }
+
     queue->virtual_queue_count++;
 
     if (command_queue)
@@ -3061,6 +3221,7 @@ struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_
         queue->command_queues[queue->command_queue_count++] = command_queue;
     }
 
+unlock:
     for (i = 0; i < queue_family->queue_count; i++)
         pthread_mutex_unlock(&queue_family->queues[i]->command_queue_mutex);
 
@@ -23162,7 +23323,8 @@ VKD3D_METHODENTRY_NONSTATIC(HRESULT) d3d12_command_queue_QueryInterface(ID3D12Co
         return S_OK;
     }
 
-    if (IsEqualGUID(riid, &IID_IDXGIVkSwapChainFactory))
+    /* Inline queue mode: no swapchain factory, its swapchains start a thread. */
+    if (IsEqualGUID(riid, &IID_IDXGIVkSwapChainFactory) && !command_queue->device->inline_queues)
     {
         IDXGIVkSwapChainFactory_AddRef(&command_queue->vk_swap_chain_factory.IDXGIVkSwapChainFactory_iface);
         *object = &command_queue->vk_swap_chain_factory;
@@ -23206,16 +23368,23 @@ VKD3D_METHODENTRY_NONSTATIC(ULONG) d3d12_command_queue_Release(ID3D12CommandQueu
         d3d_destruction_notifier_free(&command_queue->destruction_notifier);
         vkd3d_private_store_destroy(&command_queue->private_store);
 
-        /* It's important to unmap the queue first, before we send the STOP signal.
-         * Once the STOP signal has been received by command queue thread,
-         * it will no longer process commands.
-         * This can be a problem for unrelated code like resource retaining
-         * that attempts to loop over mapped queues and send submits to them. */
-        d3d12_device_unmap_vkd3d_queue(command_queue->vkd3d_queue, command_queue);
+        if (device->inline_queues)
+        {
+            d3d12_command_queue_inline_teardown(command_queue);
+        }
+        else
+        {
+            /* It's important to unmap the queue first, before we send the STOP signal.
+             * Once the STOP signal has been received by command queue thread,
+             * it will no longer process commands.
+             * This can be a problem for unrelated code like resource retaining
+             * that attempts to loop over mapped queues and send submits to them. */
+            d3d12_device_unmap_vkd3d_queue(command_queue->vkd3d_queue, command_queue);
 
-        d3d12_command_queue_submit_stop(command_queue);
+            d3d12_command_queue_submit_stop(command_queue);
 
-        pthread_join(command_queue->submission_thread, NULL);
+            pthread_join(command_queue->submission_thread, NULL);
+        }
         pthread_mutex_destroy(&command_queue->queue_lock);
         pthread_cond_destroy(&command_queue->queue_cond);
 
@@ -24145,6 +24314,25 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Wait(ID3D12CommandQueue *iface,
 
     TRACE("iface %p, fence %p, value %#"PRIx64".\n", iface, fence_iface, value);
 
+    /* Inline queue mode: a wait whose signal has not been submitted yet would block the caller
+     * (d3d12_fence_block_until_pending_value_reaches_locked); refuse it (V7). */
+    if (command_queue->device->inline_queues && !is_shared_ID3D12Fence(fence_iface))
+    {
+        struct d3d12_fence *fence = impl_from_ID3D12Fence(fence_iface);
+        bool unsignalled;
+
+        d3d12_fence_lock(fence);
+        unsignalled = value > fence->max_pending_virtual_timeline_value;
+        d3d12_fence_unlock(fence);
+
+        if (unsignalled)
+        {
+            WARN("Wait for fence %p value %#"PRIx64" before its signal is not supported in inline queue mode.\n",
+                    fence, value);
+            return E_NOTIMPL;
+        }
+    }
+
     d3d12_fence_iface_inc_ref((d3d12_fence_iface *)fence_iface);
 
     if (!is_shared_ID3D12Fence(fence_iface))
@@ -24308,6 +24496,11 @@ static bool d3d12_command_queue_needs_cpu_waits(struct d3d12_command_queue *comm
     unsigned int i;
 
     if (VKD3D_CONFIG_FLAG_IS_SET(NO_STAGGERED_SUBMIT))
+        return false;
+
+    /* Inline queue mode: the VkQueue is never shared, and this runs under queue_lock, while
+     * resource release takes command_queue_mutex before queue_lock. Do not lock here. */
+    if (command_queue->device->inline_queues)
         return false;
 
     pthread_mutex_lock(&command_queue->vkd3d_queue->command_queue_mutex);
@@ -25251,6 +25444,10 @@ static bool d3d12_command_queue_needs_staggered_submissions(struct d3d12_command
     if (command_queue->device->workarounds.tiler_suspend_resume)
         return false;
 
+    /* Inline queue mode: see d3d12_command_queue_needs_cpu_waits(). */
+    if (command_queue->device->inline_queues)
+        return false;
+
     pthread_mutex_lock(&command_queue->vkd3d_queue->command_queue_mutex);
 
     if (command_queue->vkd3d_queue->command_queue_count == 1)
@@ -26110,6 +26307,14 @@ void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue *queue
                                                const struct d3d12_command_queue_submission *sub)
 {
     vkd3d_atomic_uint32_increment(&queue->inflight_submissions, vkd3d_memory_order_relaxed);
+
+    /* Inline queue mode: no submission thread; the caller's thread does the work now. */
+    if (queue->device->inline_queues)
+    {
+        d3d12_command_queue_process_inline_locked(queue, sub);
+        return;
+    }
+
     vkd3d_array_reserve((void**)&queue->submissions, &queue->submissions_size,
                         queue->submissions_count + 1, sizeof(*queue->submissions));
     queue->submissions[queue->submissions_count++] = *sub;
@@ -26123,6 +26328,10 @@ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue
      * with the submission thread that calls vkQueueSubmit. */
     if (d3d12_device_use_embedded_mutable_descriptors(queue->device))
         vkd3d_memcpy_non_temporal_barrier();
+
+    /* Inline queue mode: every queue operation is a retirement point (V8). */
+    if (queue->device->inline_queues)
+        d3d12_device_inline_retire(queue->device);
 
     pthread_mutex_lock(&queue->queue_lock);
     d3d12_command_queue_add_submission_locked(queue, sub);
@@ -26224,6 +26433,274 @@ static void d3d12_command_queue_process_execute(struct d3d12_command_queue *queu
     }
     vkd3d_free(execute->breadcrumb_indices);
 #endif
+}
+
+/* Inline queue mode (amdgpu-wddm fork, see vkd3d.h and rules V7/V8 of libs/ddi/bc250_vkd3d_engine.h).
+ *
+ * There is no submission thread and no fence worker thread. A submission runs on the caller's
+ * thread under queue_lock, in the order the submission thread would run it, and returns once it
+ * is submitted. What the fence worker would wait for (allocator and resource references, fence
+ * signals) stays in fence_worker.enqueued_fences, in FIFO order, and is retired by polling the
+ * timelines at entry points: d3d12_device_inline_retire(). */
+static void d3d12_command_queue_process_inline_locked(struct d3d12_command_queue *queue,
+        const struct d3d12_command_queue_submission *sub)
+{
+    struct d3d12_command_queue_submission submission = *sub;
+
+    if (submission.type != VKD3D_SUBMISSION_BIND_SPARSE)
+        d3d12_command_queue_flush_bind_sparse(queue);
+
+    switch (submission.type)
+    {
+        case VKD3D_SUBMISSION_WAIT:
+            /* An inline device has no shared fence (d3d12_shared_fence_create). */
+            d3d12_command_queue_wait(queue, impl_from_ID3D12Fence1(submission.wait.fence),
+                    submission.wait.value, submission.wait.wait_ticket);
+            d3d12_fence_iface_dec_ref(submission.wait.fence);
+            break;
+
+        case VKD3D_SUBMISSION_SIGNAL:
+            d3d12_command_queue_flush_waiters(queue, 0u);
+            d3d12_command_queue_signal_inline(queue, submission.signal.fence, submission.signal.value);
+            d3d12_fence_iface_dec_ref(submission.signal.fence);
+            break;
+
+        case VKD3D_SUBMISSION_EXECUTE:
+            d3d12_command_queue_process_execute(queue, queue->inline_transition_pool, &submission.execute);
+            break;
+
+        case VKD3D_SUBMISSION_BIND_SPARSE:
+            d3d12_command_queue_flush_waiters(queue, VKD3D_WAIT_SEMAPHORES_EXTERNAL);
+            d3d12_command_queue_bind_sparse(queue, submission.bind_sparse.mode,
+                    submission.bind_sparse.dst_resource, submission.bind_sparse.src_resource,
+                    submission.bind_sparse.bind_count, submission.bind_sparse.bind_infos);
+            vkd3d_free(submission.bind_sparse.bind_infos);
+            /* The submission thread defers the bind to the next submission; the caller
+             * expects it submitted when the tile mapping call returns. */
+            d3d12_command_queue_flush_bind_sparse(queue);
+            break;
+
+        case VKD3D_SUBMISSION_DRAIN:
+            d3d12_command_queue_flush_waiters(queue, VKD3D_WAIT_SEMAPHORES_EXTERNAL | VKD3D_WAIT_SEMAPHORES_SERIALIZING);
+            queue->queue_drain_count++;
+            break;
+
+        case VKD3D_SUBMISSION_QUEUE_USING_CALLBACK:
+            d3d12_command_queue_flush_waiters(queue, VKD3D_WAIT_SEMAPHORES_EXTERNAL | VKD3D_WAIT_SEMAPHORES_SERIALIZING);
+            submission.callback.callback(submission.callback.userdata);
+            break;
+
+        case VKD3D_SUBMISSION_RESOURCE_RETAIN:
+            d3d12_command_queue_defer_release_resource(queue, submission.resource);
+            break;
+
+        default:
+            ERR("Unexpected submission type %u in inline queue mode.\n", submission.type);
+            break;
+    }
+
+    vkd3d_atomic_uint32_decrement(&queue->inflight_submissions, vkd3d_memory_order_release);
+}
+
+static bool d3d12_command_queue_inline_entry_is_complete(struct d3d12_command_queue *queue,
+        const struct vkd3d_waiting_fence *entry, uint64_t own_value)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
+    const struct vkd3d_fence_wait_info *info = &entry->fence_info;
+    const struct vkd3d_waiting_fence_signal_order_info *order_info;
+    uint64_t value;
+    bool complete;
+
+    if (info->vk_semaphore == queue->vkd3d_queue->submission_timeline)
+    {
+        if (own_value < info->vk_semaphore_value)
+            return false;
+    }
+    else if (info->vk_semaphore)
+    {
+        if (VK_CALL(vkGetSemaphoreCounterValue(queue->device->vk_device, info->vk_semaphore, &value)) ||
+                value < info->vk_semaphore_value)
+            return false;
+    }
+
+    /* The fence worker would block in this callback until the signalling queue has retired the
+     * signal; here the entry waits until another queue's retirement completes the update. */
+    if (info->release_callback == vkd3d_waiting_fence_ensure_signal_order)
+    {
+        order_info = (const void *)info->userdata;
+        d3d12_fence_lock(order_info->fence);
+        complete = d3d12_fence_update_count_is_complete_locked(order_info->fence, order_info->update_count);
+        d3d12_fence_unlock(order_info->fence);
+        return complete;
+    }
+
+    return true;
+}
+
+/* Retires the completed prefix of the queue's list. With force, it releases everything left as
+ * incomplete (queue teardown, after wait_idle and a normal pass). Returns true on progress.
+ * The device's inline_mutex serializes retirement; only the queue's own thread appends. */
+static bool d3d12_command_queue_inline_retire(struct d3d12_command_queue *queue, bool force)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
+    struct vkd3d_fence_worker *worker = &queue->fence_worker;
+    struct vkd3d_waiting_fence entries[16];
+    size_t i, count, ready;
+    uint64_t own_value = 0;
+    bool progress = false;
+
+    if (!VK_CALL(vkGetSemaphoreCounterValue(queue->device->vk_device,
+            queue->vkd3d_queue->submission_timeline, &own_value)))
+        vkd3d_queue_update_observed_cpu_timeline(queue->vkd3d_queue, own_value);
+
+    for (;;)
+    {
+        pthread_mutex_lock(&worker->mutex);
+        count = min(worker->enqueued_fence_count, ARRAY_SIZE(entries));
+        memcpy(entries, worker->enqueued_fences, count * sizeof(*entries));
+        pthread_mutex_unlock(&worker->mutex);
+
+        for (ready = 0; ready < count; ready++)
+        {
+            if (!force && !d3d12_command_queue_inline_entry_is_complete(queue, &entries[ready], own_value))
+                break;
+        }
+
+        if (!ready)
+            return progress;
+
+        pthread_mutex_lock(&worker->mutex);
+        worker->enqueued_fence_count -= ready;
+        memmove(worker->enqueued_fences, worker->enqueued_fences + ready,
+                worker->enqueued_fence_count * sizeof(*worker->enqueued_fences));
+        pthread_mutex_unlock(&worker->mutex);
+
+        for (i = 0; i < ready; i++)
+            vkd3d_waiting_fence_complete_submissions(queue->device, worker, &entries[i], !force);
+
+        progress = true;
+    }
+}
+
+void d3d12_device_inline_retire(struct d3d12_device *device)
+{
+    bool progress;
+    size_t i;
+
+    /* A signal retired on one queue can complete a signal-order entry on another. */
+    pthread_mutex_lock(&device->inline_mutex);
+    do
+    {
+        progress = false;
+        for (i = 0; i < device->inline_command_queue_count; i++)
+            progress |= d3d12_command_queue_inline_retire(device->inline_command_queues[i], false);
+    } while (progress);
+    pthread_mutex_unlock(&device->inline_mutex);
+
+    vkd3d_memory_transfer_queue_retire(&device->memory_transfers, false);
+}
+
+static HRESULT d3d12_command_queue_inline_init(struct d3d12_command_queue *queue)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
+    struct d3d12_device *device = queue->device;
+    HRESULT hr;
+
+    if (!(queue->inline_transition_pool = vkd3d_calloc(1, sizeof(*queue->inline_transition_pool))))
+        return E_OUTOFMEMORY;
+
+    if (FAILED(hr = d3d12_command_queue_transition_pool_init(queue->inline_transition_pool, queue)))
+        goto fail;
+
+    pthread_mutex_lock(&device->inline_mutex);
+    if (!vkd3d_array_reserve((void **)&device->inline_command_queues, &device->inline_command_queue_size,
+            device->inline_command_queue_count + 1, sizeof(*device->inline_command_queues)))
+    {
+        pthread_mutex_unlock(&device->inline_mutex);
+        hr = E_OUTOFMEMORY;
+        goto fail;
+    }
+    pthread_mutex_unlock(&device->inline_mutex);
+
+    /* The VkQueue is ours alone (d3d12_device_allocate_vkd3d_queue); bind it before any submission. */
+    if (FAILED(hr = device->inline_callbacks.pfn_bind_queue(device->inline_callbacks.userdata,
+            queue->inline_cookie, queue->vkd3d_queue->vk_queue)))
+    {
+        WARN("Failed to bind VkQueue %p, hr %#x.\n", (void *)queue->vkd3d_queue->vk_queue, (int)hr);
+        goto fail;
+    }
+    queue->vkd3d_queue->inline_bound = true;
+
+    pthread_mutex_lock(&device->inline_mutex);
+    device->inline_command_queues[device->inline_command_queue_count++] = queue;
+    pthread_mutex_unlock(&device->inline_mutex);
+    return S_OK;
+
+fail:
+    /* The pool's timeline is created after its command pool, so without it there is nothing to wait for. */
+    if (queue->inline_transition_pool->timeline)
+    {
+        d3d12_command_queue_transition_pool_deinit(queue->inline_transition_pool, device);
+    }
+    else
+    {
+        VK_CALL(vkDestroyCommandPool(device->vk_device, queue->inline_transition_pool->pool, NULL));
+    }
+    vkd3d_free(queue->inline_transition_pool);
+    queue->inline_transition_pool = NULL;
+    return hr;
+}
+
+/* Replaces unmap, STOP and join of the final Release: the queue is idle, retired and unbound
+ * before its VkQueue can go to another queue. */
+static void d3d12_command_queue_inline_teardown(struct d3d12_command_queue *queue)
+{
+    struct d3d12_device *device = queue->device;
+    struct vkd3d_queue *vkd3d_queue = queue->vkd3d_queue;
+    size_t i;
+
+    /* Stop resource release from adding work to this queue, keep the VkQueue reserved. */
+    pthread_mutex_lock(&vkd3d_queue->command_queue_mutex);
+    for (i = 0; i < vkd3d_queue->command_queue_count; i++)
+    {
+        if (vkd3d_queue->command_queues[i] == queue)
+        {
+            vkd3d_queue->command_queues[i] = vkd3d_queue->command_queues[--vkd3d_queue->command_queue_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&vkd3d_queue->command_queue_mutex);
+
+    pthread_mutex_lock(&queue->queue_lock);
+    d3d12_command_queue_flush_bind_sparse(queue);
+    d3d12_command_queue_wait_idle(queue);
+    pthread_mutex_unlock(&queue->queue_lock);
+
+    d3d12_command_queue_transition_pool_deinit(queue->inline_transition_pool, device);
+    vkd3d_free(queue->inline_transition_pool);
+    queue->inline_transition_pool = NULL;
+    d3d12_command_queue_destroy_serializing_semaphore(queue);
+
+    d3d12_device_inline_retire(device);
+
+    pthread_mutex_lock(&device->inline_mutex);
+    for (i = 0; i < device->inline_command_queue_count; i++)
+    {
+        if (device->inline_command_queues[i] == queue)
+        {
+            device->inline_command_queues[i] = device->inline_command_queues[--device->inline_command_queue_count];
+            break;
+        }
+    }
+    d3d12_command_queue_inline_retire(queue, true);
+    pthread_mutex_unlock(&device->inline_mutex);
+
+    device->inline_callbacks.pfn_unbind_queue(device->inline_callbacks.userdata,
+            queue->inline_cookie, vkd3d_queue->vk_queue);
+    vkd3d_queue->inline_bound = false;
+
+    /* Only now may another queue get this VkQueue. */
+    d3d12_device_unmap_vkd3d_queue(vkd3d_queue, NULL);
 }
 
 static void *d3d12_command_queue_submission_worker_main(void *userdata)
@@ -26375,6 +26852,14 @@ static HRESULT d3d12_command_queue_init(struct d3d12_command_queue *queue,
         queue->desc.NodeMask = 0x1;
 
     queue->vkd3d_queue = d3d12_device_allocate_vkd3d_queue(family_info, queue);
+
+    /* Inline queue mode never shares a VkQueue, so the allocation can fail. */
+    if (!queue->vkd3d_queue)
+    {
+        WARN("Every VkQueue of family %u is in use.\n", family_info->vk_family_index);
+        return E_OUTOFMEMORY;
+    }
+
     queue->out_of_band_queue_type = VK_OUT_OF_BAND_QUEUE_TYPE_MAX_ENUM_NV;
     queue->submissions = NULL;
     queue->submissions_count = 0;
@@ -26418,7 +26903,16 @@ static HRESULT d3d12_command_queue_init(struct d3d12_command_queue *queue,
     if (FAILED(hr = vkd3d_fence_worker_start(&queue->fence_worker, queue, device)))
         goto fail_fence_worker_start;
 
-    if ((rc = pthread_create(&queue->submission_thread, NULL, d3d12_command_queue_submission_worker_main, queue)) < 0)
+    if (device->inline_queues)
+    {
+        /* Inline queue mode: no submission thread, see d3d12_command_queue_process_inline_locked(). */
+        if (FAILED(hr = d3d12_command_queue_inline_init(queue)))
+        {
+            d3d12_device_release(queue->device);
+            goto fail_pthread_create;
+        }
+    }
+    else if ((rc = pthread_create(&queue->submission_thread, NULL, d3d12_command_queue_submission_worker_main, queue)) < 0)
     {
         d3d12_device_release(queue->device);
         hr = hresult_from_errno(rc);
@@ -26451,6 +26945,13 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
     struct d3d12_command_queue *object;
     HRESULT hr;
 
+    /* Inline queue mode: a queue needs the embedder's cookie, see vkd3d_create_inline_command_queue(). */
+    if (device->inline_queues)
+    {
+        WARN("ID3D12Device::CreateCommandQueue is not supported in inline queue mode.\n");
+        return E_NOTIMPL;
+    }
+
     if (!(object = vkd3d_calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
 
@@ -26466,6 +26967,33 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
 
     *queue = object;
 
+    return S_OK;
+}
+
+HRESULT d3d12_command_queue_create_inline(struct d3d12_device *device,
+        const D3D12_COMMAND_QUEUE_DESC *desc, void *cookie, struct d3d12_command_queue **queue)
+{
+    struct vkd3d_queue_family_info *family_info;
+    struct d3d12_command_queue *object;
+    HRESULT hr;
+
+    if (!(object = vkd3d_calloc(1, sizeof(*object))))
+        return E_OUTOFMEMORY;
+
+    object->inline_cookie = cookie;
+    family_info = d3d12_device_get_vkd3d_queue_family(device, desc->Type, VK_QUEUE_FAMILY_IGNORED);
+
+    if (FAILED(hr = d3d12_command_queue_init(object, device, desc, family_info)))
+    {
+        vkd3d_free(object);
+        return hr;
+    }
+
+    TRACE("Created inline command queue %p on VkQueue %p, family %u, index %u.\n", object,
+            (void *)object->vkd3d_queue->vk_queue, object->vkd3d_queue->vk_family_index,
+            object->vkd3d_queue->vk_queue_index);
+
+    *queue = object;
     return S_OK;
 }
 

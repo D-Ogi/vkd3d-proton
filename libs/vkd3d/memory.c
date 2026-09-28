@@ -110,15 +110,65 @@ static void vkd3d_memory_transfer_queue_track_resource_locked(struct vkd3d_memor
     pthread_cond_signal(&queue->cond);
 }
 
+static bool vkd3d_memory_transfer_queue_wait_semaphore(struct vkd3d_memory_transfer_queue *queue,
+        uint64_t wait_value, uint64_t timeout);
+
+/* Inline queue mode (amdgpu-wddm fork): there is no tracker thread, so the device's entry points
+ * release the resources whose uploads have completed, and cleanup waits for the rest. */
+void vkd3d_memory_transfer_queue_retire(struct vkd3d_memory_transfer_queue *queue, bool wait)
+{
+    struct d3d12_resource *resources[64];
+    size_t i, count;
+
+    do
+    {
+        count = 0;
+
+        pthread_mutex_lock(&queue->mutex);
+
+        /* Entries are appended in submission order, so their values never decrease. */
+        while (count < ARRAY_SIZE(resources) && count < queue->tracked_resource_count &&
+                vkd3d_memory_transfer_queue_wait_semaphore(queue,
+                        queue->tracked_resources[count].semaphore_value, wait ? UINT64_MAX : 0))
+        {
+            resources[count] = queue->tracked_resources[count].resource;
+            count++;
+        }
+
+        if (count)
+        {
+            queue->tracked_resource_count -= count;
+            memmove(queue->tracked_resources, queue->tracked_resources + count,
+                    queue->tracked_resource_count * sizeof(*queue->tracked_resources));
+        }
+
+        pthread_mutex_unlock(&queue->mutex);
+
+        /* The final release may free memory, which takes this queue's mutex. */
+        for (i = 0; i < count; i++)
+        {
+            if (resources[i])
+                vkd3d_release_tracked_resource(resources[i]);
+        }
+    } while (count == ARRAY_SIZE(resources));
+}
+
 void vkd3d_memory_transfer_queue_cleanup(struct vkd3d_memory_transfer_queue *queue)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
 
-    pthread_mutex_lock(&queue->mutex);
-    vkd3d_memory_transfer_queue_track_resource_locked(queue, NULL, 0);
-    pthread_mutex_unlock(&queue->mutex);
+    if (queue->device->inline_queues)
+    {
+        vkd3d_memory_transfer_queue_retire(queue, true);
+    }
+    else
+    {
+        pthread_mutex_lock(&queue->mutex);
+        vkd3d_memory_transfer_queue_track_resource_locked(queue, NULL, 0);
+        pthread_mutex_unlock(&queue->mutex);
 
-    pthread_join(queue->thread, NULL);
+        pthread_join(queue->thread, NULL);
+    }
 
     VK_CALL(vkDestroyCommandPool(queue->device->vk_device, queue->vk_command_pool, NULL));
     VK_CALL(vkDestroySemaphore(queue->device->vk_device, queue->vk_semaphore, NULL));
@@ -147,6 +197,10 @@ HRESULT vkd3d_memory_transfer_queue_init(struct vkd3d_memory_transfer_queue *que
     queue->vkd3d_queue = d3d12_device_allocate_vkd3d_queue(
             device->queue_families[VKD3D_QUEUE_FAMILY_INTERNAL_COMPUTE], NULL);
 
+    /* Inline queue mode never shares a VkQueue, so the allocation can fail. */
+    if (!queue->vkd3d_queue)
+        return E_OUTOFMEMORY;
+
     queue->last_known_value = VKD3D_MEMORY_TRANSFER_COMMAND_BUFFER_COUNT;
     queue->next_signal_value = VKD3D_MEMORY_TRANSFER_COMMAND_BUFFER_COUNT + 1;
 
@@ -159,7 +213,8 @@ HRESULT vkd3d_memory_transfer_queue_init(struct vkd3d_memory_transfer_queue *que
         return hresult_from_errno(rc);
     }
 
-    if ((rc = pthread_create(&queue->thread, NULL,
+    /* Inline queue mode: no tracker thread, see vkd3d_memory_transfer_queue_retire(). */
+    if (!device->inline_queues && (rc = pthread_create(&queue->thread, NULL,
             vkd3d_memory_transfer_queue_run_thread, queue)))
     {
         pthread_mutex_destroy(&queue->mutex);

@@ -59,6 +59,21 @@ extern "C" {
 
 struct vkd3d_instance;
 
+/* Inline queue mode (amdgpu-wddm fork, used by libs/ddi; see rule V7 of libs/ddi/bc250_vkd3d_engine.h).
+ * The device starts no threads: every queue operation runs on the caller's thread, and every
+ * D3D12 queue owns one VkQueue. The embedder binds each VkQueue before the device first submits
+ * to it (queue_cookie is NULL for the device's internal queue) and gets it back once it is idle.
+ * The calling convention matches the embedder's ABI, so it can pass its own callbacks through. */
+typedef HRESULT (WINAPI *PFN_vkd3d_bind_queue)(void *userdata, void *queue_cookie, VkQueue vk_queue);
+typedef void (WINAPI *PFN_vkd3d_unbind_queue)(void *userdata, void *queue_cookie, VkQueue vk_queue);
+
+struct vkd3d_inline_queue_callbacks
+{
+    void *userdata;
+    PFN_vkd3d_bind_queue pfn_bind_queue;
+    PFN_vkd3d_unbind_queue pfn_unbind_queue;
+};
+
 struct vkd3d_instance_create_info
 {
     /* If set to NULL, libvkd3d loads libvulkan. */
@@ -91,6 +106,10 @@ struct vkd3d_device_create_info
 
     D3D12_DEVICE_FACTORY_FLAGS device_factory_flags;
     bool independent;
+
+    /* Non-NULL selects the inline queue mode (amdgpu-wddm fork); the device keeps a copy.
+     * Requires independent. */
+    const struct vkd3d_inline_queue_callbacks *inline_queue_callbacks;
 };
 
 struct vkd3d_image_resource_create_info
@@ -122,6 +141,9 @@ void vkd3d_release_vk_queue(ID3D12CommandQueue *queue);
 VkQueue vkd3d_lock_vk_queue(ID3D12CommandQueue *queue);
 void vkd3d_unlock_vk_queue(ID3D12CommandQueue *queue);
 void vkd3d_enqueue_initial_transition(ID3D12CommandQueue *queue, ID3D12Resource *resource);
+/* Inline queue mode (amdgpu-wddm fork): the only way to create a queue of such a device. */
+HRESULT vkd3d_create_inline_command_queue(ID3D12Device *device, const D3D12_COMMAND_QUEUE_DESC *desc,
+        void *queue_cookie, REFIID iid, void **command_queue);
 
 ULONG vkd3d_resource_decref(ID3D12Resource *resource);
 ULONG vkd3d_resource_incref(ID3D12Resource *resource);

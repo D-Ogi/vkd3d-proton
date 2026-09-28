@@ -978,6 +978,8 @@ struct vkd3d_memory_transfer_queue
 void vkd3d_memory_transfer_queue_cleanup(struct vkd3d_memory_transfer_queue *queue);
 HRESULT vkd3d_memory_transfer_queue_init(struct vkd3d_memory_transfer_queue *queue, struct d3d12_device *device);
 HRESULT vkd3d_memory_transfer_queue_flush(struct vkd3d_memory_transfer_queue *queue);
+/* Inline queue mode: releases the tracked resources whose transfers have completed (wait: all of them). */
+void vkd3d_memory_transfer_queue_retire(struct vkd3d_memory_transfer_queue *queue, bool wait);
 HRESULT vkd3d_memory_transfer_queue_write_subresource(struct vkd3d_memory_transfer_queue *queue,
         struct d3d12_resource *resource, uint32_t subresource_idx, VkOffset3D offset, VkExtent3D extent);
 HRESULT vkd3d_memory_transfer_queue_build_empty_rtas(struct vkd3d_memory_transfer_queue *queue);
@@ -3698,6 +3700,9 @@ struct vkd3d_queue
     uint32_t wait_count;
 
     UINT64 cpu_observed_timeline_value;
+
+    /* Inline queue mode: the embedder has bound this VkQueue; only then may it be submitted to. */
+    bool inline_bound;
 };
 
 VkQueue vkd3d_queue_acquire(struct vkd3d_queue *queue);
@@ -3907,6 +3912,11 @@ struct d3d12_command_queue
 
     uint32_t inflight_submissions;
 
+    /* Inline queue mode: the embedder's cookie, and the transition pool the submission thread
+     * would keep on its stack. fence_worker holds the retire list; it has no thread. */
+    void *inline_cookie;
+    struct d3d12_command_queue_transition_pool *inline_transition_pool;
+
     struct
     {
         uint32_t buffer_binds_count;
@@ -3932,6 +3942,9 @@ struct d3d12_command_queue
 
 HRESULT d3d12_command_queue_create(struct d3d12_device *device,
         const D3D12_COMMAND_QUEUE_DESC *desc, uint32_t vk_family_index, struct d3d12_command_queue **queue);
+HRESULT d3d12_command_queue_create_inline(struct d3d12_device *device,
+        const D3D12_COMMAND_QUEUE_DESC *desc, void *cookie, struct d3d12_command_queue **queue);
+void d3d12_device_inline_retire(struct d3d12_device *device);
 void d3d12_command_queue_submit_stop(struct d3d12_command_queue *queue);
 void d3d12_command_queue_signal_inline(struct d3d12_command_queue *queue, d3d12_fence_iface *fence, uint64_t value);
 void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, void (*callback)(void *), void *userdata);
@@ -5944,6 +5957,16 @@ struct d3d12_device
     } vendor_hacks;
 
     bool independent_device;
+
+    /* Inline queue mode (amdgpu-wddm fork, see vkd3d.h): no device thread, one VkQueue per
+     * D3D12 queue, completion bookkeeping polled at entry points (d3d12_device_inline_retire). */
+    bool inline_queues;
+    struct vkd3d_inline_queue_callbacks inline_callbacks;
+    struct vkd3d_queue *inline_internal_queue;
+    pthread_mutex_t inline_mutex;
+    struct d3d12_command_queue **inline_command_queues;
+    size_t inline_command_queue_count;
+    size_t inline_command_queue_size;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
