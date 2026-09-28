@@ -422,7 +422,8 @@ static dxil_spv_bool dxil_output_remap(void *userdata, const dxil_spv_d3d_stream
         const struct vkd3d_shader_transform_feedback_element *e = &xfb_info->elements[i];
 
         /* TODO: Stream index matching? */
-        if (!ascii_strcasecmp(e->semantic_name, d3d_output->semantic) && e->semantic_index == d3d_output->semantic_index)
+        if (e->semantic_name && !ascii_strcasecmp(e->semantic_name, d3d_output->semantic) &&
+                e->semantic_index == d3d_output->semantic_index)
         {
             xfb_element = e;
             break;

@@ -2865,8 +2865,12 @@ static struct vkd3d_shader_transform_feedback_info *vkd3d_shader_transform_feedb
     xfb_info->elements = new_entries;
 
     for (i = 0; i < so_desc->NumEntries; i++, num_duped++)
-        if (!(new_entries[i].semantic_name = vkd3d_strdup(new_entries[i].semantic_name)))
+    {
+        /* A NULL semantic name declares a gap, which only skips components in the output buffer. */
+        if (new_entries[i].semantic_name &&
+                !(new_entries[i].semantic_name = vkd3d_strdup(new_entries[i].semantic_name)))
             goto fail;
+    }
 
     xfb_info->buffer_stride_count = so_desc->NumStrides;
     xfb_info->element_count = so_desc->NumEntries;
@@ -6685,7 +6689,7 @@ static void d3d12_pipeline_state_log_graphics_state(const struct d3d12_pipeline_
             const struct vkd3d_shader_transform_feedback_element *elem = &graphics->cached_desc.xfb_info->elements[i];
 
             ERR("  Element %u: stream %u, semantic %s%u, components %#x, output %u\n", i,
-                    elem->stream_index, elem->semantic_name, elem->semantic_index,
+                    elem->stream_index, debugstr_a(elem->semantic_name), elem->semantic_index,
                     ((1u << elem->component_count) - 1u) << elem->component_index,
                     elem->output_slot);
         }
