@@ -21,7 +21,8 @@
  *
  * Sizes. Every structure starts with its Size, so a shell built against an older header passes a smaller one.
  * The engine reads a field only when Size covers it (1.1 fields also need AbiVersion 1.1 or later) and fills
- * at most funcs->Size bytes. The *_SIZE_1_0 macros are the 1.0 sizes, the smallest the engine accepts.
+ * at most funcs->Size bytes. The *_SIZE_1_0 macros are the 1.0 sizes, the smallest the engine accepts: sizeof of
+ * the frozen 1.0 structures (the *_1_0 types), tail padding included, as a 1.0 shell passes them.
  *
  * C and C++. Needs windows.h and vulkan_core.h only; neither the WDK nor a D3D12 header, so the engine's
  * translation units (vkd3d-proton's own D3D12 headers) and the shell's (SDK d3d12.h plus d3d12umddi.h) can
@@ -165,7 +166,19 @@ typedef struct BC250_VKD3D_DEVICE_CREATE_INFO
     const BC250_VKD3D_SHELL_SERVICES *Services;    /* INLINE: required, BindQueue and UnbindQueue non-NULL */
 } BC250_VKD3D_DEVICE_CREATE_INFO;
 
-#define BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_0 ((UINT32)FIELD_OFFSET(BC250_VKD3D_DEVICE_CREATE_INFO, QueueMode))
+/* The frozen 1.0 (r1) layouts, for their sizes only. A 1.0 shell passes sizeof of the 1.0 structure, which
+ * includes its tail padding: 32 bytes on x64, where the 1.1 field QueueMode (offset 28) lies in that padding.
+ * The engine therefore reads the 1.1 fields only when Size covers Services as well. */
+typedef struct BC250_VKD3D_DEVICE_CREATE_INFO_1_0
+{
+    UINT32 Size;
+    UINT32 AbiVersion;
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+    LUID AdapterLuid;
+    UINT32 MinimumFeatureLevel;
+} BC250_VKD3D_DEVICE_CREATE_INFO_1_0;
+
+#define BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_0 ((UINT32)sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0))
 
 /* The members of D3D12_COMMAND_QUEUE_DESC, which this header cannot include (see above). */
 typedef struct BC250_VKD3D_COMMAND_QUEUE_DESC
@@ -197,7 +210,34 @@ typedef struct BC250_VKD3D_ENGINE_FUNCS
             void *queueCookie, REFIID riid, void **queue);
 } BC250_VKD3D_ENGINE_FUNCS;
 
-#define BC250_VKD3D_ENGINE_FUNCS_SIZE_1_0 ((UINT32)FIELD_OFFSET(BC250_VKD3D_ENGINE_FUNCS, CreateCommandQueue))
+typedef struct BC250_VKD3D_ENGINE_FUNCS_1_0
+{
+    UINT32 Size;
+    UINT32 AbiVersion;
+    HRESULT (APIENTRY *CreateDevice)(const BC250_VKD3D_DEVICE_CREATE_INFO *info, REFIID riid, void **device);
+} BC250_VKD3D_ENGINE_FUNCS_1_0;
+
+#define BC250_VKD3D_ENGINE_FUNCS_SIZE_1_0 ((UINT32)sizeof(BC250_VKD3D_ENGINE_FUNCS_1_0))
+
+/* Compile-time checks, in C and C++: the 1.1 structures extend the 1.0 ones, and the 1.0 sizes are the frozen
+ * ones (offsetof comes from vulkan_core.h, through vk_platform.h and stddef.h). */
+#define BC250_VKD3D_STATIC_ASSERT(name, e) typedef char BC250_VKD3D_STATIC_ASSERT_##name[(e) ? 1 : -1]
+BC250_VKD3D_STATIC_ASSERT(create_info_1_0_prefix,
+        offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0, AbiVersion) == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, AbiVersion)
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0, GetInstanceProcAddr)
+                == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, GetInstanceProcAddr)
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0, AdapterLuid) == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, AdapterLuid)
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0, MinimumFeatureLevel)
+                == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, MinimumFeatureLevel)
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, Services) >= sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0));
+BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_0_prefix,
+        offsetof(BC250_VKD3D_ENGINE_FUNCS_1_0, AbiVersion) == offsetof(BC250_VKD3D_ENGINE_FUNCS, AbiVersion)
+        && offsetof(BC250_VKD3D_ENGINE_FUNCS_1_0, CreateDevice) == offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateDevice)
+        && offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateCommandQueue) == sizeof(BC250_VKD3D_ENGINE_FUNCS_1_0));
+#ifdef _WIN64
+BC250_VKD3D_STATIC_ASSERT(sizes_1_0_x64,
+        sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0) == 32 && sizeof(BC250_VKD3D_ENGINE_FUNCS_1_0) == 16);
+#endif
 
 /* The one export. E_NOINTERFACE when abiVersion names another major or a later minor than the engine's;
  * E_INVALIDARG when funcs is NULL or funcs->Size is smaller than the 1.0 structure

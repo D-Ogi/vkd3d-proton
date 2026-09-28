@@ -1332,7 +1332,9 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
     ULONG refs;
     HRESULT hr;
 
-    /* A 1.0 CreateInfo; the bytes past its Size are not the engine's to read. */
+    /* A 1.0 CreateInfo, with the Size a 1.0 shell passes (sizeof, tail padding included). QueueMode lies in
+     * that padding on x64, where a 1.0 shell leaves whatever was there; Services lies past the Size. The engine
+     * reads neither below AbiVersion 1.1. */
     info = *base;
     info.Size = BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_0;
     info.AbiVersion = ABI_1_0;
