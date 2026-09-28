@@ -144,21 +144,35 @@ BC250_VKD3D_STATIC_ASSERT(inline_min_graphics_queues,
 #define BC250_COMMAND_QUEUE_DESC_SIZE_1_1 \
         ((UINT32)(FIELD_OFFSET(BC250_VKD3D_COMMAND_QUEUE_DESC, NodeMask) + sizeof(UINT32)))
 
-static HRESULT APIENTRY bc250_create_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, REFIID riid, void **device)
+/* What CreateDevice makes of a CreateInfo: libvkd3d's create info on the adapter, with the instance it was found
+ * on. bc250_prepare_device() does every check of the CreateInfo, so that another entry point can refuse the same
+ * CreateInfo with the same HRESULT. create_info points into the structure itself, which is therefore never
+ * copied. */
+struct bc250_device_request
+{
+    struct vkd3d_device_create_info create_info;
+    struct vkd3d_inline_queue_callbacks inline_callbacks;
+    struct vkd3d_instance *instance;
+};
+
+static void bc250_release_request(struct bc250_device_request *request)
+{
+    if (request->instance)
+        vkd3d_instance_decref(request->instance);
+    request->instance = NULL;
+}
+
+static HRESULT bc250_prepare_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, struct bc250_device_request *request)
 {
     struct vkd3d_instance_create_info instance_create_info;
-    struct vkd3d_device_create_info device_create_info;
-    struct vkd3d_inline_queue_callbacks inline_callbacks;
     const BC250_VKD3D_SHELL_SERVICES *services = NULL;
     UINT32 queue_mode = BC250_VKD3D_QUEUE_MODE_THREADED;
-    struct vkd3d_instance *instance;
     VkPhysicalDevice vk_physical_device;
     HRESULT hr;
 
-    if (device)
-        *device = NULL;
+    memset(request, 0, sizeof(*request));
     /* A 1.0 shell passes the 1.0 structure: compare with its size, not with this header's. */
-    if (!info || !riid || !device || info->Size < BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_0 || !info->GetInstanceProcAddr)
+    if (!info || info->Size < BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_0 || !info->GetInstanceProcAddr)
         return E_INVALIDARG;
     if (!bc250_abi_served(info->AbiVersion))
         return E_NOINTERFACE;
@@ -199,45 +213,61 @@ static HRESULT APIENTRY bc250_create_device(const BC250_VKD3D_DEVICE_CREATE_INFO
             return E_INVALIDARG;
     }
 
+    /* V6, before anything reads the configuration. */
     InitOnceExecuteOnce(&bc250_config_once, bc250_set_config_defaults, NULL, NULL);
 
     /* V1: no WSI extensions (present belongs to the runtime) and no VR extensions (no OpenVR/OpenXR probing
      * inside a system driver). vkd3d-proton adds the extensions it needs itself. */
     memset(&instance_create_info, 0, sizeof(instance_create_info));
     instance_create_info.pfn_vkGetInstanceProcAddr = info->GetInstanceProcAddr;
-    if (FAILED(hr = vkd3d_create_instance(&instance_create_info, &instance)))
+    if (FAILED(hr = vkd3d_create_instance(&instance_create_info, &request->instance)))
     {
         WARN("Failed to create the vkd3d instance, hr %#x.\n", (unsigned int)hr);
+        request->instance = NULL;
         return hr;
     }
 
-    if (!(vk_physical_device = bc250_find_physical_device(instance, info->GetInstanceProcAddr, &info->AdapterLuid)))
+    if (!(vk_physical_device = bc250_find_physical_device(request->instance, info->GetInstanceProcAddr,
+            &info->AdapterLuid)))
     {
         WARN("No Vulkan physical device has LUID %08lx:%08lx.\n",
                 (unsigned long)info->AdapterLuid.HighPart, (unsigned long)info->AdapterLuid.LowPart);
-        vkd3d_instance_decref(instance);
+        bc250_release_request(request);
         return E_INVALIDARG;
     }
 
-    memset(&device_create_info, 0, sizeof(device_create_info));
-    device_create_info.minimum_feature_level = (D3D_FEATURE_LEVEL)info->MinimumFeatureLevel;
-    device_create_info.instance = instance;
-    device_create_info.vk_physical_device = vk_physical_device;
-    device_create_info.adapter_luid = info->AdapterLuid;
-    device_create_info.independent = true;
+    request->create_info.minimum_feature_level = (D3D_FEATURE_LEVEL)info->MinimumFeatureLevel;
+    request->create_info.instance = request->instance;
+    request->create_info.vk_physical_device = vk_physical_device;
+    request->create_info.adapter_luid = info->AdapterLuid;
+    request->create_info.independent = true;
 
     /* V7: the shell's services have the calling convention of libvkd3d's callbacks (vkd3d.h). */
     if (queue_mode == BC250_VKD3D_QUEUE_MODE_INLINE)
     {
-        inline_callbacks.userdata = services->Shell;
-        inline_callbacks.pfn_bind_queue = (PFN_vkd3d_bind_queue)services->BindQueue;
-        inline_callbacks.pfn_unbind_queue = (PFN_vkd3d_unbind_queue)services->UnbindQueue;
-        device_create_info.inline_queue_callbacks = &inline_callbacks;
+        request->inline_callbacks.userdata = services->Shell;
+        request->inline_callbacks.pfn_bind_queue = (PFN_vkd3d_bind_queue)services->BindQueue;
+        request->inline_callbacks.pfn_unbind_queue = (PFN_vkd3d_unbind_queue)services->UnbindQueue;
+        request->create_info.inline_queue_callbacks = &request->inline_callbacks;
     }
+    return S_OK;
+}
 
-    hr = vkd3d_create_device(&device_create_info, riid, device);
+static HRESULT APIENTRY bc250_create_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, REFIID riid, void **device)
+{
+    struct bc250_device_request request;
+    HRESULT hr;
+
+    if (device)
+        *device = NULL;
+    if (!info || !riid || !device)
+        return E_INVALIDARG;
+    if (FAILED(hr = bc250_prepare_device(info, &request)))
+        return hr;
+
+    hr = vkd3d_create_device(&request.create_info, riid, device);
     /* The device holds its own reference to the instance. */
-    vkd3d_instance_decref(instance);
+    bc250_release_request(&request);
 
     if (FAILED(hr))
         WARN("Failed to create the device, hr %#x.\n", (unsigned int)hr);
