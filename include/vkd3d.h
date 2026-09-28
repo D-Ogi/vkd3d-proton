@@ -78,6 +78,11 @@ struct vkd3d_inline_queue_callbacks
  * removed with DXGI_ERROR_DEVICE_HUNG and fails; after that, waits only poll. */
 #define VKD3D_INLINE_QUEUE_WAIT_TIMEOUT_MS 10000u
 
+/* Inline queue mode: the fewest usable VkQueues the graphics family must give the device, the internal queue
+ * and two DIRECT queues; the out-of-band queue of NV_low_latency2 does not count. Below it,
+ * vkd3d_create_device() and vkd3d_create_adapter_caps() fail with DXGI_ERROR_UNSUPPORTED. */
+#define VKD3D_INLINE_QUEUE_MIN_GRAPHICS_QUEUES 3u
+
 struct vkd3d_instance_create_info
 {
     /* If set to NULL, libvkd3d loads libvulkan. */

@@ -3157,24 +3157,6 @@ static HRESULT vkd3d_select_queues(const struct d3d12_device *device,
         info->family_index[VKD3D_QUEUE_FAMILY_TRANSFER] = info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS];
     }
 
-    /* Inline queue mode: the internal queue holds one VkQueue of the graphics family for the device's
-     * lifetime, and DIRECT queues get the rest (the count below minus one), so with fewer than two
-     * VkQueues no DIRECT queue could ever be created. Fail here rather than in every CreateCommandQueue. */
-    if (device->inline_queues && info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS] != VK_QUEUE_FAMILY_IGNORED)
-    {
-        uint32_t graphics_count = single_queue ? 1 : min(
-                queue_properties[info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS]].queueCount,
-                VKD3D_MAX_QUEUE_COUNT_PER_FAMILY_INLINE);
-
-        if (graphics_count < 2)
-        {
-            ERR("Inline queue mode needs 2 VkQueues in graphics family %u (the internal queue and a DIRECT queue), "
-                    "it offers %u.\n", info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS], graphics_count);
-            vkd3d_free(queue_properties);
-            return DXGI_ERROR_UNSUPPORTED;
-        }
-    }
-
     for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; ++i)
     {
         if (info->family_index[i] == VK_QUEUE_FAMILY_IGNORED)
@@ -3370,6 +3352,21 @@ static HRESULT vkd3d_plan_vk_device(struct d3d12_device *device,
 
     for (i = 0; i < VKD3D_QUEUE_FAMILY_COUNT; i++)
         vkd3d_queue_info_get_family_caps(device, device_queue_info, i, &device->queue_family_caps[i]);
+
+    /* Inline queue mode: the internal queue holds one VkQueue of the graphics family for the device's lifetime
+     * and DIRECT queues share the others, so the embedder can count on two DIRECT queues at once only with three
+     * usable VkQueues (the out-of-band queue of NV_low_latency2 is not usable). Refuse the device here, where
+     * vkd3d_create_adapter_caps() refuses it too, rather than fail the embedder's second CreateCommandQueue. */
+    if (device->inline_queues && device->queue_family_caps[VKD3D_QUEUE_FAMILY_GRAPHICS].queue_count
+            < VKD3D_INLINE_QUEUE_MIN_GRAPHICS_QUEUES)
+    {
+        ERR("Inline queue mode needs %u usable VkQueues in graphics family %u (the internal queue and two DIRECT "
+                "queues), it offers %u.\n", VKD3D_INLINE_QUEUE_MIN_GRAPHICS_QUEUES,
+                device_queue_info->family_index[VKD3D_QUEUE_FAMILY_GRAPHICS],
+                device->queue_family_caps[VKD3D_QUEUE_FAMILY_GRAPHICS].queue_count);
+        vkd3d_vk_device_plan_cleanup(plan);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
 
     return S_OK;
 }

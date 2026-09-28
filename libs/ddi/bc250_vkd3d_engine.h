@@ -72,10 +72,13 @@
  *         shares it. The device's internal queue (clears, uploads, sparse initialisation) holds one VkQueue of
  *         the graphics family for the device's lifetime; DIRECT queues use the others. COMPUTE and COPY queues
  *         use vkd3d-proton's families, which are the graphics family when the adapter has no other. The engine
- *         asks for up to 16 VkQueues per family, so an adapter has min(queueCount, 16) - 1 DIRECT queues, fewer
- *         while COMPUTE or COPY queues share the family. CreateDevice fails with DXGI_ERROR_UNSUPPORTED, and an
- *         error line in the engine log, when the graphics family offers fewer than 2 VkQueues (hosted RADV
- *         reports 1). When every VkQueue of a family is in use, CreateCommandQueue fails with E_OUTOFMEMORY.
+ *         asks for up to 16 VkQueues per family, so an adapter has min(queueCount, 16) - 1 DIRECT queues (one
+ *         fewer with NV_low_latency2, which keeps a queue for itself), fewer while COMPUTE or COPY queues share
+ *         the family. When every VkQueue of a family is in use, CreateCommandQueue fails with E_OUTOFMEMORY.
+ *       - Admission. CreateDevice fails with DXGI_ERROR_UNSUPPORTED, and an error line in the engine log, when
+ *         the graphics family gives fewer than BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES (3) usable VkQueues: the
+ *         internal queue and the two DIRECT queues that the shell needs at once (T0). r2 asked for 2. Hosted
+ *         RADV reported 1 VkQueue per family at r2. The THREADED mode (V3) admits any graphics family.
  *         Sparse binding is available only if the graphics family supports it; the engine asks for no dedicated
  *         sparse family. A COPY queue on a transfer-only family that shares resources with the other families
  *         only by ownership transfer would make vkd3d-proton submit some of its work ("fallback" submissions) on
@@ -171,6 +174,7 @@ extern "C" {
 #define BC250_VKD3D_QUEUE_MODE_INLINE   1u         /* V7, 1.1 */
 
 #define BC250_VKD3D_INLINE_WAIT_BUDGET_MS 10000u   /* V7: the longest CPU wait for the GPU in INLINE */
+#define BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES 3u  /* V7: INLINE admission, usable graphics-family VkQueues */
 
 /* Services the shell provides to one engine device (1.1, V7). The engine calls them only on the thread of an
  * engine call, possibly on several threads at once for different queues. */

@@ -132,6 +132,9 @@ static bool bc250_abi_served(UINT32 version)
 
 /* The header's wait budget (V7) is the one libvkd3d applies. */
 BC250_VKD3D_STATIC_ASSERT(inline_wait_budget, BC250_VKD3D_INLINE_WAIT_BUDGET_MS == VKD3D_INLINE_QUEUE_WAIT_TIMEOUT_MS);
+/* So is its admission (V7). */
+BC250_VKD3D_STATIC_ASSERT(inline_min_graphics_queues,
+        BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES == VKD3D_INLINE_QUEUE_MIN_GRAPHICS_QUEUES);
 
 /* Sizes, fields included, up to which a 1.1 structure is read (V7). */
 #define BC250_DEVICE_CREATE_INFO_SIZE_1_1 \
