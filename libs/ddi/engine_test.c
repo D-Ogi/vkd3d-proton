@@ -19,13 +19,18 @@
  *     shader-visible descriptor table at start + 3 * increment, word-exact compare; the handles are printed;
  *   - AbiVersion 1.0 with a 1.1-sized CreateInfo: INLINE refused, QueueMode 7 ignored (THREADED); 1.1 asking
  *     for THREADED: THREADED;
- *   - teardown: the device's final Release returns 0 (V4).
+ *   - teardown: the device's final Release returns 0 (V4);
+ *   - admission (V7): a THREADED device, with its copy round trip, on a graphics family that the Vulkan wrapper
+ *     below caps at one VkQueue.
  * --inline, ABI 1.1 and the INLINE queue mode (V7, V8), with a logging BindQueue/UnbindQueue and a Vulkan
  * wrapper in front of the entry point that counts vkResetCommandPool calls and command buffers, logs the
- * semaphores of each vkQueueSubmit2 and can hold a submission:
+ * semaphores of each vkQueueSubmit2, can hold a submission and can cap the queueCount of graphics families:
  *   - thread census (Toolhelp32 snapshot, start address from NtQueryInformationThread): no thread of the
  *     process may start inside amdgpu_wddm_vkd3d.dll, before CreateDevice, after it, after queue creation, after
  *     ExecuteCommandLists and after fence waits;
+ *   - admission: with the graphics family capped at 1 and 2 VkQueues, CreateDevice fails with
+ *     DXGI_ERROR_UNSUPPORTED and binds nothing; at 3 the device has two DIRECT queues at once, and a third finds
+ *     none free;
  *   - binding: the internal queue at CreateDevice (cookie NULL), every queue on a thread that makes engine
  *     calls, a BindQueue failure returned as is with nothing bound, every BindQueue balanced by UnbindQueue
  *     before the VkQueue is bound again;
@@ -253,8 +258,9 @@ static void census_expect_none(const char *stage)
  * loader's) entry point, to see what the engine asks the GPU to do rather than only what comes out: it counts
  * vkResetCommandPool calls and command buffers allocated minus freed, and logs the semaphores that every
  * vkQueueSubmit2 waits for and signals. On request it holds one submission: it adds a wait for a semaphore that
- * only the test signals (hold_arm). Every other name goes to the driver unchanged. The real entry points are
- * those of the last device created, so one engine device at a time. */
+ * only the test signals (hold_arm), and it caps the queueCount that graphics families report (graphics_queue_cap).
+ * Every other name goes to the driver unchanged. The real entry points are those of the last device created, so
+ * one engine device at a time. */
 #define VKW_LOG_SIZE 256u
 #define VKW_MAX_SEMAPHORES 8u
 
@@ -283,6 +289,9 @@ static struct
     struct vkw_submit log[VKW_LOG_SIZE];
     VkQueue hold_queue;                 /* the next submission on it also waits for (hold_semaphore, 1) */
     VkSemaphore hold_semaphore;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties queue_family_properties;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties2 queue_family_properties2;
+    volatile LONG graphics_queue_cap;   /* nonzero: graphics families report at most this queueCount */
 } vkw;
 
 static VKAPI_ATTR VkResult VKAPI_CALL vkw_ResetCommandPool(VkDevice device, VkCommandPool pool,
@@ -377,6 +386,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkw_CreateDevice(VkPhysicalDevice physical
     return vr;
 }
 
+/* The limited physical-device answer of the admission tests (V7): with graphics_queue_cap set, every queue family
+ * with VK_QUEUE_GRAPHICS_BIT reports at most that many queues. */
+static void vkw_cap_family(VkQueueFamilyProperties *properties)
+{
+    LONG cap = vkw.graphics_queue_cap;
+
+    if (cap && (properties->queueFlags & VK_QUEUE_GRAPHICS_BIT) && properties->queueCount > (uint32_t)cap)
+        properties->queueCount = (uint32_t)cap;
+}
+
+static VKAPI_ATTR void VKAPI_CALL vkw_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physical_device,
+        uint32_t *count, VkQueueFamilyProperties *properties)
+{
+    uint32_t i;
+
+    vkw.queue_family_properties(physical_device, count, properties);
+    for (i = 0; properties && i < *count; ++i)
+        vkw_cap_family(&properties[i]);
+}
+
+static VKAPI_ATTR void VKAPI_CALL vkw_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical_device,
+        uint32_t *count, VkQueueFamilyProperties2 *properties)
+{
+    uint32_t i;
+
+    vkw.queue_family_properties2(physical_device, count, properties);
+    for (i = 0; properties && i < *count; ++i)
+        vkw_cap_family(&properties[i].queueFamilyProperties);
+}
+
 static PFN_vkVoidFunction vkw_wrap(const char *name, PFN_vkVoidFunction real)
 {
     if (!real)
@@ -424,6 +463,17 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkw_GetInstanceProcAddr(VkInstan
     {
         vkw.create_device = (PFN_vkCreateDevice)real;
         return (PFN_vkVoidFunction)vkw_CreateDevice;
+    }
+    if (!strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties"))
+    {
+        vkw.queue_family_properties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)real;
+        return (PFN_vkVoidFunction)vkw_GetPhysicalDeviceQueueFamilyProperties;
+    }
+    if (!strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties2")
+            || !strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties2KHR"))
+    {
+        vkw.queue_family_properties2 = (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)real;
+        return (PFN_vkVoidFunction)vkw_GetPhysicalDeviceQueueFamilyProperties2;
     }
     return vkw_wrap(name, real);
 }
@@ -1741,6 +1791,61 @@ done:
         ID3D12Device1_Release(device1);
 }
 
+/* V7 admission. INLINE needs BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES usable VkQueues in the graphics family: the
+ * internal queue and two DIRECT queues. The Vulkan wrapper caps the queueCount that graphics families report.
+ * Below the minimum, CreateDevice fails with DXGI_ERROR_UNSUPPORTED and binds nothing; at it, the device has two
+ * DIRECT queues at once, and a third finds every VkQueue in use. Runs with no other device bound. */
+static void inline_admission(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3D_DEVICE_CREATE_INFO *info)
+{
+    ID3D12CommandQueue *q1 = NULL, *q2 = NULL, *q3 = NULL;
+    ID3D12Device *device;
+    unsigned int binds, cap, released = 0;
+    HRESULT hr, hr3;
+
+    for (cap = 1; cap < BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES; ++cap)
+    {
+        binds = shell.binds + shell.failed_binds;
+        vkw.graphics_queue_cap = (LONG)cap;
+        device = (ID3D12Device *)(void *)1;
+        hr = funcs->CreateDevice(info, &IID_ID3D12Device, (void **)&device);
+        vkw.graphics_queue_cap = 0;
+        checkf(hr == DXGI_ERROR_UNSUPPORTED && !device && shell.binds + shell.failed_binds == binds,
+                "admission: INLINE with the graphics family capped at %u VkQueue(s) -> DXGI_ERROR_UNSUPPORTED, "
+                "nothing bound (hr %08lx)", cap, (unsigned long)hr);
+        if (SUCCEEDED(hr) && device && device != (void *)1)
+            ID3D12Device_Release(device);
+    }
+
+    vkw.graphics_queue_cap = BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES;
+    device = NULL;
+    hr = funcs->CreateDevice(info, &IID_ID3D12Device, (void **)&device);
+    vkw.graphics_queue_cap = 0;
+    checkf(SUCCEEDED(hr) && device, "admission: INLINE with the graphics family capped at %u VkQueues -> a device "
+            "(hr %08lx)", (unsigned int)BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES, (unsigned long)hr);
+    if (FAILED(hr) || !device)
+        return;
+    if (FAILED(create_inline_queue(funcs, device, D3D12_COMMAND_LIST_TYPE_DIRECT, COOKIE(0xa1), &q1)))
+        q1 = NULL;
+    if (FAILED(create_inline_queue(funcs, device, D3D12_COMMAND_LIST_TYPE_DIRECT, COOKIE(0xa2), &q2)))
+        q2 = NULL;
+    if (FAILED(hr3 = create_inline_queue(funcs, device, D3D12_COMMAND_LIST_TYPE_DIRECT, COOKIE(0xa3), &q3)))
+        q3 = NULL;
+    check(q1 && q2 && shell_queue_of(COOKIE(0xa1)) && shell_queue_of(COOKIE(0xa2))
+            && shell_queue_of(COOKIE(0xa1)) != shell_queue_of(COOKIE(0xa2)),
+            "admission: that device has two DIRECT queues at once, on two VkQueues");
+    checkf(hr3 == E_OUTOFMEMORY && !q3, "admission: a third DIRECT queue finds every VkQueue in use -> "
+            "E_OUTOFMEMORY (hr %08lx)", (unsigned long)hr3);
+    if (q3 && !ID3D12CommandQueue_Release(q3))
+        ++released;
+    if (q2 && !ID3D12CommandQueue_Release(q2))
+        ++released;
+    if (q1 && !ID3D12CommandQueue_Release(q1))
+        ++released;
+    check(released == (q1 != NULL) + (q2 != NULL) + (q3 != NULL) && !ID3D12Device_Release(device)
+            && !shell.bound_count, "admission: its queues and the device return 0 from their final Release, "
+            "nothing stays bound");
+}
+
 /* V7 and V8 on one device in the inline queue mode. */
 static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3D_DEVICE_CREATE_INFO *base)
 {
@@ -1790,6 +1895,7 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
             "INLINE CreateDevice whose BindQueue fails -> BindQueue's %08lx, no device, nothing bound (hr %08lx)",
             (unsigned long)TEST_BIND_FAILURE, (unsigned long)hr);
     census_expect_none("after the failed CreateDevice");
+    inline_admission(funcs, &info);
 
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
@@ -2090,6 +2196,30 @@ done:
     DeleteCriticalSection(&shell.lock);
 }
 
+/* V7 admission leaves THREADED alone: with the Vulkan wrapper capping the graphics family at one VkQueue, a
+ * THREADED device is created and copies on a direct queue. */
+static void threaded_admission(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3D_DEVICE_CREATE_INFO *base)
+{
+    BC250_VKD3D_DEVICE_CREATE_INFO info = *base;
+    ID3D12Device *device = NULL;
+    HRESULT hr;
+
+    info.Size = sizeof(info);
+    info.AbiVersion = ABI_1_1;
+    info.QueueMode = BC250_VKD3D_QUEUE_MODE_THREADED;
+    info.Services = NULL;
+    info.GetInstanceProcAddr = vkw_GetInstanceProcAddr;
+    vkw.graphics_queue_cap = 1;
+    hr = funcs->CreateDevice(&info, &IID_ID3D12Device, (void **)&device);
+    vkw.graphics_queue_cap = 0;
+    checkf(SUCCEEDED(hr) && device, "admission: THREADED with the graphics family capped at 1 VkQueue -> a device "
+            "(hr %08lx)", (unsigned long)hr);
+    if (FAILED(hr) || !device)
+        return;
+    copy_round_trip(device, NULL, D3D12_COMMAND_LIST_TYPE_DIRECT, WAIT_EVENT, "one-VkQueue THREADED device: ");
+    check(ID3D12Device_Release(device) == 0, "admission: that device's final Release returns 0");
+}
+
 /* The default run: a 1.0 shell (1.0-sized CreateInfo, AbiVersion 1.0) and the THREADED queue mode (V3). */
 static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3D_DEVICE_CREATE_INFO *base,
         LUID luid)
@@ -2199,6 +2329,8 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
         ID3D12CommandQueue_Release(queue);
     if (other)
         check(ID3D12Device_Release(other) == 0, "that device's final Release returns 0");
+
+    threaded_admission(funcs, base);
     return 0;
 }
 
@@ -2349,10 +2481,11 @@ int main(int argc, char **argv)
                 "INLINE without UnbindQueue -> E_INVALIDARG");
     }
 
+    /* The Vulkan wrapper's driver; the THREADED suite puts the wrapper in front only where it says so. */
+    vkw.gipa = gipa;
     if (inline_mode || hang_mode)
     {
         /* The Vulkan wrapper sits in front of the entry point. */
-        vkw.gipa = gipa;
         info.GetInstanceProcAddr = vkw_GetInstanceProcAddr;
         printf("mode: %u-byte CreateInfo, AbiVersion 1.1, INLINE%s\n", (unsigned int)sizeof(info),
                 hang_mode ? ", GPU hang" : "");
