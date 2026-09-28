@@ -300,7 +300,7 @@ static HRESULT validate_heap_desc(struct d3d12_device *device, const D3D12_HEAP_
 }
 
 static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *device,
-        const D3D12_HEAP_DESC *desc, void* host_address)
+        const D3D12_HEAP_DESC *desc, void* host_address, const struct vkd3d_device_memory_allocation *borrowed)
 {
     struct vkd3d_allocate_heap_memory_info alloc_info;
     HRESULT hr;
@@ -329,14 +329,16 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     memset(&alloc_info, 0, sizeof(alloc_info));
     alloc_info.heap_desc = heap->desc;
     alloc_info.host_ptr = host_address;
+    alloc_info.borrowed_memory = borrowed;
 
+    /* Borrowed memory (amdgpu-wddm fork) is never suballocated or padded. */
     if ((alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
-        d3d12_device_allow_image_heap_suballocation(device))
+        d3d12_device_allow_image_heap_suballocation(device) && !borrowed)
     {
         alloc_info.extra_allocation_flags = VKD3D_ALLOCATION_FLAG_ALLOW_IMAGE_SUBALLOCATION;
     }
 
-    if (!(alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS))
+    if (!(alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) && !borrowed)
         alloc_info.extra_allocation_flags |= VKD3D_ALLOCATION_FLAG_REQUIRE_ALIGNED_GPU_ADDRESS;
 
     if (!VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS))
@@ -385,7 +387,8 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         return hr;
     }
 
-    heap->priority.allows_dynamic_residency = 
+    /* The residency and priority of borrowed memory belong to the embedder. */
+    heap->priority.allows_dynamic_residency = !borrowed &&
         device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
         heap->allocation.chunk == NULL /* not suballocated */ &&
         (device->memory_properties.memoryTypes[heap->allocation.device_allocation.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -412,7 +415,7 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address)))
+    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address, NULL)))
     {
         vkd3d_free(object);
         return hr;
@@ -422,4 +425,143 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
 
     *heap = object;
     return S_OK;
+}
+
+/* amdgpu-wddm fork: engine ABI 1.2 CreateHeapFromMemory (libs/ddi/bc250_vkd3d_engine.h, rule V10).
+ * Everything the heap cannot honour is refused here with E_INVALIDARG, before any object exists. */
+static HRESULT d3d12_heap_validate_borrowed_memory(struct d3d12_device *device,
+        const struct vkd3d_borrowed_memory_info *memory, const D3D12_HEAP_DESC *desc)
+{
+    /* Sharing, display, write watch and protection need memory this library allocates itself. */
+    const D3D12_HEAP_FLAGS refused_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
+            D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER | D3D12_HEAP_FLAG_HARDWARE_PROTECTED |
+            D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH;
+    /* TOOLS_USE_MANUAL_WRITE_TRACKING (0x2000, not in this library's IDL) is accepted and ignored,
+     * as are the residency and zeroing hints: residency and contents are the embedder's. */
+    const D3D12_HEAP_FLAGS accepted_flags = D3D12_HEAP_FLAG_DENY_BUFFERS |
+            D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES |
+            D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT |
+            D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | 0x2000;
+    const D3D12_HEAP_PROPERTIES *properties = &desc->Properties;
+    bool buffers, textures, rt_ds;
+    unsigned int categories;
+
+    if (memory->vk_memory == VK_NULL_HANDLE)
+    {
+        WARN("No memory.\n");
+        return E_INVALIDARG;
+    }
+
+    if (memory->vk_memory_type_index >= device->memory_properties.memoryTypeCount)
+    {
+        WARN("Memory type %u out of range (%u types).\n", memory->vk_memory_type_index,
+                device->memory_properties.memoryTypeCount);
+        return E_INVALIDARG;
+    }
+
+    if (!desc->SizeInBytes || desc->SizeInBytes > memory->size)
+    {
+        WARN("Heap size %"PRIu64" does not fit the memory (%"PRIu64" bytes).\n", desc->SizeInBytes, memory->size);
+        return E_INVALIDARG;
+    }
+
+    if (desc->Flags & (refused_flags | ~(refused_flags | accepted_flags)))
+    {
+        WARN("Heap flags %#x are not supported on borrowed memory.\n", desc->Flags);
+        return E_INVALIDARG;
+    }
+
+    switch (properties->Type)
+    {
+        case D3D12_HEAP_TYPE_DEFAULT:
+        case D3D12_HEAP_TYPE_UPLOAD:
+        case D3D12_HEAP_TYPE_READBACK:
+        case D3D12_HEAP_TYPE_CUSTOM:
+            break;
+        case D3D12_HEAP_TYPE_GPU_UPLOAD:
+            if (device->memory_info.has_gpu_upload_heap)
+                break;
+            /* fall through */
+        default:
+            WARN("Heap type %#x is not supported.\n", properties->Type);
+            return E_INVALIDARG;
+    }
+
+    if (FAILED(d3d12_device_validate_custom_heap_type(device, properties)))
+        return E_INVALIDARG;
+
+    /* The heap tier rules are D3D12's: tier 1 heaps hold exactly one resource category. */
+    buffers = !(desc->Flags & D3D12_HEAP_FLAG_DENY_BUFFERS);
+    textures = !(desc->Flags & D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES);
+    rt_ds = !(desc->Flags & D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES);
+    categories = buffers + textures + rt_ds;
+    if (!categories || (categories > 1 && device->d3d12_caps.options.ResourceHeapTier < D3D12_RESOURCE_HEAP_TIER_2))
+    {
+        WARN("Heap flags %#x allow %u resource categories on heap tier %u.\n", desc->Flags, categories,
+                device->d3d12_caps.options.ResourceHeapTier);
+        return E_INVALIDARG;
+    }
+
+    /* This library places no textures on CPU-visible memory (they go through a staging copy with memory
+     * of their own), so a CPU-visible borrowed heap is for buffers. */
+    if (is_cpu_accessible_heap(properties) && !buffers)
+    {
+        WARN("A CPU-visible borrowed heap must allow buffers.\n");
+        return E_INVALIDARG;
+    }
+
+    /* Placed buffers get GPU virtual addresses from the heap's buffer. */
+    if (buffers && !memory->device_address)
+    {
+        WARN("A borrowed heap for buffers needs memory allocated with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT.\n");
+        return E_INVALIDARG;
+    }
+
+    if (!vkd3d_memory_type_supports_heap(device, memory->vk_memory_type_index, properties, desc->Flags))
+    {
+        WARN("Memory type %u cannot back heap type %#x with flags %#x.\n",
+                memory->vk_memory_type_index, properties->Type, desc->Flags);
+        return E_INVALIDARG;
+    }
+
+    return S_OK;
+}
+
+HRESULT vkd3d_create_heap_from_memory(ID3D12Device *device_iface, const struct vkd3d_borrowed_memory_info *memory,
+        const D3D12_HEAP_DESC *desc, REFIID iid, void **heap)
+{
+    struct vkd3d_device_memory_allocation borrowed;
+    struct d3d12_device *device;
+    struct d3d12_heap *object;
+    HRESULT hr;
+
+    TRACE("device %p, memory %p, desc %p, iid %s, heap %p.\n", device_iface, memory, desc, debugstr_guid(iid), heap);
+
+    if (!heap)
+        return E_INVALIDARG;
+    *heap = NULL;
+
+    if (!device_iface || !memory || !desc || !iid)
+        return E_INVALIDARG;
+    device = impl_from_ID3D12Device((d3d12_device_iface *)device_iface);
+
+    if (FAILED(hr = d3d12_heap_validate_borrowed_memory(device, memory, desc)))
+        return hr;
+
+    borrowed.vk_memory = memory->vk_memory;
+    borrowed.vk_memory_type = memory->vk_memory_type_index;
+    borrowed.size = memory->size;
+
+    if (!(object = vkd3d_malloc(sizeof(*object))))
+        return E_OUTOFMEMORY;
+
+    if (FAILED(hr = d3d12_heap_init(object, device, desc, NULL, &borrowed)))
+    {
+        vkd3d_free(object);
+        return hr;
+    }
+
+    TRACE("Created heap %p over borrowed memory %#"PRIx64".\n", object, (uint64_t)memory->vk_memory);
+
+    return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap, iid, heap);
 }

@@ -743,7 +743,7 @@ static void vkd3d_memory_transfer_queue_wait_allocation(struct vkd3d_memory_tran
     vkd3d_memory_transfer_queue_wait_semaphore(queue, wait_value, UINT64_MAX);
 }
 
-static uint32_t vkd3d_select_memory_types(struct d3d12_device *device,
+static uint32_t vkd3d_select_memory_types_quiet(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, bool fallback)
 {
     const VkPhysicalDeviceMemoryProperties *memory_info = &device->memory_properties;
@@ -764,10 +764,32 @@ static uint32_t vkd3d_select_memory_types(struct d3d12_device *device,
             heap_properties->Type != D3D12_HEAP_TYPE_READBACK)
         type_mask &= domain_info->rt_ds_type_mask;
 
+    return type_mask;
+}
+
+static uint32_t vkd3d_select_memory_types(struct d3d12_device *device,
+        const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, bool fallback)
+{
+    uint32_t type_mask = vkd3d_select_memory_types_quiet(device, heap_properties, heap_flags, fallback);
+
     if (!type_mask && !fallback)
         ERR("No memory type found for heap flags %#x.\n", heap_flags);
 
     return type_mask;
+}
+
+bool vkd3d_memory_type_supports_heap(struct d3d12_device *device, uint32_t type_index,
+        const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags)
+{
+    if (type_index >= device->memory_properties.memoryTypeCount)
+        return false;
+
+    /* The CPU-accessible domain already holds host-visible types only; say it anyway. */
+    if (is_cpu_accessible_heap(heap_properties) &&
+            !(device->memory_properties.memoryTypes[type_index].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+        return false;
+
+    return !!(vkd3d_select_memory_types_quiet(device, heap_properties, heap_flags, false) & (1u << type_index));
 }
 
 static uint32_t vkd3d_find_memory_types_with_flags(struct d3d12_device *device, VkMemoryPropertyFlags type_flags)
@@ -1359,6 +1381,15 @@ static void vkd3d_memory_allocation_free(const struct vkd3d_memory_allocation *a
     if (allocation->flags & VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER)
         VK_CALL(vkDestroyBuffer(device->vk_device, allocation->resource.vk_buffer, NULL));
 
+    if (allocation->flags & VKD3D_ALLOCATION_FLAG_BORROWED_MEMORY)
+    {
+        /* The embedder owns the memory and frees it after this returns (engine ABI 1.2 rule V10).
+         * Undo only what this library did to it: the mapping. */
+        if (allocation->cpu_address)
+            VK_CALL(vkUnmapMemory(device->vk_device, allocation->device_allocation.vk_memory));
+        return;
+    }
+
     vkd3d_free_device_memory(device, &allocation->device_allocation);
 }
 
@@ -1366,7 +1397,7 @@ static bool vkd3d_is_imported_allocation(const struct vkd3d_allocate_memory_info
 {
     const VkBaseInStructure *next = info->pNext;
 
-    if (info->host_ptr)
+    if (info->host_ptr || info->borrowed_memory)
         return true;
 
     while (next)
@@ -1450,7 +1481,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
                     (info->explicit_global_buffer_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)) &&
                 !(info->flags & VKD3D_ALLOCATION_FLAG_INTERNAL_SCRATCH) &&
                 (info->flags & VKD3D_ALLOCATION_FLAG_REQUIRE_ALIGNED_GPU_ADDRESS) &&
-                !d3d12_device_aligns_bda_64k(device) && !host_ptr && !info->pNext &&
+                !d3d12_device_aligns_bda_64k(device) && !host_ptr && !info->pNext && !info->borrowed_memory &&
                 info->memory_requirements.alignment >= D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
             {
                 /* D3D12 implementations do not honor 4 MiB alignment here.
@@ -1513,6 +1544,32 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     type_mask = memory_requirements.memoryTypeBits;
     if (!(info->flags & VKD3D_ALLOCATION_FLAG_DEDICATED))
         type_mask &= vkd3d_select_memory_types(device, &info->heap_properties, info->heap_flags, false);
+
+    if (info->borrowed_memory)
+    {
+        /* amdgpu-wddm fork: the embedder's memory takes the place of the allocation below. Nothing here
+         * sets its priority, clears it or imports a host pointer into it. */
+        const struct vkd3d_device_memory_allocation *borrowed = info->borrowed_memory;
+
+        if (host_ptr || (info->heap_flags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) ||
+                borrowed->vk_memory_type >= device->memory_properties.memoryTypeCount ||
+                !(type_mask & (1u << borrowed->vk_memory_type)) ||
+                memory_requirements.size > borrowed->size)
+        {
+            WARN("Borrowed memory (type %u, %"PRIu64" bytes) cannot back this allocation "
+                    "(types %#x, %"PRIu64" bytes).\n", borrowed->vk_memory_type, borrowed->size,
+                    type_mask, memory_requirements.size);
+            VK_CALL(vkDestroyBuffer(device->vk_device, allocation->resource.vk_buffer, NULL));
+            return E_INVALIDARG;
+        }
+
+        allocation->flags |= VKD3D_ALLOCATION_FLAG_BORROWED_MEMORY;
+        allocation->device_allocation = *borrowed;
+        if (allocation->resource.vk_buffer && request_bda)
+            allocation->flags |= VKD3D_ALLOCATION_FLAG_GPU_ADDRESS;
+        allocation->resource.size = info->memory_requirements.size;
+        goto map_memory;
+    }
 
     /* Allocate actual backing storage */
     flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
@@ -1612,6 +1669,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
         return hr;
     }
 
+map_memory:
     /* Map memory if the allocation was requested to be host-visible,
      * but do not map if the allocation was meant to be device-local
      * since that may negatively impact performance. */
@@ -1685,6 +1743,16 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
             }
 
             if (info->memory_requirements.alignment &&
+                (allocation->resource.va + allocation->realignment_offset) & (required_alignment - 1) &&
+                (allocation->flags & VKD3D_ALLOCATION_FLAG_BORROWED_MEMORY))
+            {
+                /* amdgpu-wddm fork: borrowed memory cannot be padded, and D3D12 promises aligned heap VAs. */
+                WARN("Borrowed memory has GPU VA %"PRIx64", not aligned to %"PRIx64".\n",
+                        allocation->resource.va, required_alignment);
+                vkd3d_memory_allocation_free(allocation, device, allocator);
+                return E_INVALIDARG;
+            }
+            else if (info->memory_requirements.alignment &&
                 (allocation->resource.va + allocation->realignment_offset) & (required_alignment - 1))
             {
                 FIXME_ONCE("Requested alignment of %"PRIx64", but got GPU VA of %"PRIx64" for intended start of heap, "
@@ -1711,6 +1779,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
 
     if (VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS) &&
             (allocation->flags & VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER) &&
+            !(allocation->flags & VKD3D_ALLOCATION_FLAG_BORROWED_MEMORY) &&
             (info->heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
     {
         vkd3d_memory_transfer_queue_fill_allocation(&device->memory_transfers, allocation, 0xff);
@@ -2204,8 +2273,9 @@ bool vkd3d_allocate_image_memory_prefers_dedicated(struct d3d12_device *device,
 static bool vkd3d_memory_info_allow_suballocate(struct d3d12_device *device,
         const struct vkd3d_allocate_memory_info *info)
 {
-    /* pNext implies dedicated allocation or similar. Host pointer implies external memory import. */
-    if (info->pNext || info->host_ptr)
+    /* pNext implies dedicated allocation or similar. Host pointer implies external memory import.
+     * Borrowed memory (amdgpu-wddm fork) is the embedder's and is used as it is. */
+    if (info->pNext || info->host_ptr || info->borrowed_memory)
         return false;
 
     /* We must never suballocate these. */
@@ -2252,9 +2322,11 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
             vkd3d_driver_can_zero_clear_alloc(device, !!(info->flags & VKD3D_ALLOCATION_FLAG_GLOBAL_BUFFER)) &&
                     !suballocate;
 
+    /* Borrowed memory (amdgpu-wddm fork) is never cleared here: its contents are the embedder's. */
     needs_command_clear = !implementation_can_zero_clear_alloc &&
             !(info->heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) &&
-            !VKD3D_CONFIG_FLAG_IS_SET(MEMORY_ALLOCATOR_SKIP_CLEAR);
+            !VKD3D_CONFIG_FLAG_IS_SET(MEMORY_ALLOCATOR_SKIP_CLEAR) &&
+            !info->borrowed_memory;
 
     if (!suballocate &&
             !needs_command_clear &&
@@ -2331,6 +2403,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
     alloc_info.host_ptr = info->host_ptr;
     alloc_info.vk_memory_priority = info->vk_memory_priority;
     alloc_info.explicit_global_buffer_usage = info->explicit_global_buffer_usage;
+    alloc_info.borrowed_memory = info->borrowed_memory;
 
     alloc_info.flags |= info->extra_allocation_flags;
 
@@ -2347,6 +2420,11 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
     {
         alloc_info.explicit_global_buffer_usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     }
+
+    /* Borrowed memory (amdgpu-wddm fork) always backs the heap itself: a CPU-visible borrowed heap
+     * must allow buffers, and a failure is the embedder's to see, never a deferral. */
+    if (info->borrowed_memory)
+        return vkd3d_allocate_memory(device, allocator, &alloc_info, allocation);
 
     if (is_cpu_accessible_system_memory_heap(&info->heap_desc.Properties))
     {

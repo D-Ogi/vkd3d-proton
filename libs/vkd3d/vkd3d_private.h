@@ -794,6 +794,10 @@ enum vkd3d_allocation_flag
     VKD3D_ALLOCATION_FLAG_INTERNAL_SCRATCH  = (1u << 6),
     VKD3D_ALLOCATION_FLAG_ALLOW_IMAGE_SUBALLOCATION  = (1u << 7),
     VKD3D_ALLOCATION_FLAG_REQUIRE_ALIGNED_GPU_ADDRESS = (1u << 8),
+    /* amdgpu-wddm fork: the VkDeviceMemory belongs to the embedder (engine ABI 1.2 CreateHeapFromMemory).
+     * It is never allocated, cleared, suballocated or freed here; releasing the allocation only undoes
+     * the mapping this library made. */
+    VKD3D_ALLOCATION_FLAG_BORROWED_MEMORY   = (1u << 9),
 };
 
 #define VKD3D_MEMORY_CHUNK_SIZE (VKD3D_VA_BLOCK_SIZE * 8)
@@ -801,6 +805,7 @@ enum vkd3d_allocation_flag
 #define VKD3D_MEMORY_LARGE_CHUNK_SIZE (VKD3D_MEMORY_IMAGE_HEAP_SUBALLOCATE_THRESHOLD * 4)
 
 struct vkd3d_memory_chunk;
+struct vkd3d_device_memory_allocation;
 
 struct vkd3d_allocate_memory_info
 {
@@ -813,6 +818,8 @@ struct vkd3d_allocate_memory_info
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;
     VkMemoryPropertyFlags optional_memory_properties;
     float vk_memory_priority;
+    /* amdgpu-wddm fork: non-NULL uses this memory instead of allocating (VKD3D_ALLOCATION_FLAG_BORROWED_MEMORY). */
+    const struct vkd3d_device_memory_allocation *borrowed_memory;
 };
 
 struct vkd3d_allocate_heap_memory_info
@@ -822,6 +829,8 @@ struct vkd3d_allocate_heap_memory_info
     uint32_t extra_allocation_flags;
     float vk_memory_priority;
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;
+    /* amdgpu-wddm fork: see vkd3d_allocate_memory_info. */
+    const struct vkd3d_device_memory_allocation *borrowed_memory;
 };
 
 struct vkd3d_allocate_resource_memory_info
@@ -1012,6 +1021,10 @@ bool vkd3d_allocate_image_memory_prefers_dedicated(struct d3d12_device *device,
         D3D12_HEAP_FLAGS heap_flags, const VkMemoryRequirements *requirements);
 HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_memory_allocator *allocator,
         const struct vkd3d_allocate_heap_memory_info *info, struct vkd3d_memory_allocation *allocation);
+/* amdgpu-wddm fork: whether memory type type_index can back a heap with these properties and flags,
+ * by the rules this library uses to choose memory types for its own heaps. Logs nothing. */
+bool vkd3d_memory_type_supports_heap(struct d3d12_device *device, uint32_t type_index,
+        const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags);
 
 HRESULT vkd3d_memory_allocator_init(struct vkd3d_memory_allocator *allocator, struct d3d12_device *device);
 void vkd3d_memory_allocator_cleanup(struct vkd3d_memory_allocator *allocator, struct d3d12_device *device);
@@ -1063,6 +1076,12 @@ struct d3d12_heap
 
 HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
         void *host_address, struct d3d12_heap **heap);
+
+/* amdgpu-wddm fork: a heap over memory the embedder allocated and keeps; see vkd3d_create_heap_from_memory(). */
+static inline bool d3d12_heap_is_borrowed(const struct d3d12_heap *heap)
+{
+    return !!(heap->allocation.flags & VKD3D_ALLOCATION_FLAG_BORROWED_MEMORY);
+}
 HRESULT d3d12_device_validate_custom_heap_type(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties);
 

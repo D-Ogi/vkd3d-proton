@@ -149,6 +149,23 @@ void vkd3d_enqueue_initial_transition(ID3D12CommandQueue *queue, ID3D12Resource 
 HRESULT vkd3d_create_inline_command_queue(ID3D12Device *device, const D3D12_COMMAND_QUEUE_DESC *desc,
         void *queue_cookie, REFIID iid, void **command_queue);
 
+/* Borrowed memory (amdgpu-wddm fork, engine ABI 1.2 CreateHeapFromMemory; rule V10 of
+ * libs/ddi/bc250_vkd3d_engine.h). The heap uses the embedder's VkDeviceMemory, which must be a
+ * non-dedicated allocation on the device's VkDevice that the embedder has not mapped. The library
+ * never frees it: it unmaps its own mapping, if any, in the release that destroys the heap, which is
+ * the last of the heap's final Release and the final Releases of the resources placed on it. */
+struct vkd3d_borrowed_memory_info
+{
+    VkDeviceMemory vk_memory;
+    VkDeviceSize size;
+    uint32_t vk_memory_type_index;
+    /* Allocated with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT; required when the heap allows buffers. */
+    bool device_address;
+};
+
+HRESULT vkd3d_create_heap_from_memory(ID3D12Device *device, const struct vkd3d_borrowed_memory_info *memory,
+        const D3D12_HEAP_DESC *desc, REFIID iid, void **heap);
+
 ULONG vkd3d_resource_decref(ID3D12Resource *resource);
 ULONG vkd3d_resource_incref(ID3D12Resource *resource);
 

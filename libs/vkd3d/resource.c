@@ -2419,6 +2419,12 @@ static ULONG STDMETHODCALLTYPE d3d12_resource_Release(d3d12_resource_iface *ifac
         else if (d3d12_resource_is_gpu_clear_pending(resource))
             retain = true;
 
+        /* amdgpu-wddm fork: a resource on borrowed memory is destroyed in its final Release, because
+         * the embedder frees the memory once the heap and its placed resources are released (rule V10
+         * of libs/ddi/bc250_vkd3d_engine.h). The use-after-free workarounds do not apply there. */
+        if (resource->heap && d3d12_heap_is_borrowed(resource->heap))
+            retain = false;
+
         if (retain)
         {
             bool sparse = !!(resource->flags & VKD3D_RESOURCE_RESERVED);
@@ -4659,6 +4665,15 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
     if (FAILED(hr = d3d12_resource_validate_heap(desc, heap)))
         return hr;
 
+    /* amdgpu-wddm fork: a texture on a CPU-visible heap lives in memory of its own (LINEAR_STAGING_COPY),
+     * which a borrowed heap cannot provide; see vkd3d_create_heap_from_memory(). */
+    if (d3d12_heap_is_borrowed(heap) && desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            is_cpu_accessible_heap(&heap->desc.Properties))
+    {
+        WARN("Cannot place a texture on a CPU-visible borrowed heap.\n");
+        return E_INVALIDARG;
+    }
+
     if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
     {
         WARN("Placing resource on heap with no memory backing it. Falling back to committed resource.\n");
@@ -4719,6 +4734,17 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
         /* Align manually. This works because we padded the required allocation size reported to the app. */
         VK_CALL(vkGetImageMemoryRequirements(device->vk_device, object->res.vk_image, &memory_requirements));
+
+        /* amdgpu-wddm fork: the heap was checked against representative images only; this image must
+         * accept the borrowed memory's type itself. */
+        if (d3d12_heap_is_borrowed(heap) &&
+                !(memory_requirements.memoryTypeBits & (1u << heap->allocation.device_allocation.vk_memory_type)))
+        {
+            WARN("Texture accepts memory types %#x, not the borrowed heap's type %u.\n",
+                    memory_requirements.memoryTypeBits, heap->allocation.device_allocation.vk_memory_type);
+            hr = E_INVALIDARG;
+            goto fail;
+        }
 
         /* For SMALL_RESOURCE_PLACEMENT when we have workaround active,
          * verify that application did in fact check alignment requirements.
