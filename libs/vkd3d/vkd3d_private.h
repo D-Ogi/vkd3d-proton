@@ -5999,6 +5999,10 @@ struct d3d12_device
 
     bool independent_device;
 
+    /* amdgpu-wddm fork: an object of vkd3d_create_adapter_caps(), with the capability policy's inputs and
+     * answers only. It has no VkDevice, no queues and no memory, and no D3D12 method may be called on it. */
+    bool caps_only;
+
     /* Inline queue mode (amdgpu-wddm fork, see vkd3d.h): no device thread, one VkQueue per
      * D3D12 queue, completion bookkeeping polled at entry points (d3d12_device_inline_retire). */
     bool inline_queues;
@@ -7018,6 +7022,8 @@ HRESULT vkd3d_load_vk_global_procs(struct vkd3d_vk_global_procs *procs,
         PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr);
 HRESULT vkd3d_load_vk_instance_procs(struct vkd3d_vk_instance_procs *procs,
         const struct vkd3d_vk_global_procs *global_procs, VkInstance instance);
+void vkd3d_load_vk_physical_device_procs(struct vkd3d_vk_device_procs *procs,
+        const struct vkd3d_vk_instance_procs *parent_procs);
 HRESULT vkd3d_load_vk_device_procs(struct vkd3d_vk_device_procs *procs,
         const struct vkd3d_vk_instance_procs *parent_procs, VkDevice device);
 

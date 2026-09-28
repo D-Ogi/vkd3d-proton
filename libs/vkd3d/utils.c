@@ -1579,6 +1579,18 @@ HRESULT vkd3d_load_vk_device_procs(struct vkd3d_vk_device_procs *procs,
     return S_OK;
 }
 
+/* amdgpu-wddm fork: the instance-level entry points of a device table and nothing else, for an object of
+ * vkd3d_create_adapter_caps(), which has no VkDevice. Every device-level entry point stays NULL. */
+void vkd3d_load_vk_physical_device_procs(struct vkd3d_vk_device_procs *procs,
+        const struct vkd3d_vk_instance_procs *parent_procs)
+{
+    memset(procs, 0, sizeof(*procs));
+
+#define VK_INSTANCE_PFN       COPY_PARENT_PFN
+#define VK_INSTANCE_EXT_PFN   COPY_PARENT_PFN
+#include "vulkan_procs.h"
+}
+
 static struct vkd3d_private_data *vkd3d_private_store_get_private_data(
         const struct vkd3d_private_store *store, const GUID *tag)
 {

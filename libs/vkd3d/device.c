@@ -4772,14 +4772,11 @@ static bool d3d12_barrier_layout_is_supported(D3D12_COMMAND_LIST_TYPE type, D3D1
     return true;
 }
 
-static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+/* amdgpu-wddm fork: the body of ID3D12Device::CheckFeatureSupport, which vkd3d_adapter_caps_check_feature_support()
+ * calls as well, on an object without a VkDevice, for the features vkd3d_adapter_caps_answers() lists. */
+static HRESULT d3d12_device_check_feature_support(struct d3d12_device *device,
         D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
 {
-    struct d3d12_device *device = impl_from_ID3D12Device(iface);
-
-    TRACE("iface %p, feature %#x, feature_data %p, feature_data_size %u.\n",
-            iface, feature, feature_data, feature_data_size);
-
     switch (feature)
     {
         case D3D12_FEATURE_D3D12_OPTIONS:
@@ -5725,6 +5722,17 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
             FIXME("Unhandled feature %#x.\n", feature);
             return E_NOTIMPL;
     }
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+        D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+{
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+
+    TRACE("iface %p, feature %#x, feature_data %p, feature_data_size %u.\n",
+            iface, feature, feature_data, feature_data_size);
+
+    return d3d12_device_check_feature_support(device, feature, feature_data, feature_data_size);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateDescriptorHeap(d3d12_device_iface *iface,
@@ -11441,6 +11449,215 @@ uint32_t vkd3d_get_vk_direct_queue_family_index(ID3D12Device *device)
 
     /* vkd3d_select_queues() fails the device without a graphics family. */
     return d3d12_device->queue_families[VKD3D_QUEUE_FAMILY_GRAPHICS]->vk_family_index;
+}
+
+/* amdgpu-wddm fork: adapter capabilities without a device (vkd3d.h). */
+struct vkd3d_adapter_caps
+{
+    struct d3d12_device *device;
+};
+
+/* The steps of d3d12_device_init() whose results d3d12_device_caps_init() and d3d12_device_check_feature_support()
+ * read, in the same order and through the same functions, without those that need a VkDevice: the Vulkan device
+ * and its queues, memory, descriptor set layouts and the heap tier's memory-type check. */
+static HRESULT d3d12_device_init_caps_only(struct d3d12_device *device, struct vkd3d_instance *instance,
+        const struct vkd3d_device_create_info *create_info)
+{
+    struct vkd3d_vk_device_plan plan;
+    HRESULT hr;
+
+    device->caps_only = true;
+    vkd3d_instance_incref(device->vkd3d_instance = instance);
+    device->vk_info = instance->vk_info;
+    device->vk_info.extension_count = 0;
+    device->vk_info.extension_names = NULL;
+    device->adapter_luid = create_info->adapter_luid;
+    device->vk_device = VK_NULL_HANDLE;
+    /* The flag alone: vkd3d_select_queues() picks the families of the inline queue mode by it. */
+    device->inline_queues = !!create_info->inline_queue_callbacks;
+    vkd3d_load_vk_physical_device_procs(&device->vk_procs, &instance->vk_procs);
+
+    /* vkd3d_create_vk_device() up to vkCreateDevice, and its workarounds after it. */
+    if (FAILED(hr = vkd3d_plan_vk_device(device, create_info, &plan)))
+        goto out_free_instance;
+    vkd3d_vk_device_plan_cleanup(&plan);
+    d3d12_device_init_workarounds(device);
+
+    if (FAILED(hr = vkd3d_init_format_info(device)))
+        goto out_free_instance;
+    /* The decisions of vkd3d_memory_info_init(), vkd3d_global_descriptor_buffer_init() and
+     * vkd3d_bindless_state_init(). */
+    vkd3d_memory_info_init_policy(&device->memory_info, device);
+    device->global_descriptor_buffer.enabled = vkd3d_global_descriptor_buffer_is_used(device);
+    if (FAILED(hr = vkd3d_bindless_state_init_caps(&device->bindless_state, device)))
+        goto out_cleanup_format_info;
+
+    d3d12_device_caps_init(device);
+    return S_OK;
+
+out_cleanup_format_info:
+    vkd3d_cleanup_format_info(device);
+out_free_instance:
+    vkd3d_instance_decref(device->vkd3d_instance);
+    return hr;
+}
+
+HRESULT vkd3d_create_adapter_caps(const struct vkd3d_device_create_info *create_info,
+        struct vkd3d_adapter_caps **caps)
+{
+    struct vkd3d_adapter_caps *object;
+    struct vkd3d_instance *instance;
+    struct d3d12_device *device;
+    HRESULT hr;
+
+    TRACE("create_info %p, caps %p.\n", create_info, caps);
+
+    if (!caps)
+        return E_INVALIDARG;
+    *caps = NULL;
+
+    /* The checks of vkd3d_create_device() and d3d12_device_create(), so that a create info the device refuses is
+     * refused here too. */
+    if (!create_info || !create_info->instance == !create_info->instance_create_info)
+    {
+        WARN("Exactly one of an instance and an instance create info is required.\n");
+        return E_INVALIDARG;
+    }
+    if (create_info->minimum_feature_level < D3D_FEATURE_LEVEL_11_0
+            || !is_valid_feature_level(create_info->minimum_feature_level))
+    {
+        WARN("Invalid feature level %#x.\n", create_info->minimum_feature_level);
+        return E_INVALIDARG;
+    }
+    if (create_info->inline_queue_callbacks && FAILED(hr = d3d12_device_validate_inline_mode(create_info)))
+        return hr;
+
+    if ((instance = create_info->instance))
+    {
+        vkd3d_instance_incref(instance);
+    }
+    else if (FAILED(hr = vkd3d_create_instance(create_info->instance_create_info, &instance)))
+    {
+        WARN("Failed to create instance, hr %#x.\n", (int)hr);
+        return E_FAIL;
+    }
+
+    if (!(object = vkd3d_calloc(1, sizeof(*object))) || !(device = vkd3d_malloc_aligned(sizeof(*device), 64)))
+    {
+        vkd3d_free(object);
+        vkd3d_instance_decref(instance);
+        return E_OUTOFMEMORY;
+    }
+    memset(device, 0, sizeof(*device));
+
+    hr = d3d12_device_init_caps_only(device, instance, create_info);
+    vkd3d_instance_decref(instance);
+    if (FAILED(hr))
+    {
+        vkd3d_free_aligned(device);
+        vkd3d_free(object);
+        return hr;
+    }
+
+    if (!d3d12_device_supports_feature_level(device, create_info->minimum_feature_level))
+    {
+        WARN("Feature level %#x is not supported.\n", create_info->minimum_feature_level);
+        object->device = device;
+        vkd3d_destroy_adapter_caps(object);
+        return E_INVALIDARG;
+    }
+
+    object->device = device;
+    *caps = object;
+    return S_OK;
+}
+
+/* The features d3d12_device_check_feature_support() answers from the capability policy, the physical device and
+ * vkd3d-proton's constants alone. The others read state of a device (PLACED_RESOURCE_SUPPORT_INFO sizes a
+ * resource) or are not features vkd3d-proton answers. */
+static bool vkd3d_adapter_caps_answers(D3D12_FEATURE feature)
+{
+    switch (feature)
+    {
+        case D3D12_FEATURE_D3D12_OPTIONS:
+        case D3D12_FEATURE_ARCHITECTURE:
+        case D3D12_FEATURE_FEATURE_LEVELS:
+        case D3D12_FEATURE_FORMAT_SUPPORT:
+        case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS:
+        case D3D12_FEATURE_FORMAT_INFO:
+        case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT:
+        case D3D12_FEATURE_SHADER_MODEL:
+        case D3D12_FEATURE_D3D12_OPTIONS1:
+        case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT:
+        case D3D12_FEATURE_ROOT_SIGNATURE:
+        case D3D12_FEATURE_ARCHITECTURE1:
+        case D3D12_FEATURE_D3D12_OPTIONS2:
+        case D3D12_FEATURE_SHADER_CACHE:
+        case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY:
+        case D3D12_FEATURE_D3D12_OPTIONS3:
+        case D3D12_FEATURE_EXISTING_HEAPS:
+        case D3D12_FEATURE_D3D12_OPTIONS4:
+        case D3D12_FEATURE_SERIALIZATION:
+        case D3D12_FEATURE_CROSS_NODE:
+        case D3D12_FEATURE_D3D12_OPTIONS5:
+        case D3D12_FEATURE_D3D12_OPTIONS6:
+        case D3D12_FEATURE_D3D12_OPTIONS7:
+        case D3D12_FEATURE_D3D12_OPTIONS8:
+        case D3D12_FEATURE_D3D12_OPTIONS9:
+        case D3D12_FEATURE_D3D12_OPTIONS10:
+        case D3D12_FEATURE_D3D12_OPTIONS11:
+        case D3D12_FEATURE_D3D12_OPTIONS12:
+        case D3D12_FEATURE_D3D12_OPTIONS13:
+        case D3D12_FEATURE_D3D12_OPTIONS14:
+        case D3D12_FEATURE_D3D12_OPTIONS15:
+        case D3D12_FEATURE_D3D12_OPTIONS16:
+        case D3D12_FEATURE_D3D12_OPTIONS17:
+        case D3D12_FEATURE_D3D12_OPTIONS18:
+        case D3D12_FEATURE_D3D12_OPTIONS19:
+        case D3D12_FEATURE_D3D12_OPTIONS20:
+        case D3D12_FEATURE_D3D12_OPTIONS21:
+        case D3D12_FEATURE_D3D12_OPTIONS22:
+        case D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT:
+        case D3D12_FEATURE_APPLICATION_SPECIFIC_DRIVER_STATE:
+        case D3D12_FEATURE_BYTECODE_BYPASS_HASH_SUPPORTED:
+        case D3D12_FEATURE_SHADER_CACHE_ABI_SUPPORT:
+        case D3D12_FEATURE_BARRIER_LAYOUT:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+HRESULT vkd3d_adapter_caps_check_feature_support(struct vkd3d_adapter_caps *caps,
+        D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+{
+    TRACE("caps %p, feature %#x, feature_data %p, feature_data_size %u.\n",
+            caps, feature, feature_data, feature_data_size);
+
+    if (!caps)
+        return E_INVALIDARG;
+    if (!vkd3d_adapter_caps_answers(feature))
+    {
+        WARN("Feature %#x needs a device.\n", feature);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    return d3d12_device_check_feature_support(caps->device, feature, feature_data, feature_data_size);
+}
+
+void vkd3d_destroy_adapter_caps(struct vkd3d_adapter_caps *caps)
+{
+    struct d3d12_device *device;
+
+    if (!caps)
+        return;
+
+    device = caps->device;
+    vkd3d_cleanup_format_info(device);
+    vkd3d_instance_decref(device->vkd3d_instance);
+    vkd3d_free_aligned(device);
+    vkd3d_free(caps);
 }
 
 struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device)

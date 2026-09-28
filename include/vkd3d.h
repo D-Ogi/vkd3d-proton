@@ -140,6 +140,21 @@ struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device);
  * inline queue mode). */
 uint32_t vkd3d_get_vk_direct_queue_family_index(ID3D12Device *device);
 
+/* Adapter capabilities (amdgpu-wddm fork, engine ABI 1.2 QueryAdapterCaps). vkd3d_create_adapter_caps() takes
+ * the create info of vkd3d_create_device() and runs the device's capability decisions through the same code,
+ * stopping short of everything that needs a VkDevice: it creates no VkDevice and no queues and allocates no GPU
+ * memory (an instance from instance_create_info is temporary). It refuses what vkd3d_create_device() refuses
+ * before creating the Vulkan device, E_INVALIDARG below minimum_feature_level included. A device created with
+ * the same create info answers CheckFeatureSupport exactly as vkd3d_adapter_caps_check_feature_support() does,
+ * for the features the latter answers; the others give DXGI_ERROR_UNSUPPORTED. The resource heap tier comes from
+ * the physical device, and CreateDevice fails with DXGI_ERROR_UNSUPPORTED when the memory types do not back it. */
+struct vkd3d_adapter_caps;
+HRESULT vkd3d_create_adapter_caps(const struct vkd3d_device_create_info *create_info,
+        struct vkd3d_adapter_caps **caps);
+HRESULT vkd3d_adapter_caps_check_feature_support(struct vkd3d_adapter_caps *caps,
+        D3D12_FEATURE feature, void *feature_data, UINT feature_data_size);
+void vkd3d_destroy_adapter_caps(struct vkd3d_adapter_caps *caps);
+
 uint32_t vkd3d_get_vk_queue_family_index(ID3D12CommandQueue *queue);
 uint32_t vkd3d_get_vk_queue_index(ID3D12CommandQueue *queue);
 uint32_t vkd3d_get_vk_queue_flags(ID3D12CommandQueue *queue);
