@@ -74,6 +74,10 @@ struct vkd3d_inline_queue_callbacks
     PFN_vkd3d_unbind_queue pfn_unbind_queue;
 };
 
+/* Inline queue mode: the longest a CPU wait for the GPU may take. A wait that runs out marks the device
+ * removed with DXGI_ERROR_DEVICE_HUNG and fails; after that, waits only poll. */
+#define VKD3D_INLINE_QUEUE_WAIT_TIMEOUT_MS 10000u
+
 struct vkd3d_instance_create_info
 {
     /* If set to NULL, libvkd3d loads libvulkan. */

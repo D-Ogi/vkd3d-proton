@@ -126,10 +126,11 @@ void vkd3d_memory_transfer_queue_retire(struct vkd3d_memory_transfer_queue *queu
 
         pthread_mutex_lock(&queue->mutex);
 
-        /* Entries are appended in submission order, so their values never decrease. */
+        /* Entries are appended in submission order, so their values never decrease. The wait of device
+         * teardown is bounded (V7); if it fails, the device is removed and the rest is released anyway. */
         while (count < ARRAY_SIZE(resources) && count < queue->tracked_resource_count &&
-                vkd3d_memory_transfer_queue_wait_semaphore(queue,
-                        queue->tracked_resources[count].semaphore_value, wait ? UINT64_MAX : 0))
+                (vkd3d_memory_transfer_queue_wait_semaphore(queue,
+                        queue->tracked_resources[count].semaphore_value, wait ? UINT64_MAX : 0) || wait))
         {
             resources[count] = queue->tracked_resources[count].resource;
             count++;
@@ -286,7 +287,17 @@ static bool vkd3d_memory_transfer_queue_wait_semaphore(struct vkd3d_memory_trans
     if (old_value >= wait_value)
         return true;
 
-    if (timeout)
+    if (timeout && queue->device->inline_queues)
+    {
+        /* Inline queue mode: the caller's thread waits, within the budget of V7. */
+        if (SUCCEEDED(d3d12_device_inline_wait_semaphores(queue->device, 1, &queue->vk_semaphore, &wait_value,
+                "a memory clear or upload")))
+        {
+            vr = VK_SUCCESS;
+            new_value = wait_value;
+        }
+    }
+    else if (timeout)
     {
         wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
         wait_info.pNext = NULL;
@@ -367,8 +378,15 @@ static HRESULT vkd3d_memory_transfer_queue_flush_locked(struct vkd3d_memory_tran
         }
     }
 
-    vkd3d_memory_transfer_queue_wait_semaphore(queue,
-            queue->next_signal_value - VKD3D_MEMORY_TRANSFER_COMMAND_BUFFER_COUNT, UINT64_MAX);
+    if (!vkd3d_memory_transfer_queue_wait_semaphore(queue,
+            queue->next_signal_value - VKD3D_MEMORY_TRANSFER_COMMAND_BUFFER_COUNT, UINT64_MAX) &&
+            queue->device->inline_queues)
+    {
+        /* Inline queue mode: the wait is bounded and failed, so the buffer may still be in use and the
+         * device is removed. Keep the transfers queued rather than reset it. */
+        HRESULT hr = d3d12_device_removed_reason(queue->device);
+        return FAILED(hr) ? hr : DXGI_ERROR_DEVICE_HUNG;
+    }
 
     if ((vr = VK_CALL(vkResetCommandBuffer(vk_cmd_buffer, 0))))
     {

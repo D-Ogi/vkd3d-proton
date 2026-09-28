@@ -266,7 +266,9 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
         return;
     }
 
-    if (queue->wait_count)
+    /* Inline queue mode: vkQueueWaitIdle has no bound. Signal the timeline after everything submitted
+     * so far (and the pending waits), then wait for that value within the budget of V7. */
+    if (device->inline_queues || queue->wait_count)
     {
         memset(&signal_semaphore, 0, sizeof(signal_semaphore));
         signal_semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -285,7 +287,13 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
             ERR("Failed to submit queue(s), vr %d.\n", vr);
     }
 
-    if (vr == VK_SUCCESS)
+    if (device->inline_queues)
+    {
+        if (vr == VK_SUCCESS)
+            d3d12_device_inline_wait_semaphores(device, 1, &signal_semaphore.semaphore, &signal_semaphore.value,
+                    "a queue drain");
+    }
+    else if (vr == VK_SUCCESS)
     {
         if ((VK_CALL(vkQueueWaitIdle(vk_queue))))
             WARN("Failed to wait for queue, vr %d.\n", vr);
@@ -1421,18 +1429,67 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface 
     return completed_value;
 }
 
+/* Inline queue mode: every CPU wait for the GPU runs on the embedder's thread, often under a queue
+ * lock, so none may last forever (rule V7 of libs/ddi/bc250_vkd3d_engine.h). A hung GPU or a context
+ * that never runs would otherwise stall the caller and every thread behind the lock. The budget is
+ * longer than the Windows TDR delay (2 s by default), so a wait that runs out is not a slow GPU. On
+ * timeout or device loss the device is marked removed and the wait fails; once one wait has failed,
+ * later waits only poll, so a removed device cannot stall its callers either. */
+HRESULT d3d12_device_inline_wait_semaphores(struct d3d12_device *device, uint32_t count,
+        const VkSemaphore *semaphores, const uint64_t *values, const char *what)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkSemaphoreWaitInfo wait_info;
+    uint64_t timeout;
+    HRESULT hr;
+    VkResult vr;
+
+    assert(device->inline_queues);
+
+    timeout = vkd3d_atomic_uint32_load_explicit(&device->inline_wait_failed, vkd3d_memory_order_acquire)
+            ? 0 : VKD3D_INLINE_QUEUE_WAIT_TIMEOUT_MS * 1000000ull;
+
+    memset(&wait_info, 0, sizeof(wait_info));
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait_info.semaphoreCount = count;
+    wait_info.pSemaphores = semaphores;
+    wait_info.pValues = values;
+
+    if ((vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, timeout))) == VK_SUCCESS)
+        return S_OK;
+
+    vkd3d_atomic_uint32_store_explicit(&device->inline_wait_failed, 1, vkd3d_memory_order_release);
+
+    if (vr == VK_TIMEOUT)
+    {
+        if (timeout)
+        {
+            ERR("Inline queue mode: %s did not complete within %u ms.\n", what, VKD3D_INLINE_QUEUE_WAIT_TIMEOUT_MS);
+            if (d3d12_device_removed_reason(device) == S_OK)
+                d3d12_device_mark_as_removed(device, DXGI_ERROR_DEVICE_HUNG, "Inline wait for %s timed out", what);
+        }
+    }
+    else
+    {
+        ERR("Inline queue mode: failed to wait for %s, vr %d.\n", what, vr);
+        VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST);
+        if (d3d12_device_removed_reason(device) == S_OK)
+            d3d12_device_mark_as_removed(device, hresult_from_vk_result(vr), "Inline wait for %s failed", what);
+    }
+
+    hr = d3d12_device_removed_reason(device);
+    return FAILED(hr) ? hr : DXGI_ERROR_DEVICE_HUNG;
+}
+
 /* Inline queue mode: a wait with no event blocks the caller, and no fence worker will signal the
  * fence. Wait for the GPU timeline of the pending signal that reaches the value first, then retire.
  * With no pending signal, only another thread (CPU Signal or queue Signal) can reach the value. */
 static HRESULT d3d12_fence_inline_wait_for_event(struct d3d12_fence *fence, const struct vkd3d_waiting_event *event)
 {
-    const struct vkd3d_vk_device_procs *vk_procs = &fence->device->vk_procs;
-    VkSemaphoreWaitInfo wait_info;
     VkSemaphore vk_semaphore;
     uint64_t update_count;
     uint64_t vk_value = 0;
     HRESULT hr;
-    VkResult vr;
     size_t i;
 
     for (;;)
@@ -1471,18 +1528,9 @@ static HRESULT d3d12_fence_inline_wait_for_event(struct d3d12_fence *fence, cons
 
         pthread_mutex_unlock(&fence->mutex);
 
-        memset(&wait_info, 0, sizeof(wait_info));
-        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-        wait_info.semaphoreCount = 1;
-        wait_info.pSemaphores = &vk_semaphore;
-        wait_info.pValues = &vk_value;
-
-        if ((vr = VK_CALL(vkWaitSemaphores(fence->device->vk_device, &wait_info, UINT64_MAX))))
-        {
-            ERR("Failed to wait for timeline semaphore, vr %d.\n", vr);
-            VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(fence->device, vr == VK_ERROR_DEVICE_LOST);
-            return hresult_from_vk_result(vr);
-        }
+        if (FAILED(hr = d3d12_device_inline_wait_semaphores(fence->device, 1, &vk_semaphore, &vk_value,
+                "a fence signal")))
+            return hr;
     }
 }
 
@@ -24833,6 +24881,14 @@ static void d3d12_command_queue_wait_idle(struct d3d12_command_queue *command_qu
     semaphore_wait.pSemaphores = &command_queue->vkd3d_queue->submission_timeline;
     semaphore_wait.pValues = &command_queue->last_submission_timeline_value;
 
+    /* Inline queue mode: bounded, and a failure marks the device removed. */
+    if (command_queue->device->inline_queues)
+    {
+        d3d12_device_inline_wait_semaphores(command_queue->device, 1, semaphore_wait.pSemaphores,
+                semaphore_wait.pValues, "the queue's last submission");
+        return;
+    }
+
     if ((vr = VK_CALL(vkWaitSemaphores(command_queue->device->vk_device, &semaphore_wait, UINT64_MAX))))
         ERR("Failed to wait for virtual queue idle, vr %d.\n", vr);
 }
@@ -25167,12 +25223,17 @@ static HRESULT d3d12_command_queue_transition_pool_init(struct d3d12_command_que
     return S_OK;
 }
 
-static void d3d12_command_queue_transition_pool_wait(struct d3d12_command_queue_transition_pool *pool,
+static bool d3d12_command_queue_transition_pool_wait(struct d3d12_command_queue_transition_pool *pool,
         struct d3d12_device *device, uint64_t value)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkSemaphoreWaitInfo wait_info;
     VkResult vr;
+
+    /* Inline queue mode: bounded, and a failure marks the device removed. */
+    if (device->inline_queues)
+        return SUCCEEDED(d3d12_device_inline_wait_semaphores(device, 1, &pool->timeline, &value,
+                "an initial-transition command buffer"));
 
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wait_info.pNext = NULL;
@@ -25182,6 +25243,7 @@ static void d3d12_command_queue_transition_pool_wait(struct d3d12_command_queue_
     wait_info.pValues = &value;
     vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, ~(uint64_t)0));
     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST);
+    return vr == VK_SUCCESS;
 }
 
 static void d3d12_command_queue_transition_pool_deinit(struct d3d12_command_queue_transition_pool *pool,
@@ -25319,8 +25381,17 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
     command_index = pool->timeline_value % VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS;
     cmd = fallback ? pool->fallback_cmd[command_index] : pool->cmd[command_index];
 
-    if (pool->timeline_value > VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS)
-        d3d12_command_queue_transition_pool_wait(pool, device, pool->timeline_value - VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS);
+    if (pool->timeline_value > VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS &&
+            !d3d12_command_queue_transition_pool_wait(pool, device,
+                    pool->timeline_value - VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS) &&
+            device->inline_queues)
+    {
+        /* Inline queue mode: the wait is bounded and failed, so the buffer may still be in use and the
+         * device is removed. Submit no transitions rather than reset it. */
+        pool->timeline_value--;
+        *vk_cmd_buffer = VK_NULL_HANDLE;
+        return;
+    }
 
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.pNext = NULL;

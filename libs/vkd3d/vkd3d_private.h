@@ -3945,6 +3945,8 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
 HRESULT d3d12_command_queue_create_inline(struct d3d12_device *device,
         const D3D12_COMMAND_QUEUE_DESC *desc, void *cookie, struct d3d12_command_queue **queue);
 void d3d12_device_inline_retire(struct d3d12_device *device);
+HRESULT d3d12_device_inline_wait_semaphores(struct d3d12_device *device, uint32_t count,
+        const VkSemaphore *semaphores, const uint64_t *values, const char *what);
 void d3d12_command_queue_submit_stop(struct d3d12_command_queue *queue);
 void d3d12_command_queue_signal_inline(struct d3d12_command_queue *queue, d3d12_fence_iface *fence, uint64_t value);
 void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, void (*callback)(void *), void *userdata);
@@ -5967,6 +5969,8 @@ struct d3d12_device
     struct d3d12_command_queue **inline_command_queues;
     size_t inline_command_queue_count;
     size_t inline_command_queue_size;
+    /* Set when a bounded wait failed (d3d12_device_inline_wait_semaphores); later waits only poll. */
+    uint32_t inline_wait_failed;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,

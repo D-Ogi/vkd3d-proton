@@ -3976,6 +3976,14 @@ static void d3d12_resource_wait_for_sparse_init(struct d3d12_resource *resource)
     semaphore_wait.pSemaphores = &resource->device->sparse_init_timeline;
     semaphore_wait.pValues = &resource->sparse.init_timeline_value;
 
+    /* Inline queue mode: bounded, and a failure marks the device removed. */
+    if (resource->device->inline_queues)
+    {
+        d3d12_device_inline_wait_semaphores(resource->device, 1, semaphore_wait.pSemaphores,
+                semaphore_wait.pValues, "a sparse initialisation");
+        return;
+    }
+
     if ((vr = VK_CALL(vkWaitSemaphores(resource->device->vk_device, &semaphore_wait, UINT64_MAX))))
         ERR("Failed to wait for timeline semaphore, vr %d.\n", vr);
 }
