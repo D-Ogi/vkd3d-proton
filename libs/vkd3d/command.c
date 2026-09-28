@@ -29,7 +29,7 @@
 #endif
 
 static HRESULT d3d12_fence_signal(struct d3d12_fence *fence, struct vkd3d_fence_worker *worker, uint64_t value);
-static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
+static HRESULT d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
         const struct d3d12_command_queue_submission *sub);
 static void d3d12_fence_inc_ref(struct d3d12_fence *fence);
 static void d3d12_fence_dec_ref(struct d3d12_fence *fence);
@@ -1036,11 +1036,12 @@ static bool d3d12_fence_block_until_pending_value_reaches_locked(
         {
             /* Inline queue mode: this is the caller's thread; blocking here could wait for a signal
              * that only this thread would submit. d3d12_command_queue_Wait() refuses a wait before
-             * its signal; a rewind since then drops the wait. */
+             * its signal; a rewind since then refuses it here, and Wait() returns the failure. */
             if (command_queue->device->inline_queues)
             {
-                ERR("Dropping a wait on fence %p for 0x%"PRIx64", which has no pending signal.\n",
+                WARN("Refusing a wait on fence %p for 0x%"PRIx64", which has no pending signal.\n",
                         fence, pending_value);
+                command_queue->inline_submission_hr = E_NOTIMPL;
                 for (i = 0; i < fence->wait_tickets_count; i++)
                 {
                     if (fence->wait_tickets[i].ticket == ticket)
@@ -24407,8 +24408,8 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Wait(ID3D12CommandQueue *iface,
     sub.wait.fence = (d3d12_fence_iface *)fence_iface;
     sub.wait.value = value;
     sub.wait.wait_ticket = ticket;
-    d3d12_command_queue_add_submission(command_queue, &sub);
-    return S_OK;
+    /* Inline queue mode: E_NOTIMPL if a rewind since the check above left the wait without a signal. */
+    return d3d12_command_queue_add_submission(command_queue, &sub);
 }
 
 VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_GetTimestampFrequency(ID3D12CommandQueue *iface,
@@ -26410,9 +26411,12 @@ void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue *queue
     pthread_cond_signal(&queue->queue_cond);
 }
 
-static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
+/* Returns a failure of the submission only in inline queue mode, where it is processed here. */
+static HRESULT d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
         const struct d3d12_command_queue_submission *sub)
 {
+    HRESULT hr;
+
     /* Ensure that any non-temporal writes from CopyDescriptors are ordered properly
      * with the submission thread that calls vkQueueSubmit. */
     if (d3d12_device_use_embedded_mutable_descriptors(queue->device))
@@ -26424,7 +26428,10 @@ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue
 
     pthread_mutex_lock(&queue->queue_lock);
     d3d12_command_queue_add_submission_locked(queue, sub);
+    hr = queue->inline_submission_hr;
+    queue->inline_submission_hr = S_OK;
     pthread_mutex_unlock(&queue->queue_lock);
+    return hr;
 }
 
 static void d3d12_command_queue_acquire_serialized(struct d3d12_command_queue *queue)

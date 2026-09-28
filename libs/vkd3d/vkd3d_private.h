@@ -3913,9 +3913,11 @@ struct d3d12_command_queue
     uint32_t inflight_submissions;
 
     /* Inline queue mode: the embedder's cookie, and the transition pool the submission thread
-     * would keep on its stack. fence_worker holds the retire list; it has no thread. */
+     * would keep on its stack. fence_worker holds the retire list; it has no thread.
+     * inline_submission_hr is a failure of the submission being processed, under queue_lock. */
     void *inline_cookie;
     struct d3d12_command_queue_transition_pool *inline_transition_pool;
+    HRESULT inline_submission_hr;
 
     struct
     {
