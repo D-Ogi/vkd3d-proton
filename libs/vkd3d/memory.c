@@ -1730,7 +1730,7 @@ map_memory:
             if (FAILED(hr = vkd3d_allocation_assign_gpu_address(allocation, device, allocator)))
             {
                 vkd3d_memory_allocation_free(allocation, device, allocator);
-                return hresult_from_vk_result(vr);
+                return hr;
             }
 
             if (padded_bda)
