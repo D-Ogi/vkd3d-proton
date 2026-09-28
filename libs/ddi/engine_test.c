@@ -20,30 +20,41 @@
  *   - AbiVersion 1.0 with a 1.1-sized CreateInfo: INLINE refused, QueueMode 7 ignored (THREADED); 1.1 asking
  *     for THREADED: THREADED;
  *   - teardown: the device's final Release returns 0 (V4).
- * --inline, ABI 1.1 and the INLINE queue mode (V7, V8), with a logging BindQueue/UnbindQueue:
+ * --inline, ABI 1.1 and the INLINE queue mode (V7, V8), with a logging BindQueue/UnbindQueue and a Vulkan
+ * wrapper in front of the entry point that counts vkResetCommandPool calls and command buffers, logs the
+ * semaphores of each vkQueueSubmit2 and can hold a submission:
  *   - thread census (Toolhelp32 snapshot, start address from NtQueryInformationThread): no thread of the
  *     process may start inside amdgpu_wddm_vkd3d.dll, before CreateDevice, after it, after queue creation, after
  *     ExecuteCommandLists and after fence waits;
- *   - binding: the internal queue at CreateDevice (cookie NULL), every queue on the caller's thread, a BindQueue
- *     failure returned as is with nothing bound, every BindQueue balanced by UnbindQueue before the VkQueue is
- *     bound again;
- *   - queues: DIRECT A, DIRECT B and COPY C on distinct VkQueues, DIRECT queues until E_OUTOFMEMORY;
+ *   - binding: the internal queue at CreateDevice (cookie NULL), every queue on a thread that makes engine
+ *     calls, a BindQueue failure returned as is with nothing bound, every BindQueue balanced by UnbindQueue
+ *     before the VkQueue is bound again;
+ *   - queues: DIRECT A, DIRECT B and COPY C on distinct VkQueues; two DIRECT queues created on two threads at
+ *     once, held together inside BindQueue, then a copy on each; two threads creating and releasing 50 queues
+ *     each; DIRECT queues until E_OUTOFMEMORY;
  *   - refusals: ID3D12Device::CreateCommandQueue, shared fences, a queue Wait before its Signal,
  *     SetEventOnMultipleFenceCompletion(ANY, NULL), the shader debug ring;
  *   - the copy round trip on C (event set by the GetCompletedValue poll that observes it), the compute dispatch
- *     on A (SetEventOnCompletion(v, NULL)), a cross-queue copy (A Signals F, B Waits F), all word-exact;
- *   - 100 command-allocator cycles with polling, private bytes within a quarter of what a positive control that
- *     keeps an allocator and list per cycle grows by, and allocator Reset as the only engine call after the GPU
- *     finished;
+ *     on A (SetEventOnCompletion(v, NULL)), a cross-queue copy (A, held until B has submitted, Signals F, B
+ *     Waits F; a submission on B's VkQueue waits for the timeline that A's submission signals), all word-exact;
+ *   - 100 command-allocator cycles with polling in which every allocator Reset calls vkResetCommandPool, three
+ *     serial cycles in which it does so as the only engine call after the GPU finished, and the allocators
+ *     keeping at most a quarter of the command buffers that the same loop without allocator Reset (the negative
+ *     control) keeps;
  *   - teardown: queues and device return 0 from their final Release.
+ * --hang, ABI 1.1 and the INLINE queue mode: the wrapper holds one submission on a semaphore that only the test
+ *   signals; SetEventOnCompletion(v, NULL) gives up after the wait budget with DXGI_ERROR_DEVICE_HUNG, the device
+ *   is removed, a second wait fails at once, and everything still comes apart once the semaphore is signalled.
+ *   It waits about 10 s, and vkd3d-proton logs the timeout as an error.
  *
  * Usage: amdgpu_wddm_vkd3d_engine_test.exe <path to amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]
- *        [--fl <hex>] [--inline]
+ *        [--fl <hex>] [--inline | --hang]
  *   adapter substring  picks the DXGI adapter whose description contains it (default: first hardware adapter)
  *   --icd              loads that Vulkan driver DLL directly (entry vk_icdGetInstanceProcAddr), as the shell
  *                      loads hosted RADV, instead of the Vulkan loader (vulkan-1.dll)
  *   --fl               MinimumFeatureLevel for CreateDevice, default b000 (11_0)
  *   --inline           runs the INLINE suite instead of the THREADED one
+ *   --hang             runs the GPU hang suite instead of the THREADED one
  * Exit code 0 = all checks passed. "icd:" lines name every loaded Vulkan driver and its SHA-256.
  */
 
@@ -235,6 +246,341 @@ static void census_expect_none(const char *stage)
 
     engine = census_count(stage, &unknown);
     checkf(!engine && !unknown, "threads %s: none started in amdgpu_wddm_vkd3d.dll (V7)", stage);
+}
+
+/* Vulkan entry-point wrapper of the inline suites. The engine gets its entry points through
+ * CreateInfo.GetInstanceProcAddr (V1), so the test puts this wrapper there, in front of the driver's (or the
+ * loader's) entry point, to see what the engine asks the GPU to do rather than only what comes out: it counts
+ * vkResetCommandPool calls and command buffers allocated minus freed, and logs the semaphores that every
+ * vkQueueSubmit2 waits for and signals. On request it holds one submission: it adds a wait for a semaphore that
+ * only the test signals (hold_arm). Every other name goes to the driver unchanged. The real entry points are
+ * those of the last device created, so one engine device at a time. */
+#define VKW_LOG_SIZE 256u
+#define VKW_MAX_SEMAPHORES 8u
+
+struct vkw_submit
+{
+    VkQueue queue;
+    unsigned int wait_count, signal_count;
+    VkSemaphore waits[VKW_MAX_SEMAPHORES], signals[VKW_MAX_SEMAPHORES];
+    UINT64 wait_values[VKW_MAX_SEMAPHORES], signal_values[VKW_MAX_SEMAPHORES];
+};
+
+static struct
+{
+    PFN_vkGetInstanceProcAddr gipa;
+    PFN_vkGetDeviceProcAddr gdpa;
+    PFN_vkCreateDevice create_device;
+    PFN_vkResetCommandPool reset_command_pool;
+    PFN_vkAllocateCommandBuffers allocate_command_buffers;
+    PFN_vkFreeCommandBuffers free_command_buffers;
+    PFN_vkQueueSubmit2 queue_submit2;
+    VkDevice device;                    /* the last device created through the wrapper */
+    volatile LONG pool_resets;          /* vkResetCommandPool calls */
+    volatile LONG command_buffers;      /* allocated minus freed (vkDestroyCommandPool frees without a count) */
+    CRITICAL_SECTION lock;
+    unsigned int submits;               /* vkQueueSubmit2 calls; log[n % VKW_LOG_SIZE] is call n */
+    struct vkw_submit log[VKW_LOG_SIZE];
+    VkQueue hold_queue;                 /* the next submission on it also waits for (hold_semaphore, 1) */
+    VkSemaphore hold_semaphore;
+} vkw;
+
+static VKAPI_ATTR VkResult VKAPI_CALL vkw_ResetCommandPool(VkDevice device, VkCommandPool pool,
+        VkCommandPoolResetFlags flags)
+{
+    InterlockedIncrement(&vkw.pool_resets);
+    return vkw.reset_command_pool(device, pool, flags);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL vkw_AllocateCommandBuffers(VkDevice device,
+        const VkCommandBufferAllocateInfo *info, VkCommandBuffer *buffers)
+{
+    VkResult vr = vkw.allocate_command_buffers(device, info, buffers);
+
+    if (vr == VK_SUCCESS)
+        InterlockedAdd(&vkw.command_buffers, (LONG)info->commandBufferCount);
+    return vr;
+}
+
+static VKAPI_ATTR void VKAPI_CALL vkw_FreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count,
+        const VkCommandBuffer *buffers)
+{
+    LONG freed = 0;
+    uint32_t i;
+
+    for (i = 0; i < count; ++i)
+        freed += buffers[i] != NULL;
+    vkw.free_command_buffers(device, pool, count, buffers);
+    InterlockedAdd(&vkw.command_buffers, -freed);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL vkw_QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 *submits,
+        VkFence fence)
+{
+    VkSemaphoreSubmitInfo *waits = NULL;
+    VkSubmitInfo2 *copy = NULL;
+    struct vkw_submit *entry;
+    VkResult vr;
+    uint32_t i, j;
+
+    EnterCriticalSection(&vkw.lock);
+    entry = &vkw.log[vkw.submits++ % VKW_LOG_SIZE];
+    memset(entry, 0, sizeof(*entry));
+    entry->queue = queue;
+    for (i = 0; i < count; ++i)
+    {
+        for (j = 0; j < submits[i].waitSemaphoreInfoCount && entry->wait_count < VKW_MAX_SEMAPHORES; ++j)
+        {
+            entry->waits[entry->wait_count] = submits[i].pWaitSemaphoreInfos[j].semaphore;
+            entry->wait_values[entry->wait_count++] = submits[i].pWaitSemaphoreInfos[j].value;
+        }
+        for (j = 0; j < submits[i].signalSemaphoreInfoCount && entry->signal_count < VKW_MAX_SEMAPHORES; ++j)
+        {
+            entry->signals[entry->signal_count] = submits[i].pSignalSemaphoreInfos[j].semaphore;
+            entry->signal_values[entry->signal_count++] = submits[i].pSignalSemaphoreInfos[j].value;
+        }
+    }
+    if (count && vkw.hold_queue && queue == vkw.hold_queue
+            && (copy = malloc(count * sizeof(*copy)))
+            && (waits = malloc((submits[0].waitSemaphoreInfoCount + 1) * sizeof(*waits))))
+    {
+        memcpy(copy, submits, count * sizeof(*copy));
+        if (submits[0].waitSemaphoreInfoCount)
+            memcpy(waits, submits[0].pWaitSemaphoreInfos, submits[0].waitSemaphoreInfoCount * sizeof(*waits));
+        memset(&waits[submits[0].waitSemaphoreInfoCount], 0, sizeof(*waits));
+        waits[submits[0].waitSemaphoreInfoCount].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        waits[submits[0].waitSemaphoreInfoCount].semaphore = vkw.hold_semaphore;
+        waits[submits[0].waitSemaphoreInfoCount].value = 1;
+        waits[submits[0].waitSemaphoreInfoCount].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        copy[0].waitSemaphoreInfoCount = submits[0].waitSemaphoreInfoCount + 1;
+        copy[0].pWaitSemaphoreInfos = waits;
+        submits = copy;
+        vkw.hold_queue = NULL;
+        printf("hold: the submission on VkQueue %p also waits for semaphore %p, value 1\n", (void *)queue,
+                (void *)vkw.hold_semaphore);
+    }
+    LeaveCriticalSection(&vkw.lock);
+
+    vr = vkw.queue_submit2(queue, count, submits, fence);
+    free(waits);
+    free(copy);
+    return vr;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL vkw_CreateDevice(VkPhysicalDevice physical_device,
+        const VkDeviceCreateInfo *create_info, const VkAllocationCallbacks *allocator, VkDevice *device)
+{
+    VkResult vr = vkw.create_device(physical_device, create_info, allocator, device);
+
+    if (vr == VK_SUCCESS)
+        vkw.device = *device;
+    return vr;
+}
+
+static PFN_vkVoidFunction vkw_wrap(const char *name, PFN_vkVoidFunction real)
+{
+    if (!real)
+        return NULL;
+    if (!strcmp(name, "vkResetCommandPool"))
+    {
+        vkw.reset_command_pool = (PFN_vkResetCommandPool)real;
+        return (PFN_vkVoidFunction)vkw_ResetCommandPool;
+    }
+    if (!strcmp(name, "vkAllocateCommandBuffers"))
+    {
+        vkw.allocate_command_buffers = (PFN_vkAllocateCommandBuffers)real;
+        return (PFN_vkVoidFunction)vkw_AllocateCommandBuffers;
+    }
+    if (!strcmp(name, "vkFreeCommandBuffers"))
+    {
+        vkw.free_command_buffers = (PFN_vkFreeCommandBuffers)real;
+        return (PFN_vkVoidFunction)vkw_FreeCommandBuffers;
+    }
+    if (!strcmp(name, "vkQueueSubmit2") || !strcmp(name, "vkQueueSubmit2KHR"))
+    {
+        vkw.queue_submit2 = (PFN_vkQueueSubmit2)real;
+        return (PFN_vkVoidFunction)vkw_QueueSubmit2;
+    }
+    return real;
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkw_GetDeviceProcAddr(VkDevice device, const char *name)
+{
+    return vkw_wrap(name, vkw.gdpa(device, name));
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkw_GetInstanceProcAddr(VkInstance instance, const char *name)
+{
+    PFN_vkVoidFunction real = vkw.gipa(instance, name);
+
+    if (!real)
+        return NULL;
+    if (!strcmp(name, "vkGetDeviceProcAddr"))
+    {
+        vkw.gdpa = (PFN_vkGetDeviceProcAddr)real;
+        return (PFN_vkVoidFunction)vkw_GetDeviceProcAddr;
+    }
+    if (!strcmp(name, "vkCreateDevice"))
+    {
+        vkw.create_device = (PFN_vkCreateDevice)real;
+        return (PFN_vkVoidFunction)vkw_CreateDevice;
+    }
+    return vkw_wrap(name, real);
+}
+
+static unsigned int vkw_mark(void)
+{
+    unsigned int mark;
+
+    EnterCriticalSection(&vkw.lock);
+    mark = vkw.submits;
+    LeaveCriticalSection(&vkw.lock);
+    return mark;
+}
+
+/* The highest value that the submissions on queue from start to end (vkw_mark values) signal on semaphore; 0 if
+ * none does. */
+static UINT64 vkw_signalled(unsigned int start, unsigned int end, VkQueue queue, VkSemaphore semaphore)
+{
+    const struct vkw_submit *entry;
+    UINT64 value = 0;
+    unsigned int n, i;
+
+    EnterCriticalSection(&vkw.lock);
+    for (n = max(start, vkw.submits > VKW_LOG_SIZE ? vkw.submits - VKW_LOG_SIZE : 0); n < end; ++n)
+    {
+        entry = &vkw.log[n % VKW_LOG_SIZE];
+        for (i = 0; entry->queue == queue && i < entry->signal_count; ++i)
+        {
+            if (entry->signals[i] == semaphore && entry->signal_values[i] > value)
+                value = entry->signal_values[i];
+        }
+    }
+    LeaveCriticalSection(&vkw.lock);
+    return value;
+}
+
+/* Whether a submission on waiter since wait_mark waits for a semaphore that the submissions on signaller from
+ * signal_mark to wait_mark signal, for at least the highest value they signal on it. */
+static BOOL vkw_waits_for(unsigned int wait_mark, VkQueue waiter, unsigned int signal_mark, VkQueue signaller,
+        VkSemaphore *semaphore, UINT64 *wait_value, UINT64 *signal_value)
+{
+    static struct vkw_submit waits[VKW_LOG_SIZE];
+    const struct vkw_submit *entry;
+    unsigned int n, i, count = 0;
+    UINT64 signalled;
+
+    EnterCriticalSection(&vkw.lock);
+    for (n = max(wait_mark, vkw.submits > VKW_LOG_SIZE ? vkw.submits - VKW_LOG_SIZE : 0); n < vkw.submits; ++n)
+    {
+        entry = &vkw.log[n % VKW_LOG_SIZE];
+        if (entry->queue == waiter)
+            waits[count++] = *entry;
+    }
+    LeaveCriticalSection(&vkw.lock);
+
+    for (n = 0; n < count; ++n)
+    {
+        for (i = 0; i < waits[n].wait_count; ++i)
+        {
+            if ((signalled = vkw_signalled(signal_mark, wait_mark, signaller, waits[n].waits[i]))
+                    && waits[n].wait_values[i] >= signalled)
+            {
+                *semaphore = waits[n].waits[i];
+                *wait_value = waits[n].wait_values[i];
+                *signal_value = signalled;
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+/* The semaphore that holds a submission (vkw.hold_queue), made and signalled through the device's own entry
+ * points, past the wrapper. It goes from 0 to 1 once: one hold per run. */
+static struct
+{
+    PFN_vkSignalSemaphore signal;
+    PFN_vkDestroySemaphore destroy;
+    PFN_vkDeviceWaitIdle wait_idle;
+    VkDevice device;
+    VkSemaphore semaphore;
+    volatile LONG released;
+    HANDLE stop;                        /* ends the --hang watchdog */
+} hold;
+
+static BOOL hold_create(void)
+{
+    PFN_vkCreateSemaphore create;
+    VkSemaphoreTypeCreateInfo type_info;
+    VkSemaphoreCreateInfo info;
+
+    memset(&hold, 0, sizeof(hold));
+    if (!vkw.gdpa || !vkw.device)
+        return FALSE;
+    hold.device = vkw.device;
+    create = (PFN_vkCreateSemaphore)vkw.gdpa(vkw.device, "vkCreateSemaphore");
+    hold.signal = (PFN_vkSignalSemaphore)vkw.gdpa(vkw.device, "vkSignalSemaphore");
+    hold.destroy = (PFN_vkDestroySemaphore)vkw.gdpa(vkw.device, "vkDestroySemaphore");
+    hold.wait_idle = (PFN_vkDeviceWaitIdle)vkw.gdpa(vkw.device, "vkDeviceWaitIdle");
+    if (!create || !hold.signal || !hold.destroy || !hold.wait_idle)
+        return FALSE;
+    memset(&type_info, 0, sizeof(type_info));
+    type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    info.pNext = &type_info;
+    if (create(vkw.device, &info, NULL, &hold.semaphore) != VK_SUCCESS)
+        hold.semaphore = VK_NULL_HANDLE;
+    return hold.semaphore != VK_NULL_HANDLE;
+}
+
+static void hold_arm(VkQueue queue)
+{
+    EnterCriticalSection(&vkw.lock);
+    vkw.hold_semaphore = hold.semaphore;
+    vkw.hold_queue = queue;
+    LeaveCriticalSection(&vkw.lock);
+}
+
+/* Whether a submission took the hold since hold_arm(). */
+static BOOL hold_disarm(void)
+{
+    BOOL taken;
+
+    EnterCriticalSection(&vkw.lock);
+    taken = !vkw.hold_queue;
+    vkw.hold_queue = NULL;
+    LeaveCriticalSection(&vkw.lock);
+    return taken;
+}
+
+static void hold_release(const char *who)
+{
+    VkSemaphoreSignalInfo info;
+    VkResult vr;
+
+    if (!hold.semaphore || InterlockedCompareExchange(&hold.released, 1, 0))
+        return;
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+    info.semaphore = hold.semaphore;
+    info.value = 1;
+    vr = hold.signal(hold.device, &info);
+    printf("hold: %s signals semaphore %p to 1, vr %d\n", who, (void *)hold.semaphore, (int)vr);
+}
+
+/* Releases the hold if nobody did, lets the device go idle and destroys the semaphore. No engine call may run
+ * meanwhile (vkDeviceWaitIdle). */
+static void hold_destroy(void)
+{
+    if (!hold.semaphore)
+        return;
+    hold_release("teardown");
+    hold.wait_idle(hold.device);
+    hold.destroy(hold.device, hold.semaphore, NULL);
+    hold.semaphore = VK_NULL_HANDLE;
 }
 
 static SIZE_T private_bytes(void)
@@ -710,15 +1056,17 @@ done:
         ID3D12RootSignature_Release(rs);
 }
 
-/* The logging shell of the inline suite: records every BindQueue and UnbindQueue, checks that they come on
- * the thread that makes the engine calls and that a VkQueue is never bound twice. */
+/* The logging shell of the inline suite: records every BindQueue and UnbindQueue, checks that they come on a
+ * thread of the test that makes engine calls (never on a thread of the engine) and that a VkQueue is never bound
+ * twice. The test's threads mark themselves in tls_engine_caller. */
 #define TEST_BIND_FAILURE ((HRESULT)0x80bc2501)
 #define COOKIE(x) ((void *)(ULONG_PTR)(x))
+
+static __declspec(thread) BOOL tls_engine_caller;
 
 static struct test_shell
 {
     CRITICAL_SECTION lock;
-    DWORD thread;                   /* the only thread that makes engine calls */
     HRESULT fail_next;              /* BindQueue returns it once instead of binding */
     struct
     {
@@ -728,17 +1076,31 @@ static struct test_shell
     unsigned int bound_count;
     unsigned int binds, unbinds, failed_binds, wrong_thread, double_binds, unknown_unbinds;
     VkQueue last_offered;
+    /* Concurrent creation: BindQueue waits (up to 2 s) until rendezvous callers are inside it; met counts the
+     * calls that saw them all. */
+    volatile LONG rendezvous, arrived, met;
 } shell;
 
 static HRESULT APIENTRY shell_bind_queue(void *context, void *cookie, VkQueue queue)
 {
     struct test_shell *s = context;
+    ULONGLONG start;
     HRESULT hr = S_OK;
     unsigned int i;
 
+    if (s->rendezvous)
+    {
+        start = GetTickCount64();
+        InterlockedIncrement(&s->arrived);
+        while (s->arrived < s->rendezvous && GetTickCount64() - start < 2000)
+            SwitchToThread();
+        if (s->arrived >= s->rendezvous)
+            InterlockedIncrement(&s->met);
+    }
+
     EnterCriticalSection(&s->lock);
     s->last_offered = queue;
-    if (GetCurrentThreadId() != s->thread)
+    if (!tls_engine_caller)
         ++s->wrong_thread;
     for (i = 0; i < s->bound_count; ++i)
     {
@@ -777,7 +1139,7 @@ static void APIENTRY shell_unbind_queue(void *context, void *cookie, VkQueue que
     unsigned int i;
 
     EnterCriticalSection(&s->lock);
-    if (GetCurrentThreadId() != s->thread)
+    if (!tls_engine_caller)
         ++s->wrong_thread;
     for (i = 0; i < s->bound_count; ++i)
     {
@@ -824,18 +1186,174 @@ static HRESULT create_inline_queue(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12
     return funcs->CreateCommandQueue(device, &desc, cookie, &IID_ID3D12CommandQueue, (void **)queue);
 }
 
-/* A writes UPLOAD -> DEFAULT (16 MiB) and Signals (F, 1); B Waits (F, 1) and copies DEFAULT -> READBACK. If B
- * did not wait for A, it would copy the zeroed DEFAULT buffer, or part of it. */
-static void cross_queue_copy(ID3D12Device *device, ID3D12CommandQueue *qa, ID3D12CommandQueue *qb)
+/* A test thread that makes engine calls: with count 0 it creates one DIRECT queue and keeps it, otherwise it
+ * creates and releases count DIRECT queues, cookies from cookie up. */
+struct queue_thread
+{
+    const BC250_VKD3D_ENGINE_FUNCS *funcs;
+    ID3D12Device *device;
+    ULONG_PTR cookie;
+    unsigned int count;
+    ID3D12CommandQueue *queue;
+    unsigned int created, released;
+    HRESULT hr;
+};
+
+static DWORD WINAPI queue_thread_main(void *arg)
+{
+    struct queue_thread *t = arg;
+    ID3D12CommandQueue *queue;
+    unsigned int i;
+
+    tls_engine_caller = TRUE;
+    if (!t->count)
+    {
+        if (FAILED(t->hr = create_inline_queue(t->funcs, t->device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                COOKIE(t->cookie), &t->queue)))
+            t->queue = NULL;
+        return 0;
+    }
+    for (i = 0; i < t->count; ++i)
+    {
+        if (FAILED(t->hr = create_inline_queue(t->funcs, t->device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                COOKIE(t->cookie + i), &queue)))
+            break;
+        ++t->created;
+        if (!ID3D12CommandQueue_Release(queue))
+            ++t->released;
+    }
+    return 0;
+}
+
+/* Runs two queue threads to their end. A thread that is still running after 30 s may yet touch the test's
+ * state, so the test stops there. */
+static void run_queue_threads(struct queue_thread threads[2])
+{
+    HANDLE handles[2];
+    DWORD count = 0, wait;
+    unsigned int i;
+
+    for (i = 0; i < 2; ++i)
+    {
+        if ((handles[count] = CreateThread(NULL, 0, queue_thread_main, &threads[i], 0, NULL)))
+            ++count;
+        else
+            threads[i].hr = HRESULT_FROM_WIN32(GetLastError());
+    }
+    wait = count ? WaitForMultipleObjects(count, handles, TRUE, 30000) : WAIT_OBJECT_0;
+    for (i = 0; i < count; ++i)
+        CloseHandle(handles[i]);
+    if (wait != WAIT_OBJECT_0)
+    {
+        check(FALSE, "queue threads end within 30 s");
+        printf("FAILED (%u)\n", failures);
+        ExitProcess(1);
+    }
+}
+
+/* V7 lets the shell create queues on several threads at once. BindQueue holds two creations until both are
+ * inside it, which is after the engine picked their VkQueues and before it adds them to its list of inline
+ * queues; with the list grown and filled in two critical sections, both would find room for one more and the
+ * second would write past it. A third queue then grows the list, and a copy on each of the two, waited for with
+ * SetEventOnCompletion(v, NULL), completes only if retirement finds the queue in the list. Then two threads
+ * create and release 50 queues each. */
+static void concurrent_queue_creation(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *device)
+{
+    struct queue_thread threads[2];
+    ID3D12CommandQueue *qf = NULL;
+    unsigned int binds, released, i;
+    VkQueue vd, ve, vf;
+    BOOL heap_ok;
+    HRESULT hr;
+
+    memset(threads, 0, sizeof(threads));
+    for (i = 0; i < 2; ++i)
+    {
+        threads[i].funcs = funcs;
+        threads[i].device = device;
+    }
+    threads[0].cookie = 0xd1;
+    threads[1].cookie = 0xe1;
+    shell.arrived = shell.met = 0;
+    shell.rendezvous = 2;
+    run_queue_threads(threads);
+    shell.rendezvous = 0;
+    heap_ok = HeapValidate(GetProcessHeap(), 0, NULL);
+    vd = shell_queue_of(COOKIE(0xd1));
+    ve = shell_queue_of(COOKIE(0xe1));
+    printf("concurrent: D hr %08lx VkQueue %p, E hr %08lx VkQueue %p, %ld of 2 BindQueue calls met, process heap "
+            "%s\n", (unsigned long)threads[0].hr, (void *)vd, (unsigned long)threads[1].hr, (void *)ve,
+            (long)shell.met, heap_ok ? "valid" : "CORRUPT");
+    check(threads[0].queue && threads[1].queue && vd && ve && vd != ve,
+            "concurrent: two threads create DIRECT D and E at once, on two VkQueues");
+    check(shell.met == 2, "concurrent: both creations were inside BindQueue at the same time");
+    check(heap_ok, "concurrent: HeapValidate of the process heap after the overlapping creations");
+
+    hr = create_inline_queue(funcs, device, D3D12_COMMAND_LIST_TYPE_DIRECT, COOKIE(0xf1), &qf);
+    if (FAILED(hr))
+        qf = NULL;
+    vf = shell_queue_of(COOKIE(0xf1));
+    check(qf && vf && vf != vd && vf != ve, "concurrent: then DIRECT F on this thread, which grows the engine's "
+            "queue list");
+    if (threads[0].queue)
+        copy_round_trip(device, threads[0].queue, D3D12_COMMAND_LIST_TYPE_DIRECT, WAIT_NULL_EVENT,
+                "concurrent queue D: ");
+    if (threads[1].queue)
+        copy_round_trip(device, threads[1].queue, D3D12_COMMAND_LIST_TYPE_DIRECT, WAIT_NULL_EVENT,
+                "concurrent queue E: ");
+    released = 0;
+    if (qf && !ID3D12CommandQueue_Release(qf))
+        ++released;
+    for (i = 0; i < 2; ++i)
+    {
+        if (threads[i].queue && !ID3D12CommandQueue_Release(threads[i].queue))
+            ++released;
+    }
+    check(released == 3 && !shell_queue_of(COOKIE(0xd1)) && !shell_queue_of(COOKIE(0xe1))
+            && !shell_queue_of(COOKIE(0xf1)), "concurrent: D, E and F return 0 from their final Release and are "
+            "unbound");
+
+    memset(threads, 0, sizeof(threads));
+    for (i = 0; i < 2; ++i)
+    {
+        threads[i].funcs = funcs;
+        threads[i].device = device;
+        threads[i].count = 50;
+        threads[i].cookie = 0x10000 * (i + 1);
+    }
+    binds = shell.binds;
+    run_queue_threads(threads);
+    heap_ok = HeapValidate(GetProcessHeap(), 0, NULL);
+    printf("concurrent: the threads created %u and %u queues and released %u and %u of them to 0 (hr %08lx, "
+            "%08lx), %u binds, process heap %s\n", threads[0].created, threads[1].created, threads[0].released,
+            threads[1].released, (unsigned long)threads[0].hr, (unsigned long)threads[1].hr, shell.binds - binds,
+            heap_ok ? "valid" : "CORRUPT");
+    check(threads[0].released == 50 && threads[1].released == 50 && shell.binds - binds == 100 && heap_ok
+            && shell.bound_count == 4, "concurrent: two threads create and release 50 DIRECT queues each; all bound "
+            "and unbound again, the process heap valid");
+}
+
+/* A writes UPLOAD -> DEFAULT (16 MiB) and Signals (F, 1); B Waits (F, 1) and copies DEFAULT -> READBACK. The
+ * Vulkan wrapper holds A's submission until B has submitted, so F cannot be reached before B's Wait (which would
+ * need no GPU wait) and B cannot run in order with A by luck. Then a submission on B's VkQueue (vb) must wait for
+ * the timeline that A's submission on va signals, at least up to A's value; G must stay at 0 while A is held;
+ * and READBACK must equal UPLOAD, where a B that did not wait would copy the DEFAULT buffer before A wrote it. */
+static void cross_queue_copy(ID3D12Device *device, ID3D12CommandQueue *qa, ID3D12CommandQueue *qb, VkQueue va,
+        VkQueue vb)
 {
     enum { WORDS = 4 * 1024 * 1024 };
     const UINT64 size = (UINT64)WORDS * sizeof(UINT32);
     ID3D12Resource *upload = NULL, *gpu = NULL, *readback = NULL;
     ID3D12CommandAllocator *allocator_a = NULL, *allocator_b = NULL;
     ID3D12GraphicsCommandList *list_a = NULL, *list_b = NULL;
+    UINT64 wait_value = 0, signal_value = 0;
     ID3D12Fence *f = NULL, *g = NULL, *h = NULL;
-    D3D12_RANGE range;
+    unsigned int mark_a, mark_b;
+    VkSemaphore timeline = NULL;
+    BOOL waits, held, ok;
     unsigned int i, bad = 0;
+    D3D12_RANGE range;
+    UINT64 g_held;
     UINT32 *words;
 
     upload = create_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -878,12 +1396,34 @@ static void cross_queue_copy(ID3D12Device *device, ID3D12CommandQueue *qa, ID3D1
     check(SUCCEEDED(ID3D12Fence_Signal(h, 1)) && ID3D12CommandQueue_Wait(qb, h, 1) == S_OK,
             "fence H: CPU Signal(1), then queue B Wait(H, 1) -> S_OK");
 
+    if (!hold_create())
+    {
+        check(FALSE, "cross-queue: a timeline semaphore through the device's own entry points");
+        goto done;
+    }
+    mark_a = vkw_mark();
+    hold_arm(va);
     ID3D12CommandQueue_ExecuteCommandLists(qa, 1, (ID3D12CommandList **)&list_a);
-    check(SUCCEEDED(ID3D12CommandQueue_Signal(qa, f, 1)), "queue A: ExecuteCommandLists, Signal(F, 1)");
+    held = hold_disarm();
+    check(SUCCEEDED(ID3D12CommandQueue_Signal(qa, f, 1)) && held, "queue A: ExecuteCommandLists, held by the "
+            "wrapper, Signal(F, 1)");
+    mark_b = vkw_mark();
     check(ID3D12CommandQueue_Wait(qb, f, 1) == S_OK, "queue B: Wait(F, 1) after A's Signal -> S_OK");
     ID3D12CommandQueue_ExecuteCommandLists(qb, 1, (ID3D12CommandList **)&list_b);
     check(SUCCEEDED(ID3D12CommandQueue_Signal(qb, g, 1)), "queue B: ExecuteCommandLists, Signal(G, 1)");
-    if (!wait_fence_inline(g, 1, WAIT_NULL_EVENT, "cross-queue"))
+    waits = vkw_waits_for(mark_b, vb, mark_a, va, &timeline, &wait_value, &signal_value);
+    printf("cross-queue: B's submissions wait for semaphore %p value %llu, which A's submission signals up to "
+            "%llu\n", (void *)timeline, (unsigned long long)wait_value, (unsigned long long)signal_value);
+    check(waits, "cross-queue: a vkQueueSubmit2 on B's VkQueue waits for the timeline that A's submission signals, "
+            "at least up to A's value");
+    Sleep(50);
+    g_held = ID3D12Fence_GetCompletedValue(g);
+    printf("cross-queue: 50 ms after B's Signal, with A held, G is at %llu\n", (unsigned long long)g_held);
+    check(!g_held, "cross-queue: G stays at 0 while A is held");
+    hold_release("cross-queue");
+    ok = wait_fence_inline(g, 1, WAIT_NULL_EVENT, "cross-queue");
+    hold_destroy();
+    if (!ok)
         goto done;
     check(ID3D12Fence_GetCompletedValue(f) >= 1, "cross-queue: F is at 1 once G is");
 
@@ -924,46 +1464,150 @@ done:
         ID3D12Resource_Release(upload);
 }
 
-/* Command-allocator reuse on one queue, the way a frame loop does it: two allocators in turn, each Reset only
- * after GetCompletedValue shows its last submission done. Private bytes are sampled after a warm-up and at the
- * end. Then three serial cycles in which allocator Reset is the first engine call after the GPU finished: the
- * test learns that from the READBACK memory, not from the engine, so only Reset's own retirement (V8) can
- * release the allocator's submission; if it did not, vkd3d-proton logs an error that the run counts.
- * The memory bound comes from a positive control: as many cycles again, each keeping a new allocator and list
- * alive (what the loop would pile up if nothing were recycled). The loop may grow by a quarter of that. */
-static void allocator_reuse(ID3D12Device *device, ID3D12CommandQueue *queue)
-{
-    enum { CYCLES = 100, WARMUP = 10, WORDS = 1024, SERIAL = 3, CONTROL = CYCLES - WARMUP };
-    ID3D12GraphicsCommandList *kept_lists[CONTROL] = {NULL};
-    ID3D12CommandAllocator *kept_allocators[CONTROL] = {NULL};
-    const UINT64 size = WORDS * sizeof(UINT32);
-    ID3D12CommandAllocator *allocators[2] = {NULL, NULL};
-    ID3D12Resource *upload = NULL, *readback = NULL;
-    SIZE_T before = 0, after = 0, control_before, control_after;
-    ID3D12GraphicsCommandList *list = NULL;
-    long long growth, control_growth;
-    unsigned int n, polls = 0, bad_resets = 0;
-    volatile const UINT32 *mapped = NULL;
-    UINT32 *upload_words = NULL;
-    ID3D12Fence *fence = NULL;
-    D3D12_RANGE range;
-    ULONGLONG start;
-    BOOL ok = TRUE;
-    UINT32 marker;
+/* Command-allocator reuse on one queue, the way a frame loop does it: allocators[n & 1] records cycle n, and a
+ * cycle that reuses an allocator first polls GetCompletedValue until that allocator's previous submission (cycle
+ * n - 2) is done. With reset, the cycle then Resets the allocator, and every Reset must reach vkResetCommandPool
+ * (the Vulkan wrapper counts the calls). Without, the negative control, the cycle Resets only the list, on the
+ * allocator as it is: nothing is recycled, and each allocator keeps a command buffer per cycle. What an
+ * allocator keeps is measured in command buffers (allocated minus freed, counted by the wrapper), since their
+ * memory is the Vulkan driver's and need not show in the process's private bytes (the NVIDIA driver's does not);
+ * both are sampled after cycle ALLOC_WARMUP and after the last one. The fence counts the cycles from base + 1. */
+enum { ALLOC_CYCLES = 100, ALLOC_WARMUP = 10, ALLOC_WORDS = 1024 };
 
-    upload = create_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
-    readback = create_buffer(device, D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
-    check(upload && readback
-            && SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+struct allocator_loop
+{
+    unsigned int cycles, polls;
+    unsigned int resets, missed_resets;     /* allocator Resets; those that did not call vkResetCommandPool */
+    LONG pool_resets;                       /* vkResetCommandPool calls during the loop */
+    LONG command_buffers;                   /* command buffers kept, end of cycle ALLOC_WARMUP to the end */
+    long long growth;                       /* private bytes, end of cycle ALLOC_WARMUP to the end */
+};
+
+static void record_copy(ID3D12GraphicsCommandList *list, ID3D12Resource *dst, ID3D12Resource *src)
+{
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, dst, 0, src, 0, ALLOC_WORDS * sizeof(UINT32));
+}
+
+static BOOL allocator_loop(ID3D12Device *device, ID3D12CommandQueue *queue, ID3D12Resource *upload,
+        ID3D12Resource *readback, ID3D12Fence *fence, UINT64 base, BOOL reset, struct allocator_loop *out)
+{
+    ID3D12CommandAllocator *allocators[2] = {NULL, NULL};
+    ID3D12GraphicsCommandList *list = NULL;
+    LONG pool_resets_start, command_buffers_start = 0, count;
+    SIZE_T before = 0, after;
+    unsigned int n;
+    ULONGLONG start;
+    BOOL ok;
+
+    memset(out, 0, sizeof(*out));
+    ok = SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
                     &IID_ID3D12CommandAllocator, (void **)&allocators[0]))
             && SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
                     &IID_ID3D12CommandAllocator, (void **)&allocators[1]))
             && SUCCEEDED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0], NULL,
                     &IID_ID3D12GraphicsCommandList, (void **)&list))
+            && SUCCEEDED(ID3D12GraphicsCommandList_Close(list));
+    pool_resets_start = vkw.pool_resets;
+
+    for (n = 1; n <= ALLOC_CYCLES && ok; ++n)
+    {
+        ID3D12CommandAllocator *allocator = allocators[n & 1];
+
+        /* Cycle n - 2 used this allocator. */
+        start = GetTickCount64();
+        while (n > 2 && ID3D12Fence_GetCompletedValue(fence) < base + n - 2)
+        {
+            ++out->polls;
+            if (GetTickCount64() - start > 5000)
+            {
+                ok = FALSE;
+                break;
+            }
+            SwitchToThread();
+        }
+        if (ok && reset)
+        {
+            count = vkw.pool_resets;
+            ok = SUCCEEDED(ID3D12CommandAllocator_Reset(allocator));
+            ++out->resets;
+            if (vkw.pool_resets == count)
+                ++out->missed_resets;
+        }
+        if (!ok || FAILED(ID3D12GraphicsCommandList_Reset(list, allocator, NULL)))
+        {
+            ok = FALSE;
+            break;
+        }
+        record_copy(list, readback, upload);
+        if (FAILED(ID3D12GraphicsCommandList_Close(list)))
+        {
+            ok = FALSE;
+            break;
+        }
+        ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+        if (FAILED(ID3D12CommandQueue_Signal(queue, fence, base + n)))
+        {
+            ok = FALSE;
+            break;
+        }
+        out->cycles = n;
+        if (n == ALLOC_WARMUP)
+        {
+            before = private_bytes();
+            command_buffers_start = vkw.command_buffers;
+        }
+    }
+    ok = ok && wait_fence_inline(fence, base + ALLOC_CYCLES, WAIT_NULL_EVENT,
+            reset ? "allocator reuse" : "allocator reuse (no Reset)");
+    after = private_bytes();
+    out->growth = (long long)after - (long long)before;
+    out->command_buffers = vkw.command_buffers - command_buffers_start;
+    out->pool_resets = vkw.pool_resets - pool_resets_start;
+
+    if (list)
+        ID3D12GraphicsCommandList_Release(list);
+    if (allocators[1])
+        ID3D12CommandAllocator_Release(allocators[1]);
+    if (allocators[0])
+        ID3D12CommandAllocator_Release(allocators[0]);
+    return ok && before;
+}
+
+/* The frame loop with allocator Reset, then three serial cycles in which allocator Reset is the first engine call
+ * after the GPU finished: the test learns that from the READBACK memory, not from the engine, so only Reset's own
+ * retirement (V8) can release the allocator's submission, and Reset must still reach vkResetCommandPool. Then
+ * the negative control: the same loop without allocator Reset. The loop with Reset may keep a quarter of the
+ * command buffers that the control keeps. */
+static void allocator_reuse(ID3D12Device *device, ID3D12CommandQueue *queue)
+{
+    enum { SERIAL = 3, CONTROL_MIN = (ALLOC_CYCLES - ALLOC_WARMUP) / 2 };
+    const UINT64 size = ALLOC_WORDS * sizeof(UINT32);
+    ID3D12Resource *upload = NULL, *readback = NULL;
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    struct allocator_loop loop, control;
+    unsigned int n, serial_resets = 0;
+    volatile const UINT32 *mapped = NULL;
+    BOOL ok, loop_ok, control_ok = FALSE;
+    UINT32 *upload_words = NULL;
+    ID3D12Fence *fence = NULL;
+    D3D12_RANGE range;
+    ULONGLONG start;
+    UINT32 marker;
+    UINT64 value;
+    LONG count;
+
+    upload = create_buffer(device, D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
+    readback = create_buffer(device, D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
+    ok = upload && readback
+            && SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void **)&allocator))
+            && SUCCEEDED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL,
+                    &IID_ID3D12GraphicsCommandList, (void **)&list))
             && SUCCEEDED(ID3D12GraphicsCommandList_Close(list))
-            && SUCCEEDED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence)),
-            "allocator reuse: two allocators, one list, one fence");
-    if (!list || !fence)
+            && SUCCEEDED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence));
+    check(ok, "allocator reuse: 4 KiB UPLOAD and READBACK, an allocator, a list, a fence");
+    if (!ok)
         goto done;
     memset(&range, 0, sizeof(range));
     if (FAILED(ID3D12Resource_Map(upload, 0, &range, (void **)&upload_words))
@@ -974,69 +1618,45 @@ static void allocator_reuse(ID3D12Device *device, ID3D12CommandQueue *queue)
     }
     memset(upload_words, 0, (size_t)size);
 
-    for (n = 1; n <= CYCLES && ok; ++n)
-    {
-        ID3D12CommandAllocator *allocator = allocators[n & 1];
-
-        /* Cycle n - 2 used this allocator. */
-        start = GetTickCount64();
-        while (n > 2 && ID3D12Fence_GetCompletedValue(fence) < n - 2)
-        {
-            ++polls;
-            if (GetTickCount64() - start > 5000)
-            {
-                ok = FALSE;
-                break;
-            }
-            SwitchToThread();
-        }
-        if (!ok || FAILED(ID3D12CommandAllocator_Reset(allocator))
-                || FAILED(ID3D12GraphicsCommandList_Reset(list, allocator, NULL)))
-        {
-            ++bad_resets;
-            ok = FALSE;
-            break;
-        }
-        ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 0, upload, 0, size);
-        if (FAILED(ID3D12GraphicsCommandList_Close(list)))
-        {
-            ok = FALSE;
-            break;
-        }
-        ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
-        if (FAILED(ID3D12CommandQueue_Signal(queue, fence, n)))
-            ok = FALSE;
-        if (n == WARMUP)
-            before = private_bytes();
-    }
-    ok = ok && wait_fence_inline(fence, CYCLES, WAIT_NULL_EVENT, "allocator reuse");
-    after = private_bytes();
-    growth = (long long)after - (long long)before;
-    printf("allocator reuse: %u cycles, %u GetCompletedValue polls, private bytes %llu after cycle %u, %llu after "
-            "cycle %u (%+lld)\n", n - 1, polls, (unsigned long long)before, (unsigned int)WARMUP,
-            (unsigned long long)after, (unsigned int)CYCLES, growth);
-    checkf(ok && !bad_resets, "allocator reuse: %u cycles, each allocator Reset after polling its fence value",
-            (unsigned int)CYCLES);
+    loop_ok = allocator_loop(device, queue, upload, readback, fence, 0, TRUE, &loop);
+    printf("allocator reuse: %u cycles, %u GetCompletedValue polls, %u allocator Resets, %ld vkResetCommandPool "
+            "calls, %u Resets without one, command buffers kept %+ld and private bytes %+lld from cycle %u to %u\n",
+            loop.cycles, loop.polls, loop.resets, (long)loop.pool_resets, loop.missed_resets,
+            (long)loop.command_buffers, loop.growth, (unsigned int)ALLOC_WARMUP, (unsigned int)ALLOC_CYCLES);
+    checkf(loop_ok && loop.cycles == ALLOC_CYCLES, "allocator reuse: %u cycles over two allocators, each Reset "
+            "after polling its fence value", (unsigned int)ALLOC_CYCLES);
+    checkf(loop_ok && loop.resets == ALLOC_CYCLES && !loop.missed_resets, "allocator reuse: each of the %u "
+            "allocator Resets calls vkResetCommandPool (%u do not)", loop.resets, loop.missed_resets);
     census_expect_none("after 100 allocator cycles");
-    if (!ok)
+    if (!loop_ok)
         goto done;
 
-    for (n = 1; n <= SERIAL && ok; ++n)
+    /* Reset n + 1 follows serial cycle n's submission, with no engine call in between. */
+    value = ALLOC_CYCLES;
+    for (n = 1; n <= SERIAL + 1 && ok; ++n)
     {
-        ID3D12CommandAllocator *allocator = allocators[0];
-
-        if (FAILED(ID3D12CommandAllocator_Reset(allocator))
-                || FAILED(ID3D12GraphicsCommandList_Reset(list, allocator, NULL)))
+        count = vkw.pool_resets;
+        if (FAILED(ID3D12CommandAllocator_Reset(allocator)))
+        {
+            ok = FALSE;
+            break;
+        }
+        if (n > 1 && vkw.pool_resets > count)
+            ++serial_resets;
+        if (n > SERIAL)
+            break;
+        if (FAILED(ID3D12GraphicsCommandList_Reset(list, allocator, NULL)))
         {
             ok = FALSE;
             break;
         }
         marker = 0xc0de0000u + n;
         upload_words[0] = marker;
-        ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 0, upload, 0, size);
+        record_copy(list, readback, upload);
         ok = SUCCEEDED(ID3D12GraphicsCommandList_Close(list));
-        ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
-        ok = ok && SUCCEEDED(ID3D12CommandQueue_Signal(queue, fence, CYCLES + n));
+        if (ok)
+            ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+        ok = ok && SUCCEEDED(ID3D12CommandQueue_Signal(queue, fence, ++value));
         /* No engine call from here to the next Reset: the copy's result says the GPU got there, and 20 ms
          * covers the timeline signal that follows it in the same submission. */
         start = GetTickCount64();
@@ -1048,48 +1668,31 @@ static void allocator_reuse(ID3D12Device *device, ID3D12CommandQueue *queue)
         }
         Sleep(20);
     }
-    ok = ok && SUCCEEDED(ID3D12CommandAllocator_Reset(allocators[0]));
-    checkf(ok, "allocator reuse: %u serial cycles with allocator Reset as the first engine call after the GPU "
-            "finished (vkd3d-proton logs an error if Reset found the submission still pending)", (unsigned int)SERIAL);
-    ok = ok && wait_fence_inline(fence, CYCLES + SERIAL, WAIT_NULL_EVENT, "allocator reuse (serial)");
+    printf("allocator reuse: %u of %u allocator Resets that were the first engine call after the GPU finished "
+            "called vkResetCommandPool\n", serial_resets, (unsigned int)SERIAL);
+    checkf(ok && serial_resets == SERIAL, "allocator reuse: %u serial cycles; each allocator Reset that is the first "
+            "engine call after the GPU finished calls vkResetCommandPool", (unsigned int)SERIAL);
+    ok = ok && wait_fence_inline(fence, value, WAIT_NULL_EVENT, "allocator reuse (serial)");
     if (!ok)
         goto done;
 
-    control_before = private_bytes();
-    for (n = 0; n < CONTROL && ok; ++n)
-    {
-        if (FAILED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &IID_ID3D12CommandAllocator, (void **)&kept_allocators[n]))
-                || FAILED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    kept_allocators[n], NULL, &IID_ID3D12GraphicsCommandList, (void **)&kept_lists[n])))
-        {
-            ok = FALSE;
-            break;
-        }
-        ID3D12GraphicsCommandList_CopyBufferRegion(kept_lists[n], readback, 0, upload, 0, size);
-        ok = SUCCEEDED(ID3D12GraphicsCommandList_Close(kept_lists[n]));
-        ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&kept_lists[n]);
-        ok = ok && SUCCEEDED(ID3D12CommandQueue_Signal(queue, fence, CYCLES + SERIAL + 1 + n));
-    }
-    ok = ok && wait_fence_inline(fence, CYCLES + SERIAL + CONTROL, WAIT_NULL_EVENT, "allocator reuse (control)");
-    control_after = private_bytes();
-    control_growth = (long long)control_after - (long long)control_before;
-    printf("allocator reuse: control keeps %u allocators and lists: private bytes %+lld (%lld per cycle)\n",
-            (unsigned int)CONTROL, control_growth, control_growth / CONTROL);
-    checkf(ok && control_growth >= 1024 * 1024, "allocator reuse: positive control, %u kept allocators and lists "
-            "grow private bytes by %lld KiB (at least 1024)", (unsigned int)CONTROL, control_growth / 1024);
-    checkf(ok && before && growth <= control_growth / 4, "allocator reuse: cycles %u to %u grow private bytes by "
-            "%+lld KiB, at most a quarter of the control's %lld KiB", (unsigned int)WARMUP, (unsigned int)CYCLES,
-            growth / 1024, control_growth / 1024);
+    control_ok = allocator_loop(device, queue, upload, readback, fence, value, FALSE, &control);
+    printf("allocator reuse (no Reset): %u cycles, %u GetCompletedValue polls, %ld vkResetCommandPool calls, "
+            "command buffers kept %+ld and private bytes %+lld from cycle %u to %u\n", control.cycles, control.polls,
+            (long)control.pool_resets, (long)control.command_buffers, control.growth, (unsigned int)ALLOC_WARMUP,
+            (unsigned int)ALLOC_CYCLES);
+    checkf(control_ok && control.cycles == ALLOC_CYCLES && !control.pool_resets, "negative control: the same %u "
+            "cycles without allocator Reset call vkResetCommandPool 0 times", (unsigned int)ALLOC_CYCLES);
+    checkf(control_ok && control.command_buffers >= CONTROL_MIN, "negative control: without allocator Reset, the "
+            "allocators keep %ld more command buffers from cycle %u to %u (at least %u)",
+            (long)control.command_buffers, (unsigned int)ALLOC_WARMUP, (unsigned int)ALLOC_CYCLES,
+            (unsigned int)CONTROL_MIN);
+    checkf(control_ok && loop.command_buffers <= control.command_buffers / 4, "allocator reuse: with allocator "
+            "Reset, the allocators keep %+ld command buffers from cycle %u to %u, at most a quarter of the %ld "
+            "without", (long)loop.command_buffers, (unsigned int)ALLOC_WARMUP, (unsigned int)ALLOC_CYCLES,
+            (long)control.command_buffers);
 
 done:
-    for (n = 0; n < CONTROL; ++n)
-    {
-        if (kept_lists[n])
-            ID3D12GraphicsCommandList_Release(kept_lists[n]);
-        if (kept_allocators[n])
-            ID3D12CommandAllocator_Release(kept_allocators[n]);
-    }
     if (mapped)
         ID3D12Resource_Unmap(readback, 0, NULL);
     if (upload_words)
@@ -1098,10 +1701,8 @@ done:
         ID3D12Fence_Release(fence);
     if (list)
         ID3D12GraphicsCommandList_Release(list);
-    if (allocators[1])
-        ID3D12CommandAllocator_Release(allocators[1]);
-    if (allocators[0])
-        ID3D12CommandAllocator_Release(allocators[0]);
+    if (allocator)
+        ID3D12CommandAllocator_Release(allocator);
     if (readback)
         ID3D12Resource_Release(readback);
     if (upload)
@@ -1157,7 +1758,7 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
     HRESULT hr;
 
     InitializeCriticalSection(&shell.lock);
-    shell.thread = GetCurrentThreadId();
+    tls_engine_caller = TRUE;
 
     memset(&services, 0, sizeof(services));
     services.Size = sizeof(services);
@@ -1240,6 +1841,7 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
     check(va && vb && vc && va != vb && va != vc && vb != vc && va != internal && vb != internal && vc != internal,
             "A, B, C and the internal queue are bound to four distinct VkQueues");
     census_expect_none("after queue creation");
+    concurrent_queue_creation(funcs, device);
 
     /* V7: a BindQueue failure fails CreateCommandQueue with its HRESULT and binds nothing. */
     shell.fail_next = TEST_BIND_FAILURE;
@@ -1283,7 +1885,7 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
     copy_round_trip(device, qc, D3D12_COMMAND_LIST_TYPE_COPY, WAIT_POLL, "COPY queue C: ");
     compute_dispatch(device, qa, WAIT_NULL_EVENT, "DIRECT queue A: ");
     census_expect_none("after ExecuteCommandLists");
-    cross_queue_copy(device, qa, qb);
+    cross_queue_copy(device, qa, qb, va, vb);
     census_expect_none("after fence waits");
     allocator_reuse(device, qa);
     multiple_fence_waits(device);
@@ -1312,9 +1914,179 @@ done:
             shell.wrong_thread, shell.double_binds, shell.unknown_unbinds);
     check(shell.binds == shell.unbinds && !shell.bound_count && !shell.unknown_unbinds,
             "every BindQueue has its UnbindQueue, the internal queue's at the device's final Release");
-    check(!shell.wrong_thread, "BindQueue and UnbindQueue ran on the thread of the engine call");
+    check(!shell.wrong_thread, "BindQueue and UnbindQueue ran on the test's threads that make engine calls");
     check(!shell.double_binds, "no VkQueue or cookie was bound twice");
     census_expect_none("after the device's final Release");
+    DeleteCriticalSection(&shell.lock);
+}
+
+static DWORD WINAPI hang_watchdog(void *arg)
+{
+    (void)arg;
+    if (WaitForSingleObject(hold.stop, 30000) == WAIT_TIMEOUT)
+        hold_release("the 30 s watchdog");
+    return 0;
+}
+
+/* --hang, ABI 1.1 and the INLINE queue mode: a GPU wait that does not end. The Vulkan wrapper holds queue A's
+ * ExecuteCommandLists submission on a semaphore that only the test signals, so the Signal(F, 1) that completes
+ * with it does not reach 1 on its own. SetEventOnCompletion(1, NULL) must give up after the wait budget (V7, BC250_VKD3D_INLINE_WAIT_BUDGET_MS)
+ * with DXGI_ERROR_DEVICE_HUNG and leave the device removed with that reason; a second wait must fail at once. A
+ * watchdog thread signals the semaphore after 30 s, so a wait without a bound ends too, late, and fails the timing
+ * check. Then the test signals the semaphore, and the queue, the fence and the device must still come apart
+ * cleanly. */
+static void hang_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3D_DEVICE_CREATE_INFO *base)
+{
+    const double budget = BC250_VKD3D_INLINE_WAIT_BUDGET_MS;
+    BC250_VKD3D_SHELL_SERVICES services;
+    BC250_VKD3D_DEVICE_CREATE_INFO info;
+    ID3D12Resource *upload = NULL, *readback = NULL;
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    LARGE_INTEGER t0, t1, freq;
+    ID3D12CommandQueue *qa = NULL;
+    double first_ms, second_ms;
+    ID3D12Device *device = NULL;
+    ID3D12Fence *fence = NULL;
+    HANDLE watchdog = NULL;
+    HRESULT hr, removed;
+    VkQueue va = NULL;
+    ULONGLONG start;
+    UINT64 value;
+    ULONG refs;
+    BOOL held;
+
+    InitializeCriticalSection(&shell.lock);
+    tls_engine_caller = TRUE;
+    QueryPerformanceFrequency(&freq);
+
+    memset(&services, 0, sizeof(services));
+    services.Size = sizeof(services);
+    services.Shell = &shell;
+    services.BindQueue = shell_bind_queue;
+    services.UnbindQueue = shell_unbind_queue;
+    info = *base;
+    info.Size = sizeof(info);
+    info.AbiVersion = ABI_1_1;
+    info.QueueMode = BC250_VKD3D_QUEUE_MODE_INLINE;
+    info.Services = &services;
+
+    hr = funcs->CreateDevice(&info, &IID_ID3D12Device, (void **)&device);
+    check(SUCCEEDED(hr) && device, "hang: CreateDevice in the INLINE queue mode (ABI 1.1)");
+    print_icd_modules();
+    if (FAILED(hr) || !device)
+    {
+        device = NULL;
+        goto done;
+    }
+
+    if (FAILED(create_inline_queue(funcs, device, D3D12_COMMAND_LIST_TYPE_DIRECT, COOKIE(0xa0), &qa)))
+        qa = NULL;
+    va = shell_queue_of(COOKIE(0xa0));
+    upload = create_buffer(device, D3D12_HEAP_TYPE_UPLOAD, 4096, D3D12_RESOURCE_STATE_GENERIC_READ);
+    readback = create_buffer(device, D3D12_HEAP_TYPE_READBACK, 4096, D3D12_RESOURCE_STATE_COPY_DEST);
+    check(qa && va && hold_create() && upload && readback
+            && SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void **)&allocator))
+            && SUCCEEDED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL,
+                    &IID_ID3D12GraphicsCommandList, (void **)&list))
+            && SUCCEEDED(ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
+                    (void **)&fence)), "hang: queue A, a list with a 4 KiB copy, fence F and a timeline semaphore "
+            "through the device's own entry points");
+    if (!qa || !va || !hold.semaphore || !list || !fence)
+        goto done;
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 0, upload, 0, 4096);
+    if (FAILED(ID3D12GraphicsCommandList_Close(list)))
+    {
+        check(FALSE, "hang: record the copy");
+        goto done;
+    }
+    if (!(hold.stop = CreateEventW(NULL, TRUE, FALSE, NULL))
+            || !(watchdog = CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL)))
+    {
+        check(FALSE, "hang: watchdog thread");
+        goto done;
+    }
+
+    /* A queue Signal submits nothing of its own: it completes with the queue's last submission. */
+    hold_arm(va);
+    ID3D12CommandQueue_ExecuteCommandLists(qa, 1, (ID3D12CommandList **)&list);
+    held = hold_disarm();
+    hr = ID3D12CommandQueue_Signal(qa, fence, 1);
+    check(SUCCEEDED(hr) && held, "hang: queue A ExecuteCommandLists (a 4 KiB copy), which the wrapper holds, and "
+            "Signal(F, 1)");
+
+    QueryPerformanceCounter(&t0);
+    hr = ID3D12Fence_SetEventOnCompletion(fence, 1, NULL);
+    QueryPerformanceCounter(&t1);
+    first_ms = 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+    removed = ID3D12Device_GetDeviceRemovedReason(device);
+    printf("hang: SetEventOnCompletion(1, NULL) hr %08lx after %.0f ms, GetDeviceRemovedReason %08lx\n",
+            (unsigned long)hr, first_ms, (unsigned long)removed);
+    checkf(hr == DXGI_ERROR_DEVICE_HUNG && first_ms >= budget - 500.0 && first_ms < 2.0 * budget,
+            "hang: SetEventOnCompletion(1, NULL) on a GPU wait that does not end -> DXGI_ERROR_DEVICE_HUNG after "
+            "the %.0f ms budget (%.0f ms)", budget, first_ms);
+    checkf(removed == DXGI_ERROR_DEVICE_HUNG, "hang: GetDeviceRemovedReason -> DXGI_ERROR_DEVICE_HUNG (%08lx)",
+            (unsigned long)removed);
+
+    QueryPerformanceCounter(&t0);
+    hr = ID3D12Fence_SetEventOnCompletion(fence, 1, NULL);
+    QueryPerformanceCounter(&t1);
+    second_ms = 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+    printf("hang: second SetEventOnCompletion(1, NULL) hr %08lx after %.2f ms\n", (unsigned long)hr, second_ms);
+    checkf(hr == DXGI_ERROR_DEVICE_HUNG && second_ms < 100.0, "hang: a second SetEventOnCompletion(1, NULL) fails "
+            "at once with DXGI_ERROR_DEVICE_HUNG (%.2f ms)", second_ms);
+    check(ID3D12Fence_GetCompletedValue(fence) == 0, "hang: F is still at 0 while the semaphore holds A");
+
+    hold_release("the test");
+    SetEvent(hold.stop);
+    WaitForSingleObject(watchdog, INFINITE);
+    CloseHandle(watchdog);
+    watchdog = NULL;
+    check(hold.wait_idle(hold.device) == VK_SUCCESS, "hang: vkDeviceWaitIdle once the semaphore is signalled");
+    start = GetTickCount64();
+    while ((value = ID3D12Fence_GetCompletedValue(fence)) < 1 && GetTickCount64() - start < 5000)
+        Sleep(1);
+    checkf(value == 1, "hang: F then reaches 1 through GetCompletedValue; retirement goes on on a removed device "
+            "(%llu)", (unsigned long long)value);
+
+done:
+    if (watchdog)
+    {
+        hold_release("the test");
+        SetEvent(hold.stop);
+        WaitForSingleObject(watchdog, INFINITE);
+        CloseHandle(watchdog);
+    }
+    if (hold.stop)
+        CloseHandle(hold.stop);
+    hold_destroy();
+    if (fence)
+        ID3D12Fence_Release(fence);
+    if (list)
+        ID3D12GraphicsCommandList_Release(list);
+    if (allocator)
+        ID3D12CommandAllocator_Release(allocator);
+    if (readback)
+        ID3D12Resource_Release(readback);
+    if (upload)
+        ID3D12Resource_Release(upload);
+    if (qa)
+        check(ID3D12CommandQueue_Release(qa) == 0 && !shell_queue_of(COOKIE(0xa0)),
+                "hang: queue A final Release 0, unbound");
+    if (device)
+    {
+        refs = ID3D12Device_Release(device);
+        printf("device final Release: %lu\n", refs);
+        check(refs == 0, "hang: device final Release returns 0");
+    }
+    printf("shell: %u binds, %u unbinds, %u failed binds, %u still bound, %u on another thread, %u double binds, "
+            "%u unknown unbinds\n", shell.binds, shell.unbinds, shell.failed_binds, shell.bound_count,
+            shell.wrong_thread, shell.double_binds, shell.unknown_unbinds);
+    check(shell.binds == shell.unbinds && !shell.bound_count && !shell.unknown_unbinds && !shell.wrong_thread
+            && !shell.double_binds, "hang: every BindQueue has its UnbindQueue, on the thread of the engine call, "
+            "no VkQueue bound twice");
+    census_expect_none("after the hang suite");
     DeleteCriticalSection(&shell.lock);
 }
 
@@ -1441,7 +2213,7 @@ int main(int argc, char **argv)
     ID3D12Device *device = NULL;
     UINT32 min_fl = 0xb000;
     HMODULE engine, driver;
-    BOOL inline_mode = FALSE, tail_kept;
+    BOOL inline_mode = FALSE, hang_mode = FALSE, tail_kept;
     char full[MAX_PATH];
     unsigned int k;
     LUID luid;
@@ -1450,10 +2222,11 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         printf("usage: amdgpu_wddm_vkd3d_engine_test <amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]"
-                " [--fl <hex>] [--inline]\n");
+                " [--fl <hex>] [--inline | --hang]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
+    InitializeCriticalSection(&vkw.lock);
     for (i = 2; i < argc; ++i)
     {
         if (!strcmp(argv[i], "--icd") && i + 1 < argc)
@@ -1462,6 +2235,8 @@ int main(int argc, char **argv)
             min_fl = (UINT32)strtoul(argv[++i], NULL, 16);
         else if (!strcmp(argv[i], "--inline"))
             inline_mode = TRUE;
+        else if (!strcmp(argv[i], "--hang"))
+            hang_mode = TRUE;
         else if (argv[i][0] == '-')
         {
             printf("FAIL  unknown or incomplete option %s\n", argv[i]);
@@ -1469,6 +2244,11 @@ int main(int argc, char **argv)
         }
         else
             filter = argv[i];
+    }
+    if (inline_mode && hang_mode)
+    {
+        printf("FAIL  --inline and --hang are separate runs\n");
+        return 2;
     }
 
     /* The shell's loads: absolute paths, dependencies from the DLL's own directory and System32 only. */
@@ -1569,10 +2349,17 @@ int main(int argc, char **argv)
                 "INLINE without UnbindQueue -> E_INVALIDARG");
     }
 
-    if (inline_mode)
+    if (inline_mode || hang_mode)
     {
-        printf("mode: %u-byte CreateInfo, AbiVersion 1.1, INLINE\n", (unsigned int)sizeof(info));
-        inline_suite(&funcs, &info);
+        /* The Vulkan wrapper sits in front of the entry point. */
+        vkw.gipa = gipa;
+        info.GetInstanceProcAddr = vkw_GetInstanceProcAddr;
+        printf("mode: %u-byte CreateInfo, AbiVersion 1.1, INLINE%s\n", (unsigned int)sizeof(info),
+                hang_mode ? ", GPU hang" : "");
+        if (hang_mode)
+            hang_suite(&funcs, &info);
+        else
+            inline_suite(&funcs, &info);
     }
     else if (threaded_suite(&funcs, &info, luid))
     {
