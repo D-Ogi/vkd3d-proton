@@ -241,6 +241,8 @@ void kmt_device_signal_fence_immediate(kmt_device device, kmt_handle fence, uint
     struct kmt_device_shmem *shmem = device->shmem;
     pthread_mutex_lock(&shmem->lock);
     kmt_device_signal_fence_immediate_locked(device, fence->shmem, value);
+    /* Could move a thread from blocked to fully signalled right away. */
+    pthread_cond_broadcast(&shmem->cond);
     pthread_mutex_unlock(&shmem->lock);
 }
 
