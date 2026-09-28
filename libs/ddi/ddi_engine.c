@@ -144,9 +144,11 @@ BC250_VKD3D_STATIC_ASSERT(inline_min_graphics_queues,
 #define BC250_COMMAND_QUEUE_DESC_SIZE_1_1 \
         ((UINT32)(FIELD_OFFSET(BC250_VKD3D_COMMAND_QUEUE_DESC, NodeMask) + sizeof(UINT32)))
 
-/* Sizes, fields included, up to which a 1.2 structure is read (V10). */
+/* Sizes, fields included, up to which a 1.2 structure is read (V10, V12). */
 #define BC250_IMPORTED_MEMORY_SIZE_1_2 \
         ((UINT32)(FIELD_OFFSET(BC250_VKD3D_IMPORTED_MEMORY, Flags) + sizeof(UINT32)))
+#define BC250_DEVICE_CREATE_INFO_SIZE_1_2 \
+        ((UINT32)(FIELD_OFFSET(BC250_VKD3D_DEVICE_CREATE_INFO, InstanceMode) + sizeof(UINT32)))
 
 /* What CreateDevice and QueryAdapterCaps (V11) make of a CreateInfo: libvkd3d's create info on the adapter, with
  * the instance it was found on. Both go through bc250_prepare_device(), so they refuse the same CreateInfo with the
@@ -168,6 +170,7 @@ static void bc250_release_request(struct bc250_device_request *request)
 static HRESULT bc250_prepare_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, struct bc250_device_request *request)
 {
     struct vkd3d_instance_create_info instance_create_info;
+    UINT32 instance_mode = BC250_VKD3D_INSTANCE_MODE_SHARED;
     const BC250_VKD3D_SHELL_SERVICES *services = NULL;
     UINT32 queue_mode = BC250_VKD3D_QUEUE_MODE_THREADED;
     VkPhysicalDevice vk_physical_device;
@@ -216,13 +219,34 @@ static HRESULT bc250_prepare_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, 
             return E_INVALIDARG;
     }
 
+    /* The 1.2 field (V12), the same way: PRIVATE below 1.2 fails, other values are ignored there. */
+    if (info->Size >= BC250_DEVICE_CREATE_INFO_SIZE_1_2)
+    {
+        if ((info->AbiVersion & 0xffffu) >= 2)
+        {
+            instance_mode = info->InstanceMode;
+        }
+        else if (info->InstanceMode == BC250_VKD3D_INSTANCE_MODE_PRIVATE)
+        {
+            WARN("The private instance mode needs AbiVersion 1.2.\n");
+            return E_INVALIDARG;
+        }
+    }
+    if (instance_mode != BC250_VKD3D_INSTANCE_MODE_SHARED && instance_mode != BC250_VKD3D_INSTANCE_MODE_PRIVATE)
+    {
+        WARN("Unknown instance mode %u.\n", instance_mode);
+        return E_INVALIDARG;
+    }
+
     /* V6, before anything reads the configuration. */
     InitOnceExecuteOnce(&bc250_config_once, bc250_set_config_defaults, NULL, NULL);
 
     /* V1: no WSI extensions (present belongs to the runtime) and no VR extensions (no OpenVR/OpenXR probing
-     * inside a system driver). vkd3d-proton adds the extensions it needs itself. */
+     * inside a system driver). vkd3d-proton adds the extensions it needs itself. V12: a private instance is the
+     * request's own, which the device keeps (libvkd3d refuses a singleton device over it) or the query destroys. */
     memset(&instance_create_info, 0, sizeof(instance_create_info));
     instance_create_info.pfn_vkGetInstanceProcAddr = info->GetInstanceProcAddr;
+    instance_create_info.private_instance = instance_mode == BC250_VKD3D_INSTANCE_MODE_PRIVATE;
     if (FAILED(hr = vkd3d_create_instance(&instance_create_info, &request->instance)))
     {
         WARN("Failed to create the vkd3d instance, hr %#x.\n", (unsigned int)hr);

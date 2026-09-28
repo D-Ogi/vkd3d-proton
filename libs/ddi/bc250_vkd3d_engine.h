@@ -5,12 +5,13 @@
  * amdgpu_wddm_vkd3d.dll, vkd3d-proton fork branch amdgpu-wddm/ddi-engine). The DLL was bc250vkd3d.dll before
  * its file names took the project's amdgpu_wddm prefix; code identifiers keep their BC250 names.
  *
- * Revision r3-draft, ABI 1.2: NOT FROZEN. r3 adds 1.2 (imported memory and the adapter query, V10 and V11) and
- * raises the admission of the inline queue mode (V7) to three VkQueues. 1.1 stays a draft until T0, the
- * logging-shell probe on unit A that settles the fence contract of the inline queue mode, and 1.2 with it. r1
- * (ABI 1.0) is frozen, and r2 and r3 keep it unchanged. This file in the vkd3d-proton fork is the only copy; the
- * shell includes it from the fork checkout it builds against. vkd3d-proton is LGPL-2.1 and stays a separately
- * loaded DLL; this header and the other files under libs/ddi are MIT.
+ * Revision r4-draft, ABI 1.2: NOT FROZEN. r4 adds the instance mode (V12) to 1.2; the minor stays 1.2 because 1.2
+ * is a draft, so an r3 engine does not know the field (V12 says how the shell tells). r3 adds 1.2 (imported memory
+ * and the adapter query, V10 and V11) and raises the admission of the inline queue mode (V7) to three VkQueues.
+ * 1.1 stays a draft until T0, the logging-shell probe on unit A that settles the fence contract of the inline
+ * queue mode, and 1.2 with it. r1 (ABI 1.0) is frozen, and r2 to r4 keep it unchanged. This file in the
+ * vkd3d-proton fork is the only copy; the shell includes it from the fork checkout it builds against. vkd3d-proton
+ * is LGPL-2.1 and stays a separately loaded DLL; this header and the other files under libs/ddi are MIT.
  *
  * Versions. A minor version adds and never changes: an engine of minor n serves a shell that requires any
  * minor up to n. CreateInfo.AbiVersion and the argument of Bc250Vkd3dEngineGetFuncs are the version the shell
@@ -21,15 +22,15 @@
  *        BC250_VKD3D_SHELL_SERVICES, BC250_VKD3D_COMMAND_QUEUE_DESC, ENGINE_FUNCS.CreateCommandQueue.
  *   1.2  r3-draft: imported memory (V10) and adapter capabilities (V11): ENGINE_FUNCS.GetVulkanHandles,
  *        CreateHeapFromMemory, MapHeap, UnmapHeap and QueryAdapterCaps, BC250_VKD3D_IMPORTED_MEMORY,
- *        BC250_VKD3D_FEATURE_QUERY.
+ *        BC250_VKD3D_FEATURE_QUERY. r4-draft: the instance mode (V12), DEVICE_CREATE_INFO.InstanceMode.
  *
  * Sizes. Every structure starts with its Size, so a shell built against an older header passes a smaller one.
- * The engine reads a field only when Size covers it (1.1 fields also need AbiVersion 1.1 or later). It fills at
- * most funcs->Size bytes of the function table, and of those only the entries of the minors up to the one that
- * abiVersion names; later entries are NULL, so a shell that requires 1.1 finds no 1.2 function even in a
+ * The engine reads a field only when Size covers it (fields of minor n also need AbiVersion 1.n or later). It
+ * fills at most funcs->Size bytes of the function table, and of those only the entries of the minors up to the one
+ * that abiVersion names; later entries are NULL, so a shell that requires 1.1 finds no 1.2 function even in a
  * 1.2-sized table. The *_SIZE_1_0 macros are the 1.0 sizes, the smallest the engine accepts: sizeof of the frozen
  * 1.0 structures (the *_1_0 types), tail padding included, as a 1.0 shell passes them. The *_SIZE_1_1 macros are
- * the sizes of the 1.1 layouts, which 1.2 extends without changing them.
+ * the sizes of the 1.1 layouts (the *_1_1 types), which 1.2 extends without changing them.
  *
  * C and C++. Needs windows.h and vulkan_core.h only; neither the WDK nor a D3D12 header, so the engine's
  * translation units (vkd3d-proton's own D3D12 headers) and the shell's (SDK d3d12.h plus d3d12umddi.h) can
@@ -48,14 +49,16 @@
  *
  *   V1  Vulkan objects. Unlike the DXVK engine, the engine creates its own VkInstance and VkDevice through
  *       CreateInfo.GetInstanceProcAddr (vkd3d-proton's public create path) and destroys them in the device's
- *       final Release. The engine loads no Vulkan DLL. The shell's entry point may add its own structures to the
- *       pNext chains of vkCreateInstance and vkCreateDevice (the hosted contract) and must return the entry
- *       points of the same driver for every name. From 1.2, GetVulkanHandles hands the objects to the shell for
- *       the memory of V10.
+ *       final Release; the VkInstance is shared by the live engine devices unless CreateInfo asks for a private
+ *       one (V12), and a shared one goes with the last of them. The engine loads no Vulkan DLL. The shell's entry
+ *       point may add its own structures to the pNext chains of vkCreateInstance and vkCreateDevice (the hosted
+ *       contract) and must return the entry points of the same driver for every name. From 1.2, GetVulkanHandles
+ *       hands the objects to the shell for the memory of V10.
  *   V2  Adapter. The engine uses the physical device whose VkPhysicalDeviceIDProperties::deviceLUID equals
  *       CreateInfo.AdapterLuid; if none does, CreateDevice fails with E_INVALIDARG and creates nothing. The
  *       device is independent: two CreateDevice calls return two devices, never a cached one (vkd3d-proton
- *       makes an exception when ENABLE_VULKAN_RENDERDOC_CAPTURE=1, because RenderDoc supports one VkDevice).
+ *       makes an exception when ENABLE_VULKAN_RENDERDOC_CAPTURE=1, because RenderDoc supports one VkDevice; an
+ *       INLINE (V7) or PRIVATE (V12) CreateDevice or QueryAdapterCaps then fails with E_INVALIDARG).
  *   V3  Threads and submission (1.0). vkd3d-proton's own threading is unchanged: its queues submit from a
  *       submission thread and it waits for fences on worker threads. That satisfies neither the runtime's fence
  *       model (work must be submitted inside ExecuteCommandLists, on the queue's WDDM context) nor the
@@ -249,9 +252,9 @@
  *         the queue selection of the queue mode, the memory, descriptor-buffer and bindless decisions, and
  *         d3d12_device_caps_init) and answers through d3d12_device_check_feature_support, the body of
  *         ID3D12Device::CheckFeatureSupport. It never answers from raw Vulkan features.
- *       - Footprint. It takes vkd3d-proton's instance as CreateDevice does: the one that live engine devices
- *         share, or a new VkInstance that it destroys before it returns. It creates no VkDevice and no queue,
- *         allocates no GPU memory, starts no thread and calls no Services.
+ *       - Footprint. It takes vkd3d-proton's instance as CreateDevice does (V12): the one that live engine devices
+ *         share, or a new VkInstance that it destroys before it returns; always a new one when PRIVATE. It
+ *         creates no VkDevice and no queue, allocates no GPU memory, starts no thread and calls no Services.
  *       - Queries. Each BC250_VKD3D_FEATURE_QUERY is one CheckFeatureSupport call: Feature, pData and DataSize
  *         as there, with the input members of *pData filled in. Result receives the HRESULT that a device made
  *         with info returns, and *pData its data. Features that read the state of a device
@@ -267,6 +270,25 @@
  *         check that a memory type backs heap tier 2. One answer can differ, on NVIDIA only: when vkCreateDevice
  *         fails with VK_ERROR_INITIALIZATION_FAILED, CreateDevice retries without the NVX extensions, which can
  *         change the descriptor-buffer decision; QueryAdapterCaps cannot know that vkCreateDevice would fail.
+ *   V12 Instance mode (1.2, r4-draft). CreateInfo.InstanceMode picks the VkInstance of a CreateDevice or a
+ *       QueryAdapterCaps.
+ *       - SHARED (0, also the mode when the field is not read): vkd3d-proton's rule. While any engine device
+ *         lives, CreateDevice and QueryAdapterCaps take the live devices' VkInstance and make no vkCreateInstance;
+ *         the engine then calls their GetInstanceProcAddr on a VkInstance that another call's entry point created.
+ *       - PRIVATE (1): CreateDevice creates a VkInstance of the device's own, destroyed with the device (V4);
+ *         QueryAdapterCaps creates one and destroys it before it returns. No other device or query gets it,
+ *         whatever their modes. The engine calls the GetInstanceProcAddr of such a device only inside its
+ *         CreateDevice (of a query, inside QueryAdapterCaps), on the calling thread, with NULL or that VkInstance,
+ *         and every Vulkan object of the device descends from it (GetVulkanHandles returns it). A shell whose
+ *         entry point binds per-device state to the VkInstance (hosted RADV binds its runtime identity there)
+ *         sets PRIVATE on every CreateDevice and QueryAdapterCaps, in either queue mode.
+ *       - Reading. InstanceMode needs a Size that covers it and AbiVersion 1.2; values other than SHARED and
+ *         PRIVATE are E_INVALIDARG. Below 1.2, PRIVATE is E_INVALIDARG, since the shell would not get what it
+ *         asked for, and other values are ignored (SHARED). PRIVATE refuses RenderDoc's singletons (V2).
+ *       - Threads. In both modes the engine creates and destroys VkInstances one at a time in the process
+ *         (vkd3d-proton's instance lock): two CreateDevice calls never run vkCreateInstance at once.
+ *       - Older engines. An r3 engine reads no InstanceMode and gives SHARED. The shell pins the engine build; it
+ *         can also check that two live PRIVATE devices return two VkInstances from GetVulkanHandles.
  */
 #ifndef BC250_VKD3D_ENGINE_H
 #define BC250_VKD3D_ENGINE_H
@@ -284,6 +306,9 @@ extern "C" {
 
 #define BC250_VKD3D_QUEUE_MODE_THREADED 0u         /* V3; also the mode when the 1.1 fields are absent */
 #define BC250_VKD3D_QUEUE_MODE_INLINE   1u         /* V7, 1.1 */
+
+#define BC250_VKD3D_INSTANCE_MODE_SHARED  0u       /* V12; also the mode when the 1.2 field is not read */
+#define BC250_VKD3D_INSTANCE_MODE_PRIVATE 1u       /* V12, 1.2 r4 */
 
 #define BC250_VKD3D_INLINE_WAIT_BUDGET_MS 10000u   /* V7: the longest CPU wait for the GPU in INLINE */
 #define BC250_VKD3D_INLINE_MIN_GRAPHICS_QUEUES 3u  /* V7: INLINE admission, usable graphics-family VkQueues */
@@ -313,6 +338,8 @@ typedef struct BC250_VKD3D_DEVICE_CREATE_INFO
      * values are ignored and the device is THREADED. */
     UINT32 QueueMode;                              /* BC250_VKD3D_QUEUE_MODE_*; other values: E_INVALIDARG */
     const BC250_VKD3D_SHELL_SERVICES *Services;    /* INLINE: required, BindQueue and UnbindQueue non-NULL */
+    /* 1.2 (r4): read only when Size covers it and AbiVersion is 1.2 or later, with the exception of V12. */
+    UINT32 InstanceMode;                           /* BC250_VKD3D_INSTANCE_MODE_*; other values: E_INVALIDARG */
 } BC250_VKD3D_DEVICE_CREATE_INFO;
 
 /* The frozen 1.0 (r1) layouts, for their sizes only. A 1.0 shell passes sizeof of the 1.0 structure, which
@@ -328,6 +355,20 @@ typedef struct BC250_VKD3D_DEVICE_CREATE_INFO_1_0
 } BC250_VKD3D_DEVICE_CREATE_INFO_1_0;
 
 #define BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_0 ((UINT32)sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0))
+
+/* The 1.1 layout, which r4 extends with InstanceMode; a shell built against r2 or r3 passes its sizeof. */
+typedef struct BC250_VKD3D_DEVICE_CREATE_INFO_1_1
+{
+    UINT32 Size;
+    UINT32 AbiVersion;
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+    LUID AdapterLuid;
+    UINT32 MinimumFeatureLevel;
+    UINT32 QueueMode;
+    const BC250_VKD3D_SHELL_SERVICES *Services;
+} BC250_VKD3D_DEVICE_CREATE_INFO_1_1;
+
+#define BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_1 ((UINT32)sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_1))
 
 /* The members of D3D12_COMMAND_QUEUE_DESC, which this header cannot include (see above). */
 typedef struct BC250_VKD3D_COMMAND_QUEUE_DESC
@@ -445,6 +486,14 @@ BC250_VKD3D_STATIC_ASSERT(create_info_1_0_prefix,
         && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0, MinimumFeatureLevel)
                 == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, MinimumFeatureLevel)
         && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, Services) >= sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0));
+BC250_VKD3D_STATIC_ASSERT(create_info_1_1_prefix,
+        offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_1, MinimumFeatureLevel)
+                == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, MinimumFeatureLevel)
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_1, QueueMode)
+                == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, QueueMode)
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO_1_1, Services)
+                == offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, Services)
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, InstanceMode) == sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_1));
 BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_0_prefix,
         offsetof(BC250_VKD3D_ENGINE_FUNCS_1_0, AbiVersion) == offsetof(BC250_VKD3D_ENGINE_FUNCS, AbiVersion)
         && offsetof(BC250_VKD3D_ENGINE_FUNCS_1_0, CreateDevice) == offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateDevice)
@@ -467,12 +516,14 @@ BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_2_order,
 BC250_VKD3D_STATIC_ASSERT(sizes_1_0_x64,
         sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0) == 32 && sizeof(BC250_VKD3D_ENGINE_FUNCS_1_0) == 16);
 BC250_VKD3D_STATIC_ASSERT(sizes_1_1_x64,
-        sizeof(BC250_VKD3D_DEVICE_CREATE_INFO) == 40 && sizeof(BC250_VKD3D_ENGINE_FUNCS_1_1) == 24
+        sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_1) == 40 && sizeof(BC250_VKD3D_ENGINE_FUNCS_1_1) == 24
         && sizeof(BC250_VKD3D_SHELL_SERVICES) == 32 && sizeof(BC250_VKD3D_COMMAND_QUEUE_DESC) == 20);
 BC250_VKD3D_STATIC_ASSERT(sizes_1_2_x64,
         sizeof(BC250_VKD3D_ENGINE_FUNCS) == 64 && sizeof(BC250_VKD3D_IMPORTED_MEMORY) == 32
         && offsetof(BC250_VKD3D_IMPORTED_MEMORY, Memory) == 8 && offsetof(BC250_VKD3D_IMPORTED_MEMORY, Flags) == 28
-        && sizeof(BC250_VKD3D_FEATURE_QUERY) == 24 && offsetof(BC250_VKD3D_FEATURE_QUERY, Result) == 16);
+        && sizeof(BC250_VKD3D_FEATURE_QUERY) == 24 && offsetof(BC250_VKD3D_FEATURE_QUERY, Result) == 16
+        && sizeof(BC250_VKD3D_DEVICE_CREATE_INFO) == 48
+        && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, InstanceMode) == 40);
 #endif
 
 /* The one export. E_NOINTERFACE when abiVersion names another major or a later minor than the engine's;
