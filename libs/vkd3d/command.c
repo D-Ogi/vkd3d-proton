@@ -26177,15 +26177,61 @@ static bool d3d12_command_queue_exec_submit_needs_fallback_queue(
     return false;
 }
 
+/* The EXECUTE step of the submission thread, shared with the inline queue mode. */
+static void d3d12_command_queue_process_execute(struct d3d12_command_queue *queue,
+        struct d3d12_command_queue_transition_pool *pool, struct d3d12_command_queue_submission_execute *execute)
+{
+    VkSemaphoreSubmitInfo transition_semaphore;
+    VkCommandBufferSubmitInfo transition_cmd;
+    VKD3D_UNUSED unsigned int i;
+
+    memset(&transition_cmd, 0, sizeof(transition_cmd));
+    transition_cmd.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+
+    memset(&transition_semaphore, 0, sizeof(transition_semaphore));
+    transition_semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    transition_semaphore.semaphore = pool->timeline;
+    transition_semaphore.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    if (d3d12_command_queue_exec_submit_needs_fallback_queue(queue, execute))
+        transition_cmd.deviceMask = VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE;
+
+    d3d12_command_queue_transition_pool_build(pool, queue->device,
+            execute->transitions,
+            execute->transition_count,
+            transition_cmd.deviceMask != VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_DEFAULT,
+            &transition_cmd.commandBuffer,
+            &transition_semaphore.value);
+
+    d3d12_command_queue_execute(queue, execute, &transition_cmd, &transition_semaphore);
+
+    /* command_queue_execute takes ownership of the
+     * outstanding_submission_counters and queue_timeline_indices allocations.
+     * The atomic counters are decremented when the submission is observed to be freed.
+     * On error, the counters are freed early, so there is no risk of leak. */
+    vkd3d_free(execute->cmd);
+    vkd3d_free(execute->cmd_cost);
+    vkd3d_free(execute->transitions);
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+    for (i = 0; i < execute->breadcrumb_indices_count; i++)
+    {
+        INFO("=== Executing command list %u (context %u) on VkQueue %p, queue family %u ===\n",
+                i, execute->breadcrumb_indices[i],
+                (void*)queue->vkd3d_queue->vk_queue, queue->vkd3d_queue->vk_family_index);
+        vkd3d_breadcrumb_tracer_dump_command_list(&queue->device->breadcrumb_tracer,
+                execute->breadcrumb_indices[i]);
+        INFO("============================\n");
+    }
+    vkd3d_free(execute->breadcrumb_indices);
+#endif
+}
+
 static void *d3d12_command_queue_submission_worker_main(void *userdata)
 {
     struct d3d12_command_queue_submission submission;
     struct d3d12_command_queue_transition_pool pool;
     struct vkd3d_queue_timeline_trace_cookie cookie;
     struct d3d12_command_queue *queue = userdata;
-    VkSemaphoreSubmitInfo transition_semaphore;
-    VkCommandBufferSubmitInfo transition_cmd;
-    VKD3D_UNUSED unsigned int i;
     HRESULT hr;
 
     VKD3D_REGION_DECL(queue_wait);
@@ -26250,46 +26296,7 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
         case VKD3D_SUBMISSION_EXECUTE:
             VKD3D_REGION_BEGIN(queue_execute);
             cookie = vkd3d_queue_timeline_trace_register_generic_region(&queue->device->queue_timeline_trace, "EXECUTE");
-
-            memset(&transition_cmd, 0, sizeof(transition_cmd));
-            transition_cmd.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-
-            memset(&transition_semaphore, 0, sizeof(transition_semaphore));
-            transition_semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-            transition_semaphore.semaphore = pool.timeline;
-            transition_semaphore.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-
-            if (d3d12_command_queue_exec_submit_needs_fallback_queue(queue, &submission.execute))
-                transition_cmd.deviceMask = VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE;
-
-            d3d12_command_queue_transition_pool_build(&pool, queue->device,
-                    submission.execute.transitions,
-                    submission.execute.transition_count,
-                    transition_cmd.deviceMask != VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_DEFAULT,
-                    &transition_cmd.commandBuffer,
-                    &transition_semaphore.value);
-
-            d3d12_command_queue_execute(queue, &submission.execute, &transition_cmd, &transition_semaphore);
-
-            /* command_queue_execute takes ownership of the
-             * outstanding_submission_counters and queue_timeline_indices allocations.
-             * The atomic counters are decremented when the submission is observed to be freed.
-             * On error, the counters are freed early, so there is no risk of leak. */
-            vkd3d_free(submission.execute.cmd);
-            vkd3d_free(submission.execute.cmd_cost);
-            vkd3d_free(submission.execute.transitions);
-#ifdef VKD3D_ENABLE_BREADCRUMBS
-            for (i = 0; i < submission.execute.breadcrumb_indices_count; i++)
-            {
-                INFO("=== Executing command list %u (context %u) on VkQueue %p, queue family %u ===\n",
-                        i, submission.execute.breadcrumb_indices[i],
-                        (void*)queue->vkd3d_queue->vk_queue, queue->vkd3d_queue->vk_family_index);
-                vkd3d_breadcrumb_tracer_dump_command_list(&queue->device->breadcrumb_tracer,
-                        submission.execute.breadcrumb_indices[i]);
-                INFO("============================\n");
-            }
-            vkd3d_free(submission.execute.breadcrumb_indices);
-#endif
+            d3d12_command_queue_process_execute(queue, &pool, &submission.execute);
             VKD3D_REGION_END(queue_execute);
             break;
 
