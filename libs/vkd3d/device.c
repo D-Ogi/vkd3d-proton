@@ -596,12 +596,28 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
 #undef VKD3D_DECL_CONFIG_PLAIN
 };
 
+/* Config defaults of the module that embeds libvkd3d, in VKD3D_CONFIG syntax, added to VKD3D_CONFIG before the
+ * environment is deduced. d3d12core.dll never sets them; bc250vkd3d.dll (libs/ddi) sets them once, before its
+ * first vkd3d_create_instance. Setting them after the flags were initialized changes nothing. */
+static char vkd3d_config_embedder_defaults[VKD3D_PATH_MAX];
+
+void vkd3d_config_set_embedder_defaults(const char *config)
+{
+    vkd3d_strlcpy(vkd3d_config_embedder_defaults, sizeof(vkd3d_config_embedder_defaults), config);
+}
+
 static void vkd3d_config_flags_init_once(void)
 {
     char config[VKD3D_PATH_MAX];
 
     vkd3d_get_env_var("VKD3D_CONFIG", config, sizeof(config));
     vkd3d_config_flags = vkd3d_parse_debug_options(config, vkd3d_config_options, ARRAY_SIZE(vkd3d_config_options));
+    if (*vkd3d_config_embedder_defaults)
+    {
+        vkd3d_config_flag_global_add(vkd3d_parse_debug_options(vkd3d_config_embedder_defaults,
+                vkd3d_config_options, ARRAY_SIZE(vkd3d_config_options)));
+        INFO("Embedder config defaults '%s'.\n", vkd3d_config_embedder_defaults);
+    }
 
     if (!VKD3D_CONFIG_FLAG_IS_SET(SKIP_APPLICATION_WORKAROUNDS))
         vkd3d_instance_apply_application_workarounds();
@@ -10820,7 +10836,8 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
         forced_singletons = vkd3d_get_env_var("ENABLE_VULKAN_RENDERDOC_CAPTURE", env, sizeof(env)) &&
                 strcmp(env, "1") == 0;
 
-        INFO("Forcing singleton device due to RenderDoc being enabled.\n");
+        if (forced_singletons)
+            INFO("Forcing singleton device due to RenderDoc being enabled.\n");
 
         if (forced_singletons &&
             (create_info->device_factory_flags &
