@@ -7,8 +7,21 @@
  *   - the export and its version rules (E_NOINTERFACE, E_INVALIDARG); 1.0- and 1.1-sized function tables, whose
  *     tails the engine must leave alone; GetFuncs(1.1) leaves the 1.2 entries NULL, GetFuncs(1.2) fills them, and
  *     the suites use that table;
- *   - CreateInfo checks that create nothing: sizes, queue modes, missing services; QueryAdapterCaps with no query
- *     array and MapHeap(NULL) fail with E_INVALIDARG.
+ *   - CreateInfo checks that create nothing: sizes, queue modes, missing services, InstanceMode 7 and PRIVATE
+ *     with AbiVersion 1.1 (V12, also through QueryAdapterCaps); QueryAdapterCaps with no query array and
+ *     MapHeap(NULL) fail with E_INVALIDARG.
+ * Both suites, after their own devices (V12), in their queue mode, through an emulation of the shell's entry point
+ * (one GetInstanceProcAddr for every device, a thread-local host selector, a dispatch per VkInstance's host):
+ *   - SHARED, the default: the first device creates a VkInstance (no device of the suite, refused ones included,
+ *     kept the shared one); two live devices, the first with an r3 shell's 1.1-sized CreateInfo, share it as
+ *     upstream, and the emulation sees the second call the first host's entry point;
+ *   - PRIVATE: two live devices created on two threads have VkInstances of their own, every entry point call of
+ *     each goes to its own host, and each completes a copy round trip; QueryAdapterCaps while both live answers
+ *     as the first device's CheckFeatureSupport (every byte) on a VkInstance of its own, destroyed before it
+ *     returns, without calling either device's host or Services; the final Releases destroy each VkInstance
+ *     through its own host;
+ *   - with ENABLE_VULKAN_RENDERDOC_CAPTURE=1, PRIVATE CreateDevice and QueryAdapterCaps fail with E_INVALIDARG and
+ *     leave no VkInstance; in INLINE, a PRIVATE CreateDevice that the admission refuses leaves none either.
  * Both suites, on their main device (1.2, V10, V11):
  *   - QueryAdapterCaps against ID3D12Device::CheckFeatureSupport of that device, made from the same CreateInfo:
  *     HRESULT and every byte for every feature QueryAdapterCaps answers (all DXGI formats for FORMAT_SUPPORT and
@@ -648,6 +661,239 @@ static void hold_destroy(void)
     hold.wait_idle(hold.device);
     hold.destroy(hold.device, hold.semaphore, NULL);
     hold.semaphore = VK_NULL_HANDLE;
+}
+
+/* The shell's entry point as the native D3D12 shell has it (V12): one static GetInstanceProcAddr for every engine
+ * device, and a thread-local selector naming the device ("host") whose engine call runs on the thread. Hosted RADV
+ * binds the selected host's runtime to a VkInstance when vkCreateInstance creates it, and the entry points it
+ * returns for that VkInstance are that host's dispatch. This emulation, in front of the driver's entry point,
+ * records which host created each VkInstance and hands each host its own wrappers of the instance-level functions
+ * that the engine resolves (vkEnumeratePhysicalDevices, vkCreateDevice, vkGetDeviceProcAddr, vkDestroyInstance).
+ * It counts the GetInstanceProcAddr calls on each host's VkInstances and the calls into each host's dispatch, and
+ * among them those made while another host was selected: they would run on another device's runtime. Hosts are
+ * 1 to 3; 0 is no host selected. */
+#define HOSTW_HOSTS 4u
+#define HOSTW_INSTANCES 16u
+
+static __declspec(thread) unsigned int tls_host;
+
+struct hostw_host
+{
+    volatile LONG instances;        /* VkInstances created while it was selected */
+    volatile LONG destroyed;        /* its VkInstances destroyed */
+    volatile LONG gipa_calls;       /* GetInstanceProcAddr calls on its VkInstances */
+    volatile LONG dispatch_calls;   /* calls into its dispatch */
+    volatile LONG device_creates;   /* vkCreateDevice calls into its dispatch */
+    volatile LONG foreign_gipa;     /* gipa_calls made while another host was selected */
+    volatile LONG foreign_dispatch; /* dispatch_calls made while another host was selected */
+    PFN_vkEnumeratePhysicalDevices enumerate_physical_devices;
+    PFN_vkCreateDevice create_device;
+    PFN_vkGetDeviceProcAddr get_device_proc_addr;
+    PFN_vkDestroyInstance destroy_instance;
+};
+
+static struct
+{
+    PFN_vkGetInstanceProcAddr next;
+    PFN_vkCreateInstance create_instance;
+    CRITICAL_SECTION lock;
+    struct
+    {
+        VkInstance instance;
+        unsigned int host;
+    } bound[HOSTW_INSTANCES];
+    unsigned int bound_count;
+    volatile LONG unselected;       /* entry point calls with no host selected */
+    volatile LONG unbound;          /* GetInstanceProcAddr calls on a VkInstance that no host created */
+    struct hostw_host host[HOSTW_HOSTS];
+} hostw;
+
+static unsigned int hostw_owner(VkInstance instance)
+{
+    unsigned int i, host = 0;
+
+    EnterCriticalSection(&hostw.lock);
+    for (i = 0; i < hostw.bound_count; ++i)
+    {
+        if (hostw.bound[i].instance == instance)
+            host = hostw.bound[i].host;
+    }
+    LeaveCriticalSection(&hostw.lock);
+    return host;
+}
+
+static void hostw_enter(unsigned int host)
+{
+    InterlockedIncrement(&hostw.host[host].dispatch_calls);
+    if (tls_host != host)
+        InterlockedIncrement(&hostw.host[host].foreign_dispatch);
+}
+
+static void hostw_unbind(VkInstance instance)
+{
+    unsigned int i;
+
+    EnterCriticalSection(&hostw.lock);
+    for (i = 0; i < hostw.bound_count; ++i)
+    {
+        if (hostw.bound[i].instance == instance)
+        {
+            InterlockedIncrement(&hostw.host[hostw.bound[i].host].destroyed);
+            hostw.bound[i] = hostw.bound[--hostw.bound_count];
+            break;
+        }
+    }
+    LeaveCriticalSection(&hostw.lock);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL hostw_CreateInstance(const VkInstanceCreateInfo *info,
+        const VkAllocationCallbacks *allocator, VkInstance *instance)
+{
+    unsigned int host = tls_host;
+    VkResult vr;
+
+    if (!host)
+        InterlockedIncrement(&hostw.unselected);
+    if ((vr = hostw.create_instance(info, allocator, instance)) != VK_SUCCESS)
+        return vr;
+    InterlockedIncrement(&hostw.host[host].instances);
+    EnterCriticalSection(&hostw.lock);
+    if (hostw.bound_count < HOSTW_INSTANCES)
+    {
+        hostw.bound[hostw.bound_count].instance = *instance;
+        hostw.bound[hostw.bound_count++].host = host;
+    }
+    LeaveCriticalSection(&hostw.lock);
+    return vr;
+}
+
+#define HOSTW_DISPATCH(n) \
+static VKAPI_ATTR VkResult VKAPI_CALL hostw_EnumeratePhysicalDevices##n(VkInstance instance, uint32_t *count, \
+        VkPhysicalDevice *devices) \
+{ \
+    hostw_enter(n); \
+    return hostw.host[n].enumerate_physical_devices(instance, count, devices); \
+} \
+static VKAPI_ATTR VkResult VKAPI_CALL hostw_CreateDevice##n(VkPhysicalDevice physical_device, \
+        const VkDeviceCreateInfo *info, const VkAllocationCallbacks *allocator, VkDevice *device) \
+{ \
+    hostw_enter(n); \
+    InterlockedIncrement(&hostw.host[n].device_creates); \
+    return hostw.host[n].create_device(physical_device, info, allocator, device); \
+} \
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hostw_GetDeviceProcAddr##n(VkDevice device, const char *name) \
+{ \
+    hostw_enter(n); \
+    return hostw.host[n].get_device_proc_addr(device, name); \
+} \
+static VKAPI_ATTR void VKAPI_CALL hostw_DestroyInstance##n(VkInstance instance, \
+        const VkAllocationCallbacks *allocator) \
+{ \
+    hostw_enter(n); \
+    hostw_unbind(instance); \
+    hostw.host[n].destroy_instance(instance, allocator); \
+}
+
+HOSTW_DISPATCH(1)
+HOSTW_DISPATCH(2)
+HOSTW_DISPATCH(3)
+
+static const struct
+{
+    PFN_vkEnumeratePhysicalDevices enumerate_physical_devices;
+    PFN_vkCreateDevice create_device;
+    PFN_vkGetDeviceProcAddr get_device_proc_addr;
+    PFN_vkDestroyInstance destroy_instance;
+}
+hostw_dispatch[HOSTW_HOSTS] =
+{
+    {NULL},
+    {hostw_EnumeratePhysicalDevices1, hostw_CreateDevice1, hostw_GetDeviceProcAddr1, hostw_DestroyInstance1},
+    {hostw_EnumeratePhysicalDevices2, hostw_CreateDevice2, hostw_GetDeviceProcAddr2, hostw_DestroyInstance2},
+    {hostw_EnumeratePhysicalDevices3, hostw_CreateDevice3, hostw_GetDeviceProcAddr3, hostw_DestroyInstance3},
+};
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hostw_GetInstanceProcAddr(VkInstance instance, const char *name)
+{
+    unsigned int host = tls_host, owner = 0;
+    struct hostw_host *h;
+    PFN_vkVoidFunction real;
+
+    if (!host)
+        InterlockedIncrement(&hostw.unselected);
+    if (instance)
+    {
+        if (!(owner = hostw_owner(instance)))
+        {
+            InterlockedIncrement(&hostw.unbound);
+        }
+        else
+        {
+            InterlockedIncrement(&hostw.host[owner].gipa_calls);
+            if (owner != host)
+                InterlockedIncrement(&hostw.host[owner].foreign_gipa);
+        }
+    }
+    if (!(real = hostw.next(instance, name)))
+        return NULL;
+    if (!instance)
+    {
+        if (strcmp(name, "vkCreateInstance"))
+            return real;
+        InterlockedExchangePointer((void **)&hostw.create_instance, (void *)real);
+        return (PFN_vkVoidFunction)hostw_CreateInstance;
+    }
+    if (!owner)
+        return real;
+
+    /* The owner's own dispatch: its wrappers, over the entry points of its VkInstance. */
+    h = &hostw.host[owner];
+    if (!strcmp(name, "vkEnumeratePhysicalDevices"))
+    {
+        InterlockedExchangePointer((void **)&h->enumerate_physical_devices, (void *)real);
+        return (PFN_vkVoidFunction)hostw_dispatch[owner].enumerate_physical_devices;
+    }
+    if (!strcmp(name, "vkCreateDevice"))
+    {
+        InterlockedExchangePointer((void **)&h->create_device, (void *)real);
+        return (PFN_vkVoidFunction)hostw_dispatch[owner].create_device;
+    }
+    if (!strcmp(name, "vkGetDeviceProcAddr"))
+    {
+        InterlockedExchangePointer((void **)&h->get_device_proc_addr, (void *)real);
+        return (PFN_vkVoidFunction)hostw_dispatch[owner].get_device_proc_addr;
+    }
+    if (!strcmp(name, "vkDestroyInstance"))
+    {
+        InterlockedExchangePointer((void **)&h->destroy_instance, (void *)real);
+        return (PFN_vkVoidFunction)hostw_dispatch[owner].destroy_instance;
+    }
+    return real;
+}
+
+/* Clears the counters; the bindings stay. */
+static void hostw_reset(void)
+{
+    unsigned int i;
+
+    hostw.unselected = hostw.unbound = 0;
+    for (i = 0; i < HOSTW_HOSTS; ++i)
+    {
+        hostw.host[i].instances = hostw.host[i].destroyed = hostw.host[i].gipa_calls = 0;
+        hostw.host[i].dispatch_calls = hostw.host[i].device_creates = 0;
+        hostw.host[i].foreign_gipa = hostw.host[i].foreign_dispatch = 0;
+    }
+}
+
+/* Calls on the wrong host, or with none selected, since the last reset. */
+static LONG hostw_foreign(void)
+{
+    LONG n = hostw.unselected + hostw.unbound;
+    unsigned int i;
+
+    for (i = 0; i < HOSTW_HOSTS; ++i)
+        n += hostw.host[i].foreign_gipa + hostw.host[i].foreign_dispatch;
+    return n;
 }
 
 static SIZE_T private_bytes(void)
@@ -1816,6 +2062,8 @@ static struct test_shell
     /* Concurrent creation: BindQueue waits (up to 2 s) until rendezvous callers are inside it; met counts the
      * calls that saw them all. */
     volatile LONG rendezvous, arrived, met;
+    /* The shells of the instance isolation test serve one host each (tls_host, V12); 0 checks nothing. */
+    unsigned int host, wrong_host;
 } shell;
 
 static HRESULT APIENTRY shell_bind_queue(void *context, void *cookie, VkQueue queue)
@@ -1839,6 +2087,8 @@ static HRESULT APIENTRY shell_bind_queue(void *context, void *cookie, VkQueue qu
     s->last_offered = queue;
     if (!tls_engine_caller)
         ++s->wrong_thread;
+    if (s->host && s->host != tls_host)
+        ++s->wrong_host;
     for (i = 0; i < s->bound_count; ++i)
     {
         if (s->bound[i].queue == queue || (cookie && s->bound[i].cookie == cookie))
@@ -1878,6 +2128,8 @@ static void APIENTRY shell_unbind_queue(void *context, void *cookie, VkQueue que
     EnterCriticalSection(&s->lock);
     if (!tls_engine_caller)
         ++s->wrong_thread;
+    if (s->host && s->host != tls_host)
+        ++s->wrong_host;
     for (i = 0; i < s->bound_count; ++i)
     {
         if (s->bound[i].cookie == cookie && s->bound[i].queue == queue)
@@ -2999,7 +3251,7 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
 
     /* INLINE is 1.1: asking for it with AbiVersion 1.0 fails and creates nothing. */
     info = *base;
-    info.Size = sizeof(info);
+    info.Size = BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_1;
     info.AbiVersion = ABI_1_0;
     info.QueueMode = BC250_VKD3D_QUEUE_MODE_INLINE;
     info.Services = NULL;
@@ -3036,6 +3288,299 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
 
     threaded_admission(funcs, base);
     return 0;
+}
+
+/* One engine device of the instance isolation test: its engine calls run with its host selected (tls_host), as the
+ * shell's do, and in INLINE it has Services of its own (host_shell[host]). */
+static struct test_shell host_shell[HOSTW_HOSTS];
+
+struct host_device
+{
+    const BC250_VKD3D_ENGINE_FUNCS *funcs;
+    BC250_VKD3D_DEVICE_CREATE_INFO info;
+    BC250_VKD3D_SHELL_SERVICES services;
+    unsigned int host;
+    ID3D12Device *device;
+    HRESULT hr;
+};
+
+static void host_device_init(struct host_device *d, const BC250_VKD3D_ENGINE_FUNCS *funcs,
+        const BC250_VKD3D_DEVICE_CREATE_INFO *base, BOOL inline_mode, unsigned int host, UINT32 instance_mode)
+{
+    memset(d, 0, sizeof(*d));
+    d->funcs = funcs;
+    d->host = host;
+    d->info = *base;
+    d->info.Size = sizeof(d->info);
+    d->info.AbiVersion = ABI_1_2;
+    d->info.GetInstanceProcAddr = hostw_GetInstanceProcAddr;
+    d->info.QueueMode = inline_mode ? BC250_VKD3D_QUEUE_MODE_INLINE : BC250_VKD3D_QUEUE_MODE_THREADED;
+    d->info.Services = NULL;
+    d->info.InstanceMode = instance_mode;
+    if (inline_mode)
+    {
+        d->services.Size = sizeof(d->services);
+        d->services.Shell = &host_shell[host];
+        d->services.BindQueue = shell_bind_queue;
+        d->services.UnbindQueue = shell_unbind_queue;
+        d->info.Services = &d->services;
+    }
+}
+
+static DWORD WINAPI host_device_create(void *arg)
+{
+    struct host_device *d = arg;
+
+    tls_engine_caller = TRUE;
+    tls_host = d->host;
+    if (FAILED(d->hr = d->funcs->CreateDevice(&d->info, &IID_ID3D12Device, (void **)&d->device)))
+        d->device = NULL;
+    tls_host = 0;
+    return 0;
+}
+
+static VkInstance host_device_instance(const struct host_device *d)
+{
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device;
+    VkDevice vk_device;
+    UINT32 family;
+
+    tls_host = d->host;
+    if (d->device && FAILED(d->funcs->GetVulkanHandles(d->device, &instance, &physical_device, &vk_device, &family)))
+        instance = VK_NULL_HANDLE;
+    tls_host = 0;
+    return instance;
+}
+
+/* A copy round trip on the device: on a DIRECT queue of the engine's own in THREADED, on a DIRECT queue from
+ * CreateCommandQueue in INLINE. */
+static void host_device_copy(struct host_device *d, BOOL inline_mode, const char *tag)
+{
+    ID3D12CommandQueue *queue = NULL;
+
+    tls_host = d->host;
+    if (!inline_mode)
+    {
+        copy_round_trip(d->device, NULL, D3D12_COMMAND_LIST_TYPE_DIRECT, WAIT_EVENT, tag);
+    }
+    else if (SUCCEEDED(create_inline_queue(d->funcs, d->device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            COOKIE(0x1000 + d->host), &queue)) && queue)
+    {
+        copy_round_trip(d->device, queue, D3D12_COMMAND_LIST_TYPE_DIRECT, WAIT_NULL_EVENT, tag);
+        checkf(ID3D12CommandQueue_Release(queue) == 0, "%sthe DIRECT queue's final Release returns 0", tag);
+    }
+    else
+    {
+        checkf(FALSE, "%sCreateCommandQueue(DIRECT)", tag);
+    }
+    tls_host = 0;
+}
+
+static ULONG host_device_release(struct host_device *d)
+{
+    ULONG refs = 0;
+
+    tls_host = d->host;
+    if (d->device)
+        refs = ID3D12Device_Release(d->device);
+    d->device = NULL;
+    tls_host = 0;
+    return refs;
+}
+
+/* V12 in the suite's queue mode, after the suite's own devices are gone. The entry point is the host emulation
+ * (hostw) over the test's driver.
+ *   SHARED, the default: device A with the 1.1-sized CreateInfo of an r3 shell (PRIVATE past its Size, not read)
+ *   and device B with InstanceMode SHARED share A's VkInstance, as in upstream vkd3d-proton. B's CreateDevice
+ *   then calls host 1's entry point with host 2 selected, which the emulation must see: its positive control.
+ *   PRIVATE: devices A and B, created on two threads with hosts 1 and 2 selected, have VkInstances of their own,
+ *   and every entry point call of each goes to its own host; each completes a copy round trip. While both live,
+ *   QueryAdapterCaps with host 3 selected answers as A's CheckFeatureSupport, HRESULT and every byte, on a new
+ *   VkInstance of host 3 that it destroys before it returns, without a VkDevice, a Services call or any call to
+ *   host 1 or 2. The final Releases destroy each VkInstance through its own host.
+ *   With ENABLE_VULKAN_RENDERDOC_CAPTURE=1, PRIVATE CreateDevice and QueryAdapterCaps fail with E_INVALIDARG and
+ *   leave no VkInstance (V2). In INLINE, a PRIVATE CreateDevice that the admission refuses destroys its VkInstance.
+ */
+static void instance_isolation(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3D_DEVICE_CREATE_INFO *base,
+        BOOL inline_mode)
+{
+    const char *mode = inline_mode ? "INLINE" : "THREADED";
+    LONG gipa1, dispatch1, gipa2, dispatch2;
+    struct host_device a, b, q;
+    HANDLE threads[2];
+    VkInstance ia, ib;
+    HRESULT hr, query_hr;
+    unsigned int i, services;
+    ULONG ra, rb;
+    char tag[64];
+    DWORD wait;
+
+    InitializeCriticalSection(&hostw.lock);
+    hostw.next = vkw.gipa;
+    for (i = 1; i < HOSTW_HOSTS; ++i)
+    {
+        memset(&host_shell[i], 0, sizeof(host_shell[i]));
+        InitializeCriticalSection(&host_shell[i].lock);
+        host_shell[i].host = i;
+    }
+    tls_engine_caller = TRUE;
+    printf("isolation: %s, hosts 1 to 3 over the test's entry point\n", mode);
+
+    /* SHARED. */
+    host_device_init(&a, funcs, base, inline_mode, 1, BC250_VKD3D_INSTANCE_MODE_PRIVATE);
+    a.info.Size = BC250_VKD3D_DEVICE_CREATE_INFO_SIZE_1_1;
+    host_device_init(&b, funcs, base, inline_mode, 2, BC250_VKD3D_INSTANCE_MODE_SHARED);
+    hostw_reset();
+    host_device_create(&a);
+    host_device_create(&b);
+    ia = host_device_instance(&a);
+    ib = host_device_instance(&b);
+    printf("isolation: SHARED: A hr %08lx VkInstance %p, B hr %08lx VkInstance %p; VkInstances created: host 1 %ld, "
+            "host 2 %ld; host 1 calls with host 2 selected: %ld GetInstanceProcAddr, %ld dispatch\n",
+            (unsigned long)a.hr, (void *)ia, (unsigned long)b.hr, (void *)ib, hostw.host[1].instances,
+            hostw.host[2].instances, hostw.host[1].foreign_gipa, hostw.host[1].foreign_dispatch);
+    checkf(a.device && hostw.host[1].instances == 1, "isolation %s SHARED: A creates a VkInstance, so none of the "
+            "suite's devices, refused ones included, keeps the shared one alive", mode);
+    checkf(a.device && b.device && ia && ia == ib && hostw.host[1].instances == 1 && !hostw.host[2].instances,
+            "isolation %s SHARED (A: 1.1-sized CreateInfo, PRIVATE past its Size; B: InstanceMode SHARED): B takes "
+            "A's VkInstance and creates none, as upstream vkd3d-proton", mode);
+    checkf(hostw_owner(ia) == 1 && hostw.host[1].foreign_gipa > 0 && hostw.host[1].foreign_dispatch > 0,
+            "isolation %s SHARED: the host emulation sees B's CreateDevice call host 1's entry point (its positive "
+            "control)", mode);
+    rb = host_device_release(&b);
+    ra = host_device_release(&a);
+    checkf(!ra && !rb && hostw.host[1].destroyed == 1 && !hostw.bound_count, "isolation %s SHARED: final Releases "
+            "return 0, and the last one destroys the VkInstance, once", mode);
+
+    /* PRIVATE, two devices created on two threads. */
+    host_device_init(&a, funcs, base, inline_mode, 1, BC250_VKD3D_INSTANCE_MODE_PRIVATE);
+    host_device_init(&b, funcs, base, inline_mode, 2, BC250_VKD3D_INSTANCE_MODE_PRIVATE);
+    for (i = 1; i < HOSTW_HOSTS; ++i)
+        host_shell[i].binds = host_shell[i].unbinds = host_shell[i].failed_binds = 0;
+    hostw_reset();
+    threads[0] = CreateThread(NULL, 0, host_device_create, &a, 0, NULL);
+    threads[1] = CreateThread(NULL, 0, host_device_create, &b, 0, NULL);
+    wait = threads[0] && threads[1] ? WaitForMultipleObjects(2, threads, TRUE, 60000) : WAIT_FAILED;
+    for (i = 0; i < 2; ++i)
+    {
+        if (threads[i])
+            CloseHandle(threads[i]);
+    }
+    if (wait != WAIT_OBJECT_0)
+    {
+        check(FALSE, "isolation: two CreateDevice threads end within 60 s");
+        printf("FAILED (%u)\n", failures);
+        ExitProcess(1);
+    }
+    ia = host_device_instance(&a);
+    ib = host_device_instance(&b);
+    printf("isolation: PRIVATE: A hr %08lx VkInstance %p of host %u, B hr %08lx VkInstance %p of host %u\n",
+            (unsigned long)a.hr, (void *)ia, hostw_owner(ia), (unsigned long)b.hr, (void *)ib, hostw_owner(ib));
+    checkf(a.device && b.device && ia && ib && ia != ib && hostw_owner(ia) == 1 && hostw_owner(ib) == 2
+            && hostw.host[1].instances == 1 && hostw.host[2].instances == 1, "isolation %s PRIVATE: A and B, created "
+            "on two threads with hosts 1 and 2 selected, have VkInstances of their own, each created by its host",
+            mode);
+    printf("isolation: PRIVATE: host 1 %ld GetInstanceProcAddr and %ld dispatch calls, host 2 %ld and %ld; %ld calls "
+            "on another host or none\n", hostw.host[1].gipa_calls, hostw.host[1].dispatch_calls,
+            hostw.host[2].gipa_calls, hostw.host[2].dispatch_calls, hostw_foreign());
+    checkf(!hostw_foreign() && hostw.host[1].gipa_calls && hostw.host[1].device_creates == 1
+            && hostw.host[2].gipa_calls && hostw.host[2].device_creates == 1, "isolation %s PRIVATE: every entry "
+            "point call of each device goes to its own host, with one vkCreateDevice each", mode);
+    if (inline_mode)
+        check(host_shell[1].binds == 1 && host_shell[2].binds == 1 && !host_shell[1].wrong_host
+                && !host_shell[2].wrong_host, "isolation INLINE PRIVATE: each device binds its internal queue "
+                "through its own Services, with its host selected");
+
+    if (a.device && b.device)
+    {
+        snprintf(tag, sizeof(tag), "isolation %s PRIVATE A: ", mode);
+        host_device_copy(&a, inline_mode, tag);
+        snprintf(tag, sizeof(tag), "isolation %s PRIVATE B: ", mode);
+        host_device_copy(&b, inline_mode, tag);
+        checkf(!hostw_foreign(), "isolation %s PRIVATE: the copies call no entry point of another host", mode);
+
+        /* QueryAdapterCaps while A and B live. */
+        host_device_init(&q, funcs, base, inline_mode, 3, BC250_VKD3D_INSTANCE_MODE_PRIVATE);
+        gipa1 = hostw.host[1].gipa_calls;
+        dispatch1 = hostw.host[1].dispatch_calls;
+        gipa2 = hostw.host[2].gipa_calls;
+        dispatch2 = hostw.host[2].dispatch_calls;
+        snprintf(tag, sizeof(tag), "isolation %s PRIVATE: ", mode);
+        tls_host = 3;
+        adapter_caps_equality(funcs, &q.info, a.device, tag);
+        tls_host = 0;
+        printf("isolation: QueryAdapterCaps: host 3 created %ld and destroyed %ld VkInstances, %ld vkCreateDevice\n",
+                hostw.host[3].instances, hostw.host[3].destroyed, hostw.host[3].device_creates);
+        checkf(hostw.host[3].instances == 1 && hostw.host[3].destroyed == 1 && !hostw.host[3].device_creates
+                && hostw.bound_count == 2, "isolation %s: QueryAdapterCaps (PRIVATE, host 3) while A and B live makes "
+                "a VkInstance of host 3 and destroys it before it returns, with no VkDevice", mode);
+        services = host_shell[3].binds + host_shell[3].unbinds + host_shell[3].failed_binds;
+        checkf(hostw.host[1].gipa_calls == gipa1 && hostw.host[1].dispatch_calls == dispatch1
+                && hostw.host[2].gipa_calls == gipa2 && hostw.host[2].dispatch_calls == dispatch2
+                && !hostw_foreign() && !services, "isolation %s: that QueryAdapterCaps calls neither host 1 nor host 2 "
+                "and no Services", mode);
+    }
+    rb = host_device_release(&b);
+    ra = host_device_release(&a);
+    checkf(!ra && !rb && hostw.host[1].destroyed == 1 && hostw.host[2].destroyed == 1 && !hostw.bound_count
+            && !hostw_foreign(), "isolation %s PRIVATE: final Releases return 0 and destroy each device's VkInstance "
+            "through its own host", mode);
+    if (inline_mode)
+    {
+        for (i = 1, services = 0; i < HOSTW_HOSTS; ++i)
+            services += host_shell[i].binds != host_shell[i].unbinds || host_shell[i].bound_count
+                    || host_shell[i].wrong_thread || host_shell[i].wrong_host || host_shell[i].double_binds
+                    || host_shell[i].unknown_unbinds;
+        check(!services, "isolation INLINE: every BindQueue of each host's Services has its UnbindQueue, with that "
+                "host selected, on the thread of the engine call");
+    }
+
+    /* RenderDoc's singleton devices (V2). */
+    host_device_init(&a, funcs, base, inline_mode, 1, BC250_VKD3D_INSTANCE_MODE_PRIVATE);
+    host_shell[1].binds = 0;
+    hostw_reset();
+    SetEnvironmentVariableA("ENABLE_VULKAN_RENDERDOC_CAPTURE", "1");
+    tls_host = 1;
+    a.device = (ID3D12Device *)(void *)1;
+    hr = funcs->CreateDevice(&a.info, &IID_ID3D12Device, (void **)&a.device);
+    query_hr = funcs->QueryAdapterCaps(&a.info, 0, NULL);
+    tls_host = 0;
+    SetEnvironmentVariableA("ENABLE_VULKAN_RENDERDOC_CAPTURE", NULL);
+    checkf(hr == E_INVALIDARG && !a.device && query_hr == E_INVALIDARG
+            && hostw.host[1].instances == hostw.host[1].destroyed && !hostw.bound_count
+            && !host_shell[1].binds, "isolation %s: with ENABLE_VULKAN_RENDERDOC_CAPTURE=1 "
+            "PRIVATE CreateDevice and QueryAdapterCaps -> E_INVALIDARG (%08lx, %08lx), no device, no VkInstance left",
+            mode, (unsigned long)hr, (unsigned long)query_hr);
+    if (hr == S_OK && a.device && a.device != (void *)1)
+        host_device_release(&a);
+
+    /* The admission (V7) refuses an INLINE device after its VkInstance exists; the refusal must not keep it. The
+     * inline suite's Vulkan wrapper, put behind the host emulation, caps the graphics family at one VkQueue. */
+    if (inline_mode)
+    {
+        host_device_init(&a, funcs, base, TRUE, 1, BC250_VKD3D_INSTANCE_MODE_PRIVATE);
+        host_shell[1].binds = 0;
+        hostw_reset();
+        hostw.next = vkw_GetInstanceProcAddr;
+        vkw.graphics_queue_cap = 1;
+        tls_host = 1;
+        a.device = (ID3D12Device *)(void *)1;
+        hr = funcs->CreateDevice(&a.info, &IID_ID3D12Device, (void **)&a.device);
+        tls_host = 0;
+        vkw.graphics_queue_cap = 0;
+        hostw.next = vkw.gipa;
+        checkf(hr == DXGI_ERROR_UNSUPPORTED && !a.device && hostw.host[1].instances == 1
+                && hostw.host[1].destroyed == 1 && !hostw.bound_count && !host_shell[1].binds, "isolation INLINE "
+                "PRIVATE: CreateDevice that the admission refuses (graphics family capped at 1 VkQueue) -> "
+                "DXGI_ERROR_UNSUPPORTED (%08lx), and its VkInstance is destroyed", (unsigned long)hr);
+        if (hr == S_OK && a.device && a.device != (void *)1)
+            host_device_release(&a);
+    }
+
+    for (i = 1; i < HOSTW_HOSTS; ++i)
+        DeleteCriticalSection(&host_shell[i].lock);
+    DeleteCriticalSection(&hostw.lock);
 }
 
 int main(int argc, char **argv)
@@ -3204,6 +3749,18 @@ int main(int argc, char **argv)
                 "INLINE without UnbindQueue -> E_INVALIDARG");
         check(funcs.QueryAdapterCaps(&info, 1, NULL) == E_INVALIDARG,
                 "QueryAdapterCaps(1 query, NULL) -> E_INVALIDARG");
+        /* V12: InstanceMode counts from AbiVersion 1.2; PRIVATE below it fails. */
+        bad = info;
+        bad.AbiVersion = ABI_1_2;
+        bad.InstanceMode = 7;
+        check(funcs.CreateDevice(&bad, &IID_ID3D12Device, (void **)&device) == E_INVALIDARG && !device
+                && funcs.QueryAdapterCaps(&bad, 0, NULL) == E_INVALIDARG,
+                "InstanceMode 7 -> E_INVALIDARG from CreateDevice and QueryAdapterCaps");
+        bad.AbiVersion = ABI_1_1;
+        bad.InstanceMode = BC250_VKD3D_INSTANCE_MODE_PRIVATE;
+        check(funcs.CreateDevice(&bad, &IID_ID3D12Device, (void **)&device) == E_INVALIDARG && !device
+                && funcs.QueryAdapterCaps(&bad, 0, NULL) == E_INVALIDARG,
+                "AbiVersion 1.1 asking for PRIVATE -> E_INVALIDARG from CreateDevice and QueryAdapterCaps");
         check(funcs.MapHeap(NULL, (void **)&device) == E_INVALIDARG && !device, "MapHeap(NULL) -> E_INVALIDARG");
     }
 
@@ -3216,13 +3773,22 @@ int main(int argc, char **argv)
         printf("mode: %u-byte CreateInfo, AbiVersion 1.1, INLINE%s\n", (unsigned int)sizeof(info),
                 hang_mode ? ", GPU hang" : "");
         if (hang_mode)
+        {
             hang_suite(&funcs, &info);
+        }
         else
+        {
             inline_suite(&funcs, &info);
+            instance_isolation(&funcs, &info, TRUE);
+        }
     }
     else if (threaded_suite(&funcs, &info, luid))
     {
         return 1;
+    }
+    else
+    {
+        instance_isolation(&funcs, &info, FALSE);
     }
 
     printf(failures ? "FAILED (%u)\n" : "PASSED\n", failures);
