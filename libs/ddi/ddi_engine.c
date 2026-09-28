@@ -144,10 +144,13 @@ BC250_VKD3D_STATIC_ASSERT(inline_min_graphics_queues,
 #define BC250_COMMAND_QUEUE_DESC_SIZE_1_1 \
         ((UINT32)(FIELD_OFFSET(BC250_VKD3D_COMMAND_QUEUE_DESC, NodeMask) + sizeof(UINT32)))
 
-/* What CreateDevice makes of a CreateInfo: libvkd3d's create info on the adapter, with the instance it was found
- * on. bc250_prepare_device() does every check of the CreateInfo, so that another entry point can refuse the same
- * CreateInfo with the same HRESULT. create_info points into the structure itself, which is therefore never
- * copied. */
+/* Sizes, fields included, up to which a 1.2 structure is read (V10). */
+#define BC250_IMPORTED_MEMORY_SIZE_1_2 \
+        ((UINT32)(FIELD_OFFSET(BC250_VKD3D_IMPORTED_MEMORY, Flags) + sizeof(UINT32)))
+
+/* What CreateDevice and QueryAdapterCaps (V11) make of a CreateInfo: libvkd3d's create info on the adapter, with
+ * the instance it was found on. Both go through bc250_prepare_device(), so they refuse the same CreateInfo with the
+ * same HRESULT. create_info points into the structure itself, which is therefore never copied. */
 struct bc250_device_request
 {
     struct vkd3d_device_create_info create_info;
@@ -293,10 +296,95 @@ static HRESULT APIENTRY bc250_create_command_queue(void *device, const BC250_VKD
     return vkd3d_create_inline_command_queue((ID3D12Device *)device, &d3d12_desc, queueCookie, riid, queue);
 }
 
+static HRESULT APIENTRY bc250_get_vulkan_handles(void *device, VkInstance *instance,
+        VkPhysicalDevice *physical_device, VkDevice *vk_device, UINT32 *queue_family_index)
+{
+    ID3D12Device *d3d12_device = device;
+
+    if (!device || !instance || !physical_device || !vk_device || !queue_family_index)
+        return E_INVALIDARG;
+
+    *instance = vkd3d_instance_get_vk_instance(vkd3d_instance_from_device(d3d12_device));
+    *physical_device = vkd3d_get_vk_physical_device(d3d12_device);
+    *vk_device = vkd3d_get_vk_device(d3d12_device);
+    *queue_family_index = vkd3d_get_vk_direct_queue_family_index(d3d12_device);
+    return S_OK;
+}
+
+static HRESULT APIENTRY bc250_create_heap_from_memory(void *device, const BC250_VKD3D_IMPORTED_MEMORY *memory,
+        const struct D3D12_HEAP_DESC *heap_desc, REFIID riid, void **heap)
+{
+    struct vkd3d_borrowed_memory_info borrowed;
+
+    if (heap)
+        *heap = NULL;
+    if (!device || !memory || !heap_desc || !riid || !heap || memory->Size < BC250_IMPORTED_MEMORY_SIZE_1_2)
+        return E_INVALIDARG;
+    if (memory->Flags & ~BC250_VKD3D_IMPORTED_MEMORY_FLAG_DEVICE_ADDRESS)
+    {
+        WARN("Unknown imported memory flags %#x.\n", memory->Flags);
+        return E_INVALIDARG;
+    }
+
+    /* V10: libvkd3d checks the memory against the heap description and never frees it. */
+    memset(&borrowed, 0, sizeof(borrowed));
+    borrowed.vk_memory = memory->Memory;
+    borrowed.size = memory->AllocationSize;
+    borrowed.vk_memory_type_index = memory->MemoryTypeIndex;
+    borrowed.device_address = !!(memory->Flags & BC250_VKD3D_IMPORTED_MEMORY_FLAG_DEVICE_ADDRESS);
+    return vkd3d_create_heap_from_memory((ID3D12Device *)device, &borrowed, (const D3D12_HEAP_DESC *)heap_desc,
+            riid, heap);
+}
+
+static HRESULT APIENTRY bc250_map_heap(void *heap, void **cpu_address)
+{
+    return vkd3d_heap_map((ID3D12Heap *)heap, cpu_address);
+}
+
+static HRESULT APIENTRY bc250_unmap_heap(void *heap)
+{
+    return vkd3d_heap_unmap((ID3D12Heap *)heap);
+}
+
+static HRESULT APIENTRY bc250_query_adapter_caps(const BC250_VKD3D_DEVICE_CREATE_INFO *info, UINT32 count,
+        BC250_VKD3D_FEATURE_QUERY *queries)
+{
+    struct bc250_device_request request;
+    struct vkd3d_adapter_caps *caps;
+    HRESULT hr;
+    UINT32 i;
+
+    if (count && !queries)
+        return E_INVALIDARG;
+
+    /* V11: CreateDevice's checks and admission, then its capability decisions without a VkDevice. */
+    if (SUCCEEDED(hr = bc250_prepare_device(info, &request)))
+    {
+        hr = vkd3d_create_adapter_caps(&request.create_info, &caps);
+        /* The adapter caps object holds its own reference to the instance until it is destroyed. */
+        bc250_release_request(&request);
+    }
+    if (FAILED(hr))
+    {
+        WARN("Failed to examine the adapter, hr %#x.\n", (unsigned int)hr);
+        for (i = 0; i < count; ++i)
+            queries[i].Result = hr;
+        return hr;
+    }
+
+    for (i = 0; i < count; ++i)
+    {
+        queries[i].Result = queries[i].Reserved ? E_INVALIDARG : vkd3d_adapter_caps_check_feature_support(caps,
+                (D3D12_FEATURE)queries[i].Feature, queries[i].pData, queries[i].DataSize);
+    }
+    vkd3d_destroy_adapter_caps(caps);
+    return S_OK;
+}
+
 HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_FUNCS *funcs)
 {
     BC250_VKD3D_ENGINE_FUNCS out;
-    UINT32 size;
+    UINT32 size, minor;
 
     /* A 1.0 shell passes the 1.0 structure: compare with its size, not with this header's. */
     if (!funcs || funcs->Size < BC250_VKD3D_ENGINE_FUNCS_SIZE_1_0)
@@ -305,13 +393,24 @@ HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_
         return E_NOINTERFACE;
 
     size = funcs->Size;
+    minor = abiVersion & 0xffffu;
     memset(&out, 0, sizeof(out));
     out.Size = size;
     out.AbiVersion = BC250_VKD3D_ENGINE_ABI_VERSION;
     out.CreateDevice = bc250_create_device;
-    out.CreateCommandQueue = bc250_create_command_queue;
-    /* Fill at most Size bytes: a 1.0 structure ends before CreateCommandQueue, a larger one keeps its
-     * zeroed tail. */
+    /* Only the entries of the minors the shell requires (Sizes): the others stay NULL. */
+    if (minor >= 1)
+        out.CreateCommandQueue = bc250_create_command_queue;
+    if (minor >= 2)
+    {
+        out.GetVulkanHandles = bc250_get_vulkan_handles;
+        out.CreateHeapFromMemory = bc250_create_heap_from_memory;
+        out.MapHeap = bc250_map_heap;
+        out.UnmapHeap = bc250_unmap_heap;
+        out.QueryAdapterCaps = bc250_query_adapter_caps;
+    }
+    /* Fill at most Size bytes: a 1.0 structure ends before CreateCommandQueue, a 1.1 structure before
+     * GetVulkanHandles, and a larger one keeps its zeroed tail. */
     memset(funcs, 0, size);
     memcpy(funcs, &out, size < sizeof(out) ? size : sizeof(out));
     return S_OK;

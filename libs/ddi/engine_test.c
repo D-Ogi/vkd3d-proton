@@ -2441,7 +2441,8 @@ int main(int argc, char **argv)
     memset(&funcs, 0, sizeof(funcs));
     funcs.Size = sizeof(funcs);
     check(get_funcs(ABI_1_1, &funcs) == S_OK && funcs.CreateDevice && funcs.CreateCommandQueue
-            && funcs.AbiVersion == ABI_1_1, "GetFuncs(1.1) fills CreateDevice and CreateCommandQueue");
+            && funcs.AbiVersion == BC250_VKD3D_ENGINE_ABI_VERSION,
+            "GetFuncs(1.1) fills CreateDevice and CreateCommandQueue");
     if (!funcs.CreateDevice || !funcs.CreateCommandQueue)
         return 1;
 
