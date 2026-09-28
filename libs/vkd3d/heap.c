@@ -565,3 +565,98 @@ HRESULT vkd3d_create_heap_from_memory(ID3D12Device *device_iface, const struct v
 
     return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap, iid, heap);
 }
+
+/* amdgpu-wddm fork: engine ABI 1.2 MapHeap and UnmapHeap. */
+static struct d3d12_heap *d3d12_heap_from_foreign_iface(ID3D12Heap *iface)
+{
+    /* Every COM object starts with its vtable, so a pointer to another kind of object is told apart
+     * here instead of tripping the assertion in impl_from_ID3D12Heap1(). */
+    if (!iface || ((ID3D12Heap1 *)iface)->lpVtbl != &d3d12_heap_vtbl)
+        return NULL;
+    return impl_from_ID3D12Heap1((ID3D12Heap1 *)iface);
+}
+
+static void d3d12_heap_sync_mapping(struct d3d12_heap *heap, bool flush)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &heap->device->vk_procs;
+    struct d3d12_device *device = heap->device;
+    VkMappedMemoryRange range;
+
+    if (device->memory_properties.memoryTypes[heap->allocation.device_allocation.vk_memory_type].propertyFlags &
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        return;
+
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.pNext = NULL;
+    range.memory = heap->allocation.device_allocation.vk_memory;
+    range.offset = heap->allocation.offset + heap->allocation.realignment_offset;
+    range.size = heap->desc.SizeInBytes;
+    vkd3d_mapped_memory_range_align(device, &range, heap->allocation.device_allocation.size);
+
+    if (flush)
+        VK_CALL(vkFlushMappedMemoryRanges(device->vk_device, 1, &range));
+    else
+        VK_CALL(vkInvalidateMappedMemoryRanges(device->vk_device, 1, &range));
+}
+
+HRESULT vkd3d_heap_map(ID3D12Heap *iface, void **cpu_address)
+{
+    struct d3d12_heap *heap = d3d12_heap_from_foreign_iface(iface);
+
+    TRACE("heap %p, cpu_address %p.\n", iface, cpu_address);
+
+    if (!cpu_address)
+        return E_INVALIDARG;
+    *cpu_address = NULL;
+
+    if (!heap)
+    {
+        WARN("Not a heap of this library.\n");
+        return E_INVALIDARG;
+    }
+
+    /* Only heaps whose memory this library keeps mapped have an address: CPU-visible heaps other than
+     * the CPU-visible texture-only ones, which have no memory of their own. */
+    if (!heap->allocation.cpu_address)
+    {
+        WARN("Heap %p is not CPU visible.\n", heap);
+        return E_INVALIDARG;
+    }
+
+    vkd3d_atomic_uint32_increment(&heap->map_count, vkd3d_memory_order_relaxed);
+    d3d12_heap_sync_mapping(heap, false);
+
+    /* Heap offset 0 is where vkd3d_memory_allocation_slice() places resources at offset 0. */
+    *cpu_address = void_ptr_offset(heap->allocation.cpu_address, heap->allocation.realignment_offset);
+    return S_OK;
+}
+
+HRESULT vkd3d_heap_unmap(ID3D12Heap *iface)
+{
+    struct d3d12_heap *heap = d3d12_heap_from_foreign_iface(iface);
+    uint32_t count, old;
+
+    TRACE("heap %p.\n", iface);
+
+    if (!heap)
+    {
+        WARN("Not a heap of this library.\n");
+        return E_INVALIDARG;
+    }
+
+    count = vkd3d_atomic_uint32_load_explicit(&heap->map_count, vkd3d_memory_order_relaxed);
+    do
+    {
+        if (!count)
+        {
+            WARN("Heap %p is not mapped.\n", heap);
+            return E_INVALIDARG;
+        }
+        old = count;
+        count = vkd3d_atomic_uint32_compare_exchange(&heap->map_count, old, old - 1,
+                vkd3d_memory_order_relaxed, vkd3d_memory_order_relaxed);
+    } while (count != old);
+
+    d3d12_heap_sync_mapping(heap, true);
+    return S_OK;
+}

@@ -165,6 +165,14 @@ struct vkd3d_borrowed_memory_info
 
 HRESULT vkd3d_create_heap_from_memory(ID3D12Device *device, const struct vkd3d_borrowed_memory_info *memory,
         const D3D12_HEAP_DESC *desc, REFIID iid, void **heap);
+/* amdgpu-wddm fork (engine ABI 1.2 MapHeap and UnmapHeap): the CPU address of heap offset 0, which a
+ * placed buffer at offset X maps at plus X. Only heaps whose memory the library keeps mapped have one;
+ * anything else, including an object that is not a heap of this library, gives E_INVALIDARG. Map and
+ * unmap are counted; an unmap without a map gives E_INVALIDARG. For memory that is not host-coherent,
+ * map invalidates and unmap flushes the heap's range. The address stays valid until the heap is
+ * destroyed, whatever the count. */
+HRESULT vkd3d_heap_map(ID3D12Heap *heap, void **cpu_address);
+HRESULT vkd3d_heap_unmap(ID3D12Heap *heap);
 
 ULONG vkd3d_resource_decref(ID3D12Resource *resource);
 ULONG vkd3d_resource_incref(ID3D12Resource *resource);

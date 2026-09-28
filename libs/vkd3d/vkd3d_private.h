@@ -1059,6 +1059,8 @@ struct d3d12_heap
 
     D3D12_HEAP_DESC desc;
     struct vkd3d_memory_allocation allocation;
+    /* amdgpu-wddm fork: vkd3d_heap_map() calls not yet balanced by vkd3d_heap_unmap(). */
+    uint32_t map_count;
 
     priority_info priority;
 
