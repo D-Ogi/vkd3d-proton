@@ -9228,31 +9228,48 @@ static D3D12_RAYTRACING_TIER d3d12_device_determine_ray_tracing_tier(struct d3d1
     return tier;
 }
 
+/* amdgpu-wddm fork: the resource heap tier comes from the physical device alone, so that an adapter query with
+ * no VkDevice (vkd3d_create_adapter_caps) gives the same answer. Upstream also required the memory types of
+ * buffers, textures and render targets to intersect, which only vkGetDevice*MemoryRequirements on a VkDevice can
+ * tell; d3d12_device_init() checks that with d3d12_device_memory_backs_heap_tier() and fails the device when the
+ * tier decided here is not backed, instead of reporting a lower tier than the adapter query did. */
 static D3D12_RESOURCE_HEAP_TIER d3d12_device_determine_heap_tier(struct d3d12_device *device)
 {
     const VkPhysicalDeviceLimits *limits = &device->device_info.properties2.properties.limits;
-    const struct vkd3d_memory_info *mem_info = &device->memory_info;
-    const struct vkd3d_memory_info_domain *fallback_domain;
-    const struct vkd3d_memory_info_domain *non_cpu_domain;
-
-    non_cpu_domain = &mem_info->non_cpu_accessible_domain;
-    fallback_domain = &mem_info->fallback_domain;
 
     /* Heap Tier 2 requires us to be able to create a heap that supports all resource
      * categories at the same time, except RT/DS textures on UPLOAD/READBACK heaps.
      * Ignore CPU visible heaps since we only place buffers there. Textures are promoted to committed always. */
-    if ((limits->bufferImageGranularity > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) ||
-            !(non_cpu_domain->buffer_type_mask & non_cpu_domain->sampled_type_mask & non_cpu_domain->rt_ds_type_mask))
+    if (limits->bufferImageGranularity > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
         return D3D12_RESOURCE_HEAP_TIER_1;
+
+    return D3D12_RESOURCE_HEAP_TIER_2;
+}
+
+/* The memory-type half of upstream's heap tier decision, for a device whose memory_info masks exist. */
+static bool d3d12_device_memory_backs_heap_tier(struct d3d12_device *device, D3D12_RESOURCE_HEAP_TIER tier)
+{
+    const struct vkd3d_memory_info *mem_info = &device->memory_info;
+    const struct vkd3d_memory_info_domain *fallback_domain;
+    const struct vkd3d_memory_info_domain *non_cpu_domain;
+
+    if (tier < D3D12_RESOURCE_HEAP_TIER_2)
+        return true;
+
+    non_cpu_domain = &mem_info->non_cpu_accessible_domain;
+    fallback_domain = &mem_info->fallback_domain;
+
+    if (!(non_cpu_domain->buffer_type_mask & non_cpu_domain->sampled_type_mask & non_cpu_domain->rt_ds_type_mask))
+        return false;
 
     /* If we don't have VK_EXT_pageable_device_memory, we're at the risk of needing to fallback allocate
      * memory from sysmem when we run out.
      * For HEAP_TIER_2 to work, we need to ensure there is a heap index which can support this use case as well. */
     if (!device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
             !(fallback_domain->buffer_type_mask & fallback_domain->sampled_type_mask & fallback_domain->rt_ds_type_mask))
-        return D3D12_RESOURCE_HEAP_TIER_1;
+        return false;
 
-    return D3D12_RESOURCE_HEAP_TIER_2;
+    return true;
 }
 
 static bool d3d12_device_determine_additional_typed_uav_support(struct d3d12_device *device)
@@ -10752,6 +10769,15 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     if (FAILED(hr = vkd3d_memory_info_init(&device->memory_info, device)))
         goto out_cleanup_format_info;
+
+    /* amdgpu-wddm fork: the tier the capability policy reports must be backed (d3d12_device_determine_heap_tier). */
+    if (!d3d12_device_memory_backs_heap_tier(device, d3d12_device_determine_heap_tier(device)))
+    {
+        ERR("Resource heap tier %u needs a memory type for buffers, textures and render targets at once, "
+                "which this device lacks.\n", d3d12_device_determine_heap_tier(device));
+        hr = DXGI_ERROR_UNSUPPORTED;
+        goto out_cleanup_memory_info;
+    }
 
     if (FAILED(hr = vkd3d_global_descriptor_buffer_init(&device->global_descriptor_buffer, device)))
         goto out_cleanup_memory_info;
