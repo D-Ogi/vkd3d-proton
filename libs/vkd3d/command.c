@@ -1486,6 +1486,7 @@ HRESULT d3d12_device_inline_wait_semaphores(struct d3d12_device *device, uint32_
  * With no pending signal, only another thread (CPU Signal or queue Signal) can reach the value. */
 static HRESULT d3d12_fence_inline_wait_for_event(struct d3d12_fence *fence, const struct vkd3d_waiting_event *event)
 {
+    uint64_t waited_update_count = 0;
     VkSemaphore vk_semaphore;
     uint64_t update_count;
     uint64_t vk_value = 0;
@@ -1528,9 +1529,22 @@ static HRESULT d3d12_fence_inline_wait_for_event(struct d3d12_fence *fence, cons
 
         pthread_mutex_unlock(&fence->mutex);
 
+        /* The last pass saw this update's timeline reach its value, and the retirement since then left
+         * it pending. Nothing will complete it; waiting again would return at once, forever. */
+        if (update_count == waited_update_count)
+        {
+            ERR("Fence %p update %"PRIu64" reached its timeline but did not retire.\n", fence, update_count);
+            if (d3d12_device_removed_reason(fence->device) == S_OK)
+                d3d12_device_mark_as_removed(fence->device, DXGI_ERROR_DEVICE_REMOVED,
+                        "Inline fence signal did not retire");
+            return DXGI_ERROR_DEVICE_REMOVED;
+        }
+
         if (FAILED(hr = d3d12_device_inline_wait_semaphores(fence->device, 1, &vk_semaphore, &vk_value,
                 "a fence signal")))
             return hr;
+
+        waited_update_count = update_count;
     }
 }
 
@@ -25884,12 +25898,16 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
      * - Decrementing counters for submissions. This allows us to track when it's safe to reset a command pool.
      *   If there are pending submissions waiting, we are expected to ignore the reset.
      *   We will report a failure in this case. Some games run into this.
+     * Inline queue mode: also after a failed submission, or the allocators would count as in flight
+     * forever and every later Reset would be ignored. They are released once the queue's last
+     * successful submission, which may include part of this call, has completed.
      */
-    if (vr == VK_SUCCESS && exec->num_command_allocators)
+    if ((vr == VK_SUCCESS || command_queue->device->inline_queues) && exec->num_command_allocators)
     {
         memset(&fence_info, 0, sizeof(fence_info));
         fence_info.vk_semaphore = vkd3d_queue->submission_timeline;
-        fence_info.vk_semaphore_value = signal_semaphore_infos[0].value;
+        fence_info.vk_semaphore_value = vr == VK_SUCCESS ? signal_semaphore_infos[0].value
+                : command_queue->last_submission_timeline_value;
 
         submission_info = vkd3d_waiting_fence_set_callback(&fence_info,
                 &vkd3d_waiting_fence_release_submission, sizeof(*submission_info));
@@ -26646,8 +26664,13 @@ static bool d3d12_command_queue_inline_retire(struct d3d12_command_queue *queue,
                 worker->enqueued_fence_count * sizeof(*worker->enqueued_fences));
         pthread_mutex_unlock(&worker->mutex);
 
+        /* A forced fence signal still completes: dropped, it would leave its update pending on the
+         * fence forever, for waits that the next queue on this VkQueue resolves by submission order
+         * and for SetEventOnCompletion. Other forced entries only release their references; a
+         * signal-order entry would block. */
         for (i = 0; i < ready; i++)
-            vkd3d_waiting_fence_complete_submissions(queue->device, worker, &entries[i], !force);
+            vkd3d_waiting_fence_complete_submissions(queue->device, worker, &entries[i],
+                    !force || entries[i].fence_info.release_callback == vkd3d_waiting_fence_signal_fence);
 
         progress = true;
     }
