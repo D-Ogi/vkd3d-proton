@@ -93,6 +93,12 @@ struct vkd3d_instance_create_info
 
     const char * const *optional_instance_extensions;
     uint32_t optional_instance_extension_count;
+
+    /* amdgpu-wddm fork: a new instance of the caller's own. vkd3d_create_instance() then neither returns the
+     * instance that live devices share nor makes the new one that shared instance; it is destroyed with its last
+     * reference. For an embedder whose vkGetInstanceProcAddr binds per-caller state to each VkInstance
+     * (libs/ddi). */
+    bool private_instance;
 };
 
 struct vkd3d_device_create_info

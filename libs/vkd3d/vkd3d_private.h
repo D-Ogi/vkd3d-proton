@@ -263,6 +263,8 @@ struct vkd3d_instance
     VkDebugUtilsMessengerEXT vk_debug_callback;
 
     LONG refcount;
+    /* amdgpu-wddm fork: never the instance singleton (vkd3d_instance_create_info.private_instance). */
+    bool private_instance;
 };
 
 struct vkd3d_queue_timeline_trace_cookie

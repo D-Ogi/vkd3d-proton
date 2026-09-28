@@ -804,6 +804,7 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
             VK_VERSION_MINOR(loader_version));
 
     instance->refcount = 1;
+    instance->private_instance = create_info->private_instance;
 
     instance->vk_debug_callback = VK_NULL_HANDLE;
     if (instance->vk_info.EXT_debug_utils && VKD3D_CONFIG_FLAG_IS_SET(VULKAN_DEBUG))
@@ -830,9 +831,11 @@ HRESULT vkd3d_create_instance(const struct vkd3d_instance_create_info *create_in
     struct vkd3d_instance *object;
     HRESULT hr = S_OK;
 
-    /* As long as there are live ID3D12Devices, we should only have one VkInstance that all devices can share. */
+    /* As long as there are live ID3D12Devices, we should only have one VkInstance that all devices can share.
+     * amdgpu-wddm fork: except for private instances, which are created and destroyed under the same lock all the
+     * same, so that vkd3d_instance_init() and vkd3d_destroy_instance() never run on two threads at once. */
     pthread_mutex_lock(&instance_singleton_lock);
-    if (instance_singleton)
+    if (instance_singleton && !(create_info && create_info->private_instance))
     {
         vkd3d_instance_incref(*instance = instance_singleton);
         TRACE("Handling out global instance singleton.\n");
@@ -861,10 +864,11 @@ HRESULT vkd3d_create_instance(const struct vkd3d_instance_create_info *create_in
         goto out_unlock;
     }
 
-    TRACE("Created instance %p.\n", object);
+    TRACE("Created %sinstance %p.\n", object->private_instance ? "private " : "", object);
 
     *instance = object;
-    instance_singleton = object;
+    if (!object->private_instance)
+        instance_singleton = object;
 
 out_unlock:
     pthread_mutex_unlock(&instance_singleton_lock);
@@ -908,9 +912,10 @@ ULONG vkd3d_instance_decref(struct vkd3d_instance *instance)
 
     if (!refcount)
     {
-        assert(instance_singleton == instance);
+        assert(instance->private_instance ? instance_singleton != instance : instance_singleton == instance);
+        if (!instance->private_instance)
+            instance_singleton = NULL;
         vkd3d_destroy_instance(instance);
-        instance_singleton = NULL;
     }
 
     pthread_mutex_unlock(&instance_singleton_lock);
