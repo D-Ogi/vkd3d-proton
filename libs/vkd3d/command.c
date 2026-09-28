@@ -26688,7 +26688,12 @@ void d3d12_device_inline_retire(struct d3d12_device *device)
     bool progress;
     size_t i;
 
-    /* A signal retired on one queue can complete a signal-order entry on another. */
+    /* A signal retired on one queue can complete a signal-order entry on another.
+     * The callbacks run under inline_mutex on purpose: two threads that each took a batch of one queue's
+     * retired entries and ran the callbacks outside it could apply that queue's signals of one fence out
+     * of order and rewind the fence. The destructors that run here may wait (freeing memory with a clear
+     * in flight, a reserved resource with its sparse initialisation pending), but only within the bound of
+     * d3d12_device_inline_wait_semaphores(). */
     pthread_mutex_lock(&device->inline_mutex);
     do
     {
