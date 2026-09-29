@@ -203,6 +203,32 @@ HRESULT vkd3d_create_heap_from_memory(ID3D12Device *device, const struct vkd3d_b
 HRESULT vkd3d_heap_map(ID3D12Heap *heap, void **cpu_address);
 HRESULT vkd3d_heap_unmap(ID3D12Heap *heap);
 
+/* Linear images (amdgpu-wddm fork, engine ABI 1.3 QueryLinearImage and CreateLinearPlacedResource; rule V13 of
+ * libs/ddi/bc250_vkd3d_engine.h). An image with VK_IMAGE_TILING_LINEAR that the embedder asks for by calling
+ * these functions; a resource description never selects it. 2D colour images with one mip level, one layer
+ * and one sample only, on heaps without CPU access. The three sizes are different things: layout_size is the
+ * subresource's, memory_size and memory_alignment are the image's memory requirements. */
+struct vkd3d_linear_image_info
+{
+    uint64_t offset;
+    uint64_t row_pitch;
+    uint64_t layout_size;
+    uint64_t memory_size;
+    uint64_t memory_alignment;
+    uint32_t memory_type_bits;
+};
+
+/* What an image of desc would be, from an image that is created unbound and destroyed before the call returns.
+ * E_INVALIDARG for a description outside the rule, E_NOTIMPL when the device does not support the format with
+ * linear tiling and the usage the description implies. */
+HRESULT vkd3d_query_linear_image(ID3D12Device *device, const D3D12_RESOURCE_DESC1 *desc,
+        struct vkd3d_linear_image_info *info);
+/* CreatePlacedResource1 with a linear image. info receives the layout and requirements of the bound image. */
+HRESULT vkd3d_create_linear_placed_resource(ID3D12Device *device, ID3D12Heap *heap, UINT64 heap_offset,
+        const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+        const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID iid, void **resource,
+        struct vkd3d_linear_image_info *info);
+
 ULONG vkd3d_resource_decref(ID3D12Resource *resource);
 ULONG vkd3d_resource_incref(ID3D12Resource *resource);
 

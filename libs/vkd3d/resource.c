@@ -716,10 +716,12 @@ static bool d3d12_device_supports_universal_color_ds_copy(struct d3d12_device *d
     return true;
 }
 
-static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+/* amdgpu-wddm fork: linear is the embedder's request for a linear image (vkd3d.h). Without a resource it comes
+ * from the caller, with one from the resource's flags, so that sizing and creation cannot disagree. */
+static HRESULT vkd3d_get_image_create_info_tiling(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties,
         const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
-        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats, bool linear,
         struct vkd3d_image_create_info *create_info)
 {
     VkImageCompressionControlEXT *image_compression_control = &create_info->image_compression_control;
@@ -921,6 +923,22 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
     image_info->samples = vk_samples_from_dxgi_sample_desc(&desc->SampleDesc);
     image_info->tiling = format->vk_image_tiling;
     image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (resource)
+        linear = !!(resource->flags & VKD3D_RESOURCE_LINEAR_IMAGE);
+    if (linear)
+    {
+        if (sparse_resource || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                image_info->mipLevels != 1 || image_info->arrayLayers != 1 || desc->SampleDesc.Count != 1 ||
+                format->vk_aspect_mask != VK_IMAGE_ASPECT_COLOR_BIT ||
+                (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+                d3d12_resource_desc_is_sampler_feedback(desc) || is_cpu_accessible_heap(heap_properties))
+        {
+            WARN("A linear image is a 2D colour image with one mip level, layer and sample on a heap without CPU access.\n");
+            return E_INVALIDARG;
+        }
+        image_info->tiling = VK_IMAGE_TILING_LINEAR;
+    }
 
     if (resource && (resource->flags & VKD3D_RESOURCE_COMMITTED) &&
             device->device_info.zero_initialize_device_memory_features.zeroInitializeDeviceMemory &&
@@ -1147,7 +1165,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
             resource->flags |= VKD3D_RESOURCE_INPUT_ATTACHMENT;
     }
 
-    if (device->device_info.image_alignment_control_features.imageAlignmentControl &&
+    /* amdgpu-wddm fork: the alignment request chooses between swizzle modes, which a linear image has not. */
+    if (device->device_info.image_alignment_control_features.imageAlignmentControl && !linear &&
             !sparse_resource && (!resource || (resource->flags & VKD3D_RESOURCE_PLACED)))
     {
         const uint32_t supported_alignment =
@@ -1184,7 +1203,52 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
         vk_prepend_struct(image_info, alignment_control);
     }
 
+    if (linear)
+    {
+        /* The format's cached features are those of its own tiling: ask for this combination. */
+        VkPhysicalDeviceImageFormatInfo2 format_info;
+        VkImageFormatListCreateInfo list_info;
+        VkImageFormatProperties2 properties;
+        VkResult vr;
+
+        memset(&format_info, 0, sizeof(format_info));
+        format_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+        format_info.format = image_info->format;
+        format_info.type = image_info->imageType;
+        format_info.tiling = image_info->tiling;
+        format_info.usage = image_info->usage;
+        format_info.flags = image_info->flags;
+        if (format_list->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)
+        {
+            list_info = *format_list;
+            list_info.pNext = NULL;
+            format_info.pNext = &list_info;
+        }
+        memset(&properties, 0, sizeof(properties));
+        properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+
+        if ((vr = VK_CALL(vkGetPhysicalDeviceImageFormatProperties2(device->vk_physical_device,
+                &format_info, &properties))) < 0 ||
+                image_info->extent.width > properties.imageFormatProperties.maxExtent.width ||
+                image_info->extent.height > properties.imageFormatProperties.maxExtent.height)
+        {
+            WARN("No linear image of format %u, usage %#x, flags %#x, %ux%u (vr %d).\n", image_info->format,
+                    image_info->usage, image_info->flags, image_info->extent.width, image_info->extent.height, vr);
+            return E_NOTIMPL;
+        }
+    }
+
     return S_OK;
+}
+
+static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+        const D3D12_HEAP_PROPERTIES *heap_properties,
+        const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct vkd3d_image_create_info *create_info)
+{
+    return vkd3d_get_image_create_info_tiling(device, heap_properties, desc, resource,
+            num_castable_formats, castable_formats, false, create_info);
 }
 
 static HRESULT vkd3d_create_image(struct d3d12_device *device,
@@ -4647,7 +4711,124 @@ static HRESULT d3d12_resource_validate_heap(const D3D12_RESOURCE_DESC1 *resource
     return S_OK;
 }
 
+static HRESULT d3d12_resource_create_placed_flags(struct d3d12_device *device, uint32_t extra_flags,
+        const D3D12_RESOURCE_DESC1 *desc,
+        struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_resource **resource);
+
 HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+        struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        struct d3d12_resource **resource)
+{
+    return d3d12_resource_create_placed_flags(device, 0, desc, heap, heap_offset, initial_state,
+            optimized_clear_value, num_castable_formats, castable_formats, resource);
+}
+
+static void vkd3d_linear_image_info_from_image(struct d3d12_device *device, VkImage vk_image,
+        struct vkd3d_linear_image_info *info)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkMemoryRequirements requirements;
+    VkImageSubresource subresource;
+    VkSubresourceLayout layout;
+
+    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subresource.mipLevel = 0;
+    subresource.arrayLayer = 0;
+    VK_CALL(vkGetImageSubresourceLayout(device->vk_device, vk_image, &subresource, &layout));
+    VK_CALL(vkGetImageMemoryRequirements(device->vk_device, vk_image, &requirements));
+
+    memset(info, 0, sizeof(*info));
+    info->offset = layout.offset;
+    info->row_pitch = layout.rowPitch;
+    info->layout_size = layout.size;
+    info->memory_size = requirements.size;
+    info->memory_alignment = requirements.alignment;
+    info->memory_type_bits = requirements.memoryTypeBits;
+}
+
+/* amdgpu-wddm fork: engine ABI 1.3 QueryLinearImage (vkd3d.h). */
+HRESULT vkd3d_query_linear_image(ID3D12Device *device_iface, const D3D12_RESOURCE_DESC1 *desc,
+        struct vkd3d_linear_image_info *info)
+{
+    const struct vkd3d_vk_device_procs *vk_procs;
+    struct vkd3d_image_create_info create_info;
+    D3D12_HEAP_PROPERTIES heap_properties;
+    D3D12_RESOURCE_DESC1 validated_desc;
+    struct d3d12_device *device;
+    VkImage vk_image;
+    VkResult vr;
+    HRESULT hr;
+
+    TRACE("device %p, desc %p, info %p.\n", device_iface, desc, info);
+
+    if (!device_iface || !desc || !info)
+        return E_INVALIDARG;
+    memset(info, 0, sizeof(*info));
+    device = impl_from_ID3D12Device((d3d12_device_iface *)device_iface);
+    vk_procs = &device->vk_procs;
+
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        return E_INVALIDARG;
+    validated_desc = *desc;
+    if (FAILED(hr = d3d12_resource_validate_desc(&validated_desc, 0, NULL, device)))
+        return hr;
+
+    memset(&heap_properties, 0, sizeof(heap_properties));
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    if (FAILED(hr = vkd3d_get_image_create_info_tiling(device, &heap_properties, &validated_desc, NULL,
+            0, NULL, true, &create_info)))
+        return hr;
+
+    if ((vr = VK_CALL(vkCreateImage(device->vk_device, &create_info.image_info, NULL, &vk_image))) < 0)
+    {
+        WARN("Failed to create the linear image of the query, vr %d.\n", vr);
+        return hresult_from_vk_result(vr);
+    }
+    vkd3d_linear_image_info_from_image(device, vk_image, info);
+    VK_CALL(vkDestroyImage(device->vk_device, vk_image, NULL));
+    return S_OK;
+}
+
+/* amdgpu-wddm fork: engine ABI 1.3 CreateLinearPlacedResource (vkd3d.h). */
+HRESULT vkd3d_create_linear_placed_resource(ID3D12Device *device_iface, ID3D12Heap *heap, UINT64 heap_offset,
+        const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+        const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID iid, void **resource,
+        struct vkd3d_linear_image_info *info)
+{
+    struct d3d12_resource *object;
+    struct d3d12_device *device;
+    HRESULT hr;
+
+    TRACE("device %p, heap %p, heap_offset %#"PRIx64", desc %p, initial_state %#x, optimized_clear_value %p, "
+            "iid %s, resource %p, info %p.\n", device_iface, heap, heap_offset, desc, initial_state,
+            optimized_clear_value, debugstr_guid(iid), resource, info);
+
+    if (resource)
+        *resource = NULL;
+    if (info)
+        memset(info, 0, sizeof(*info));
+    if (!device_iface || !heap || !desc || !iid || !resource || !info)
+        return E_INVALIDARG;
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        return E_INVALIDARG;
+    device = impl_from_ID3D12Device((d3d12_device_iface *)device_iface);
+
+    if (FAILED(hr = d3d12_resource_create_placed_flags(device, VKD3D_RESOURCE_LINEAR_IMAGE, desc,
+            impl_from_ID3D12Heap(heap), heap_offset, initial_state, optimized_clear_value, 0, NULL, &object)))
+        return hr;
+
+    vkd3d_linear_image_info_from_image(device, object->res.vk_image, info);
+    return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+}
+
+static HRESULT d3d12_resource_create_placed_flags(struct d3d12_device *device, uint32_t extra_flags,
+        const D3D12_RESOURCE_DESC1 *desc,
         struct d3d12_heap *heap, uint64_t heap_offset, D3D12_RESOURCE_STATES initial_state,
         const D3D12_CLEAR_VALUE *optimized_clear_value,
         UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
@@ -4676,6 +4857,12 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
     if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
     {
+        if (extra_flags & VKD3D_RESOURCE_LINEAR_IMAGE)
+        {
+            WARN("A linear image needs a heap with memory.\n");
+            return E_INVALIDARG;
+        }
+
         WARN("Placing resource on heap with no memory backing it. Falling back to committed resource.\n");
 
         if (FAILED(hr = d3d12_resource_create_committed(device, desc, &heap->desc.Properties,
@@ -4691,7 +4878,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
         return hr;
     }
 
-    if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_PLACED, desc,
+    if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_PLACED | extra_flags, desc,
             &heap->desc.Properties, heap->desc.Flags, initial_state, optimized_clear_value,
             num_castable_formats, castable_formats,
             &object)))

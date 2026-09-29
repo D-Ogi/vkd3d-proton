@@ -1119,7 +1119,9 @@ enum vkd3d_resource_flag
     VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
     VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9),
     VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
-    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11)
+    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
+    /* amdgpu-wddm fork (engine ABI 1.3, rule V13): the image has linear tiling on the embedder's request. */
+    VKD3D_RESOURCE_LINEAR_IMAGE           = (1u << 12)
 };
 
 #define VKD3D_INVALID_TILE_INDEX (~0u)
