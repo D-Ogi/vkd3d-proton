@@ -1024,6 +1024,7 @@ static BOOL wait_fence_inline(ID3D12Fence *fence, UINT64 value, enum wait_mode m
     LARGE_INTEGER t0, t1, freq;
     HANDLE event = NULL;
     BOOL done = FALSE, set;
+    UINT64 completed;
     ULONGLONG start;
     HRESULT hr;
 
@@ -1033,7 +1034,9 @@ static BOOL wait_fence_inline(ID3D12Fence *fence, UINT64 value, enum wait_mode m
         QueryPerformanceCounter(&t0);
         hr = ID3D12Fence_SetEventOnCompletion(fence, value, NULL);
         QueryPerformanceCounter(&t1);
-        done = SUCCEEDED(hr) && ID3D12Fence_GetCompletedValue(fence) >= value;
+        /* UINT64_MAX is the value of a fence on a removed device, not a completion. */
+        completed = ID3D12Fence_GetCompletedValue(fence);
+        done = SUCCEEDED(hr) && completed != UINT64_MAX && completed >= value;
         printf("%s: SetEventOnCompletion(%llu, NULL) hr %08lx after %.2f ms\n", what, (unsigned long long)value,
                 (unsigned long)hr, 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
         checkf(done, "%s: SetEventOnCompletion(%llu, NULL) returns with the fence at %llu", what,
@@ -1048,7 +1051,10 @@ static BOOL wait_fence_inline(ID3D12Fence *fence, UINT64 value, enum wait_mode m
     while (SUCCEEDED(hr) && GetTickCount64() - start < 5000)
     {
         ++polls;
-        if (ID3D12Fence_GetCompletedValue(fence) >= value)
+        completed = ID3D12Fence_GetCompletedValue(fence);
+        if (completed == UINT64_MAX)
+            break;
+        if (completed >= value)
         {
             done = TRUE;
             break;
