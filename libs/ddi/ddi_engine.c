@@ -405,6 +405,58 @@ static HRESULT APIENTRY bc250_query_adapter_caps(const BC250_VKD3D_DEVICE_CREATE
     return S_OK;
 }
 
+static void bc250_linear_image_info(const struct vkd3d_linear_image_info *in, BC250_VKD3D_LINEAR_IMAGE_INFO *out)
+{
+    out->MemoryTypeBits = in->memory_type_bits;
+    out->Offset = in->offset;
+    out->RowPitch = in->row_pitch;
+    out->LayoutSize = in->layout_size;
+    out->MemorySize = in->memory_size;
+    out->MemoryAlignment = in->memory_alignment;
+}
+
+/* V13: on failure info keeps its Size and is zero otherwise. */
+static bool bc250_reset_linear_image_info(BC250_VKD3D_LINEAR_IMAGE_INFO *info)
+{
+    if (!info || info->Size < sizeof(*info))
+        return false;
+    memset(info, 0, sizeof(*info));
+    info->Size = sizeof(*info);
+    return true;
+}
+
+static HRESULT APIENTRY bc250_query_linear_image(void *device, const struct D3D12_RESOURCE_DESC1 *desc,
+        BC250_VKD3D_LINEAR_IMAGE_INFO *info)
+{
+    struct vkd3d_linear_image_info image;
+    HRESULT hr;
+
+    if (!bc250_reset_linear_image_info(info) || !device || !desc)
+        return E_INVALIDARG;
+    if (SUCCEEDED(hr = vkd3d_query_linear_image((ID3D12Device *)device, (const D3D12_RESOURCE_DESC1 *)desc, &image)))
+        bc250_linear_image_info(&image, info);
+    return hr;
+}
+
+static HRESULT APIENTRY bc250_create_linear_placed_resource(void *device, void *heap, UINT64 heap_offset,
+        const struct D3D12_RESOURCE_DESC1 *desc, UINT32 initial_state,
+        const struct D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource,
+        BC250_VKD3D_LINEAR_IMAGE_INFO *info)
+{
+    struct vkd3d_linear_image_info image;
+    HRESULT hr;
+
+    if (resource)
+        *resource = NULL;
+    if (!bc250_reset_linear_image_info(info) || !device || !heap || !desc || !riid || !resource)
+        return E_INVALIDARG;
+    if (SUCCEEDED(hr = vkd3d_create_linear_placed_resource((ID3D12Device *)device, (ID3D12Heap *)heap, heap_offset,
+            (const D3D12_RESOURCE_DESC1 *)desc, (D3D12_RESOURCE_STATES)initial_state,
+            (const D3D12_CLEAR_VALUE *)optimized_clear_value, riid, resource, &image)))
+        bc250_linear_image_info(&image, info);
+    return hr;
+}
+
 HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_FUNCS *funcs)
 {
     BC250_VKD3D_ENGINE_FUNCS out;
@@ -433,8 +485,13 @@ HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_
         out.UnmapHeap = bc250_unmap_heap;
         out.QueryAdapterCaps = bc250_query_adapter_caps;
     }
+    if (minor >= 3)
+    {
+        out.QueryLinearImage = bc250_query_linear_image;
+        out.CreateLinearPlacedResource = bc250_create_linear_placed_resource;
+    }
     /* Fill at most Size bytes: a 1.0 structure ends before CreateCommandQueue, a 1.1 structure before
-     * GetVulkanHandles, and a larger one keeps its zeroed tail. */
+     * GetVulkanHandles, a 1.2 structure before QueryLinearImage, and a larger one keeps its zeroed tail. */
     memset(funcs, 0, size);
     memcpy(funcs, &out, size < sizeof(out) ? size : sizeof(out));
     return S_OK;

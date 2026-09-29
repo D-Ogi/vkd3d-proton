@@ -5,7 +5,8 @@
  * amdgpu_wddm_vkd3d.dll, vkd3d-proton fork branch amdgpu-wddm/ddi-engine). The DLL was bc250vkd3d.dll before
  * its file names took the project's amdgpu_wddm prefix; code identifiers keep their BC250 names.
  *
- * Revision r4-draft, ABI 1.2: NOT FROZEN. r4 adds the instance mode (V12) to 1.2; the minor stays 1.2 because 1.2
+ * Revision r5-draft, ABI 1.3: NOT FROZEN. r5 adds 1.3, linear images (V13), and changes nothing of 1.2.
+ * r4 adds the instance mode (V12) to 1.2; the minor stays 1.2 because 1.2
  * is a draft, so an r3 engine does not know the field (V12 says how the shell tells). r3 adds 1.2 (imported memory
  * and the adapter query, V10 and V11) and raises the admission of the inline queue mode (V7) to three VkQueues.
  * 1.1 stays a draft until T0, the logging-shell probe on unit A that settles the fence contract of the inline
@@ -23,6 +24,8 @@
  *   1.2  r3-draft: imported memory (V10) and adapter capabilities (V11): ENGINE_FUNCS.GetVulkanHandles,
  *        CreateHeapFromMemory, MapHeap, UnmapHeap and QueryAdapterCaps, BC250_VKD3D_IMPORTED_MEMORY,
  *        BC250_VKD3D_FEATURE_QUERY. r4-draft: the instance mode (V12), DEVICE_CREATE_INFO.InstanceMode.
+ *   1.3  r5-draft: linear images (V13): ENGINE_FUNCS.QueryLinearImage and CreateLinearPlacedResource,
+ *        BC250_VKD3D_LINEAR_IMAGE_INFO.
  *
  * Sizes. Every structure starts with its Size, so a shell built against an older header passes a smaller one.
  * The engine reads a field only when Size covers it (fields of minor n also need AbiVersion 1.n or later). It
@@ -289,6 +292,22 @@
  *         (vkd3d-proton's instance lock): two CreateDevice calls never run vkCreateInstance at once.
  *       - Older engines. An r3 engine reads no InstanceMode and gives SHARED. The shell pins the engine build; it
  *         can also check that two live PRIVATE devices return two VkInstances from GetVulkanHandles.
+ *   V13 Linear images (1.3, r5-draft). An image with VK_IMAGE_TILING_LINEAR exists only because the shell
+ *       called CreateLinearPlacedResource: no resource description, layout value or heap flag selects one, and
+ *       the device's own CreatePlacedResource and GetResourceAllocationInfo are unchanged.
+ *       - Shape. A 2D colour image with one mip level, one layer and one sample, without depth-stencil use, on a
+ *         heap without CPU access. Anything else is E_INVALIDARG. A format that the device does not support
+ *         with linear tiling and the usage the description implies is E_NOTIMPL; the engine never falls back to
+ *         another tiling.
+ *       - Order. QueryLinearImage answers before any memory exists, from an image that it creates unbound and
+ *         destroys before it returns; the shell sizes its allocation and describes the surface from the answer.
+ *         CreateLinearPlacedResource places the image on an engine heap (CreateHeapFromMemory, V10) and returns
+ *         the same structure for the bound image. The engine does not compare the two: the shell does, and
+ *         releases the resource when they differ.
+ *       - Sizes. LayoutSize is the subresource's size, MemorySize and MemoryAlignment are the image's memory
+ *         requirements, MemoryTypeBits its memory types. None of them is the size of the shell's allocation.
+ *       - Layout. The image is used in VK_IMAGE_LAYOUT_GENERAL, as every image of vkd3d-proton whose tiling is
+ *         linear. InitialState and the clear value are those of CreatePlacedResource.
  */
 #ifndef BC250_VKD3D_ENGINE_H
 #define BC250_VKD3D_ENGINE_H
@@ -301,7 +320,7 @@ extern "C" {
 #endif
 
 #define BC250_VKD3D_ENGINE_ABI_MAJOR 1u
-#define BC250_VKD3D_ENGINE_ABI_MINOR 2u
+#define BC250_VKD3D_ENGINE_ABI_MINOR 3u
 #define BC250_VKD3D_ENGINE_ABI_VERSION ((BC250_VKD3D_ENGINE_ABI_MAJOR << 16) | BC250_VKD3D_ENGINE_ABI_MINOR)
 
 #define BC250_VKD3D_QUEUE_MODE_THREADED 0u         /* V3; also the mode when the 1.1 fields are absent */
@@ -403,8 +422,22 @@ typedef struct BC250_VKD3D_FEATURE_QUERY
     UINT32 Reserved;                               /* 0 */
 } BC250_VKD3D_FEATURE_QUERY;
 
-/* The D3D12 structures of 1.2 by their struct tags (see C and C++ above). */
+/* 1.3, V13. A linear image: its one subresource and its memory requirements. */
+typedef struct BC250_VKD3D_LINEAR_IMAGE_INFO
+{
+    UINT32 Size;                                   /* sizeof(BC250_VKD3D_LINEAR_IMAGE_INFO), set by the caller */
+    UINT32 MemoryTypeBits;                         /* VkMemoryRequirements::memoryTypeBits */
+    UINT64 Offset;                                 /* VkSubresourceLayout::offset */
+    UINT64 RowPitch;                               /* VkSubresourceLayout::rowPitch, bytes */
+    UINT64 LayoutSize;                             /* VkSubresourceLayout::size */
+    UINT64 MemorySize;                             /* VkMemoryRequirements::size */
+    UINT64 MemoryAlignment;                        /* VkMemoryRequirements::alignment */
+} BC250_VKD3D_LINEAR_IMAGE_INFO;
+
+/* The D3D12 structures of 1.2 and 1.3 by their struct tags (see C and C++ above). */
 struct D3D12_HEAP_DESC;
+struct D3D12_RESOURCE_DESC1;
+struct D3D12_CLEAR_VALUE;
 
 typedef struct BC250_VKD3D_ENGINE_FUNCS
 {
@@ -452,6 +485,21 @@ typedef struct BC250_VKD3D_ENGINE_FUNCS
      * CreateDevice's failure for info, in every Result as well. */
     HRESULT (APIENTRY *QueryAdapterCaps)(const BC250_VKD3D_DEVICE_CREATE_INFO *info, UINT32 count,
             BC250_VKD3D_FEATURE_QUERY *queries);
+
+    /* 1.3, V13. What a linear image of desc (a D3D12_RESOURCE_DESC1) is on device. E_INVALIDARG for a NULL
+     * pointer, an info->Size below the structure's or a description outside V13's shape; E_NOTIMPL when the
+     * device has no such image. On failure info keeps its Size and is zero otherwise. device as for
+     * CreateCommandQueue, in either queue mode. */
+    HRESULT (APIENTRY *QueryLinearImage)(void *device, const struct D3D12_RESOURCE_DESC1 *desc,
+            BC250_VKD3D_LINEAR_IMAGE_INFO *info);
+
+    /* 1.3, V13. CreatePlacedResource1 of device with a linear image: heap is an engine heap of the device,
+     * initialState a D3D12_RESOURCE_STATES value. Returns the interface riid of the resource and, in info, the
+     * bound image. Failures as QueryLinearImage and as CreatePlacedResource1; nothing is created on failure. */
+    HRESULT (APIENTRY *CreateLinearPlacedResource)(void *device, void *heap, UINT64 heapOffset,
+            const struct D3D12_RESOURCE_DESC1 *desc, UINT32 initialState,
+            const struct D3D12_CLEAR_VALUE *optimizedClearValue, REFIID riid, void **resource,
+            BC250_VKD3D_LINEAR_IMAGE_INFO *info);
 } BC250_VKD3D_ENGINE_FUNCS;
 
 typedef struct BC250_VKD3D_ENGINE_FUNCS_1_0
@@ -474,6 +522,10 @@ typedef struct BC250_VKD3D_ENGINE_FUNCS_1_1
 } BC250_VKD3D_ENGINE_FUNCS_1_1;
 
 #define BC250_VKD3D_ENGINE_FUNCS_SIZE_1_1 ((UINT32)sizeof(BC250_VKD3D_ENGINE_FUNCS_1_1))
+
+/* The 1.2 layout of the function table ends with QueryAdapterCaps; a 1.2 shell passes this size. */
+#define BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2 \
+        ((UINT32)(offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryAdapterCaps) + sizeof(void *)))
 
 /* Compile-time checks, in C and C++: each minor's structures extend the previous ones, and the sizes of 1.0 and
  * 1.1 are fixed (offsetof comes from vulkan_core.h, through vk_platform.h and stddef.h). */
@@ -510,8 +562,13 @@ BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_2_order,
                 == offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateHeapFromMemory) + sizeof(void *)
         && offsetof(BC250_VKD3D_ENGINE_FUNCS, UnmapHeap) == offsetof(BC250_VKD3D_ENGINE_FUNCS, MapHeap) + sizeof(void *)
         && offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryAdapterCaps)
-                == offsetof(BC250_VKD3D_ENGINE_FUNCS, UnmapHeap) + sizeof(void *)
-        && sizeof(BC250_VKD3D_ENGINE_FUNCS) == offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryAdapterCaps) + sizeof(void *));
+                == offsetof(BC250_VKD3D_ENGINE_FUNCS, UnmapHeap) + sizeof(void *));
+BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_3_order,
+        offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryLinearImage) == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2
+        && offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateLinearPlacedResource)
+                == offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryLinearImage) + sizeof(void *)
+        && sizeof(BC250_VKD3D_ENGINE_FUNCS)
+                == offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateLinearPlacedResource) + sizeof(void *));
 #ifdef _WIN64
 BC250_VKD3D_STATIC_ASSERT(sizes_1_0_x64,
         sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0) == 32 && sizeof(BC250_VKD3D_ENGINE_FUNCS_1_0) == 16);
@@ -519,11 +576,15 @@ BC250_VKD3D_STATIC_ASSERT(sizes_1_1_x64,
         sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_1) == 40 && sizeof(BC250_VKD3D_ENGINE_FUNCS_1_1) == 24
         && sizeof(BC250_VKD3D_SHELL_SERVICES) == 32 && sizeof(BC250_VKD3D_COMMAND_QUEUE_DESC) == 20);
 BC250_VKD3D_STATIC_ASSERT(sizes_1_2_x64,
-        sizeof(BC250_VKD3D_ENGINE_FUNCS) == 64 && sizeof(BC250_VKD3D_IMPORTED_MEMORY) == 32
+        BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2 == 64 && sizeof(BC250_VKD3D_IMPORTED_MEMORY) == 32
         && offsetof(BC250_VKD3D_IMPORTED_MEMORY, Memory) == 8 && offsetof(BC250_VKD3D_IMPORTED_MEMORY, Flags) == 28
         && sizeof(BC250_VKD3D_FEATURE_QUERY) == 24 && offsetof(BC250_VKD3D_FEATURE_QUERY, Result) == 16
         && sizeof(BC250_VKD3D_DEVICE_CREATE_INFO) == 48
         && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, InstanceMode) == 40);
+BC250_VKD3D_STATIC_ASSERT(sizes_1_3_x64,
+        sizeof(BC250_VKD3D_ENGINE_FUNCS) == 80 && sizeof(BC250_VKD3D_LINEAR_IMAGE_INFO) == 48
+        && offsetof(BC250_VKD3D_LINEAR_IMAGE_INFO, Offset) == 8
+        && offsetof(BC250_VKD3D_LINEAR_IMAGE_INFO, MemoryAlignment) == 40);
 #endif
 
 /* The one export. E_NOINTERFACE when abiVersion names another major or a later minor than the engine's;

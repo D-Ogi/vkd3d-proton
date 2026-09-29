@@ -108,6 +108,7 @@
 #define ABI_1_0 0x00010000u
 #define ABI_1_1 0x00010001u
 #define ABI_1_2 0x00010002u
+#define ABI_1_3 0x00010003u
 
 static unsigned int failures;
 
@@ -1778,6 +1779,297 @@ release:
     }
 }
 
+/* V13: a linear image. QueryLinearImage before any memory exists, its refusals, then a heap over memory of a type
+ * the answer names, CreateLinearPlacedResource on it, the bound image against the answer, a clear of the image as a
+ * render target and a texel-exact readback. A device without such an image answers E_NOTIMPL, which the test
+ * reports and accepts: the rule is that the engine never gives another tiling instead. */
+#define LINEAR_EDGE 256u
+#define LINEAR_TEXEL 0xff336699u            /* B8G8R8A8: blue 0x99, green 0x66, red 0x33, alpha 0xff */
+
+static void linear_image(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *device,
+        PFN_vkGetInstanceProcAddr gipa, ID3D12CommandQueue *given_queue, enum wait_mode mode, const char *tag)
+{
+    static const FLOAT colour[4] = {0.2f, 0.4f, 0.6f, 1.0f};
+    PFN_vkGetPhysicalDeviceMemoryProperties get_memory_properties;
+    BC250_VKD3D_LINEAR_IMAGE_INFO queried, bound, odd, refused;
+    ID3D12Resource *image = NULL, *back = NULL;
+    D3D12_TEXTURE_COPY_LOCATION copy_dst, copy_src;
+    ID3D12CommandAllocator *allocator = NULL;
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12DescriptorHeap *views = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC views_desc;
+    D3D12_COMMAND_QUEUE_DESC queue_desc;
+    struct import_heap target, readback;
+    D3D12_CPU_DESCRIPTOR_HANDLE view;
+    VkPhysicalDevice vk_physical_device;
+    ID3D12CommandQueue *queue = NULL;
+    D3D12_RESOURCE_DESC buffer_desc;
+    D3D12_RESOURCE_BARRIER barrier;
+    D3D12_RESOURCE_DESC1 desc, bad;
+    PFN_vkGetDeviceProcAddr gdpa;
+    unsigned int i, differ = 0;
+    struct import_ctx ctx;
+    VkInstance vk_instance;
+    void *heap_address;
+    UINT32 family = ~0u;
+    BOOL done = FALSE;
+    HRESULT hr;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&target, 0, sizeof(target));
+    memset(&readback, 0, sizeof(readback));
+    if (!funcs->QueryLinearImage || !funcs->CreateLinearPlacedResource)
+    {
+        checkf(FALSE, "%sthe 1.3 entries are in the table", tag);
+        return;
+    }
+
+    memset(&desc, 0, sizeof(desc));
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = LINEAR_EDGE;
+    desc.Height = LINEAR_EDGE;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    /* Refusals that need no device support. */
+    memset(&refused, 0x5e, sizeof(refused));
+    refused.Size = sizeof(refused) - 1;
+    checkf(funcs->QueryLinearImage(device, &desc, &refused) == E_INVALIDARG
+            && funcs->QueryLinearImage(device, &desc, NULL) == E_INVALIDARG
+            && funcs->QueryLinearImage(device, NULL, &refused) == E_INVALIDARG,
+            "%sQueryLinearImage with a short Size, without info or without a description -> E_INVALIDARG", tag);
+    bad = desc;
+    bad.MipLevels = 2;
+    refused.Size = sizeof(refused);
+    hr = funcs->QueryLinearImage(device, &bad, &refused);
+    bad = desc;
+    bad.DepthOrArraySize = 2;
+    checkf(hr == E_INVALIDARG && funcs->QueryLinearImage(device, &bad, &refused) == E_INVALIDARG
+            && refused.Size == sizeof(refused) && !refused.RowPitch && !refused.MemorySize,
+            "%sQueryLinearImage of two mip levels or two layers -> E_INVALIDARG, info zero but for its Size", tag);
+    bad = desc;
+    bad.Format = DXGI_FORMAT_D32_FLOAT;
+    bad.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    hr = funcs->QueryLinearImage(device, &bad, &refused);
+    bad = desc;
+    bad.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    checkf(hr == E_INVALIDARG && funcs->QueryLinearImage(device, &bad, &refused) == E_INVALIDARG,
+            "%sQueryLinearImage of a depth image or a 3D image -> E_INVALIDARG", tag);
+
+    memset(&queried, 0, sizeof(queried));
+    queried.Size = sizeof(queried);
+    hr = funcs->QueryLinearImage(device, &desc, &queried);
+    if (hr == E_NOTIMPL)
+    {
+        printf("%sthis device has no linear B8G8R8A8_UNORM render target: QueryLinearImage E_NOTIMPL, nothing "
+                "more to test\n", tag);
+        checkf(funcs->CreateLinearPlacedResource(device, (void *)1, 0, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                NULL, &IID_ID3D12Resource, (void **)&image, NULL) == E_INVALIDARG && !image,
+                "%sCreateLinearPlacedResource without info -> E_INVALIDARG", tag);
+        return;
+    }
+    printf("%slinear %ux%u B8G8R8A8_UNORM: offset %llu, row pitch %llu, layout size %llu, memory size %llu, "
+            "alignment %llu, type bits %#x\n", tag, LINEAR_EDGE, LINEAR_EDGE, (unsigned long long)queried.Offset,
+            (unsigned long long)queried.RowPitch, (unsigned long long)queried.LayoutSize,
+            (unsigned long long)queried.MemorySize, (unsigned long long)queried.MemoryAlignment,
+            (unsigned int)queried.MemoryTypeBits);
+    checkf(hr == S_OK && queried.Size == sizeof(queried) && queried.RowPitch >= LINEAR_EDGE * 4
+            && queried.LayoutSize >= queried.RowPitch * (LINEAR_EDGE - 1) + LINEAR_EDGE * 4
+            && queried.MemorySize >= queried.Offset + queried.LayoutSize && queried.MemoryAlignment
+            && !(queried.MemoryAlignment & (queried.MemoryAlignment - 1)) && queried.MemoryTypeBits,
+            "%sQueryLinearImage: a row pitch that holds a row, a layout that holds the rows, memory that holds the "
+            "layout (hr %08lx)", tag, (unsigned long)hr);
+    if (hr != S_OK)
+        return;
+    bad = desc;
+    bad.Width = 127;
+    bad.Height = 79;
+    memset(&odd, 0, sizeof(odd));
+    odd.Size = sizeof(odd);
+    hr = funcs->QueryLinearImage(device, &bad, &odd);
+    printf("%slinear 127x79: hr %08lx, row pitch %llu, layout size %llu, memory size %llu\n", tag, (unsigned long)hr,
+            (unsigned long long)odd.RowPitch, (unsigned long long)odd.LayoutSize, (unsigned long long)odd.MemorySize);
+    checkf(hr == S_OK && odd.RowPitch >= 127 * 4 && odd.LayoutSize >= odd.RowPitch * 78 + 127 * 4,
+            "%sQueryLinearImage of 127x79 holds its rows", tag);
+
+    hr = funcs->GetVulkanHandles(device, &vk_instance, &vk_physical_device, &ctx.vk_device, &family);
+    if (hr != S_OK)
+    {
+        checkf(FALSE, "%sGetVulkanHandles (hr %08lx)", tag, (unsigned long)hr);
+        return;
+    }
+    get_memory_properties = (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(vk_instance,
+            "vkGetPhysicalDeviceMemoryProperties");
+    gdpa = (PFN_vkGetDeviceProcAddr)gipa(vk_instance, "vkGetDeviceProcAddr");
+    if (!get_memory_properties || !gdpa)
+    {
+        checkf(FALSE, "%sVulkan entry points of the engine's instance", tag);
+        return;
+    }
+    ctx.funcs = funcs;
+    ctx.device = device;
+    get_memory_properties(vk_physical_device, &ctx.memory_properties);
+    /* Only the memory types the image takes are offered to the heap. */
+    for (i = 0; i < ctx.memory_properties.memoryTypeCount; ++i)
+    {
+        if (!(queried.MemoryTypeBits & (1u << i)))
+            ctx.memory_properties.memoryTypes[i].propertyFlags = 0;
+    }
+    ctx.allocate_memory = (PFN_vkAllocateMemory)gdpa(ctx.vk_device, "vkAllocateMemory");
+    ctx.free_memory = (PFN_vkFreeMemory)gdpa(ctx.vk_device, "vkFreeMemory");
+    if (!ctx.allocate_memory || !ctx.free_memory)
+    {
+        checkf(FALSE, "%svkAllocateMemory and vkFreeMemory of the engine's VkDevice", tag);
+        return;
+    }
+    checkf(queried.MemorySize <= IMPORT_HEAP_SIZE
+            && import_heap_create(&ctx, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &target, "DEFAULT render target")
+            && import_heap_create(&ctx, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &readback, "READBACK"),
+            "%sheaps over imported memory for the linear image and its readback", tag);
+    if (!target.heap || !readback.heap)
+        goto release;
+
+    checkf(funcs->CreateLinearPlacedResource(device, target.heap, 0, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
+            &IID_ID3D12Resource, (void **)&image, NULL) == E_INVALIDARG && !image,
+            "%sCreateLinearPlacedResource without info -> E_INVALIDARG", tag);
+    bad = desc;
+    bad.MipLevels = 2;
+    memset(&bound, 0, sizeof(bound));
+    bound.Size = sizeof(bound);
+    checkf(funcs->CreateLinearPlacedResource(device, target.heap, 0, &bad, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
+            &IID_ID3D12Resource, (void **)&image, &bound) == E_INVALIDARG && !image && !bound.RowPitch,
+            "%sCreateLinearPlacedResource of two mip levels -> E_INVALIDARG, nothing created", tag);
+    hr = funcs->CreateLinearPlacedResource(device, target.heap, 0, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
+            &IID_ID3D12Resource, (void **)&image, &bound);
+    checkf(hr == S_OK && image, "%sCreateLinearPlacedResource at offset 0 of the imported heap (hr %08lx)", tag,
+            (unsigned long)hr);
+    if (hr != S_OK || !image)
+        goto release;
+    checkf(!memcmp(&bound, &queried, sizeof(bound)),
+            "%sthe bound image has the layout and the requirements of the query (row pitch %llu, layout size %llu, "
+            "memory size %llu)", tag, (unsigned long long)bound.RowPitch, (unsigned long long)bound.LayoutSize,
+            (unsigned long long)bound.MemorySize);
+
+    memset(&buffer_desc, 0, sizeof(buffer_desc));
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = LINEAR_EDGE * LINEAR_EDGE * 4;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    back = place_resource(device, &readback, 0, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    memset(&views_desc, 0, sizeof(views_desc));
+    views_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    views_desc.NumDescriptors = 1;
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(device, &views_desc, &IID_ID3D12DescriptorHeap, (void **)&views)))
+        views = NULL;
+    if (given_queue)
+    {
+        queue = given_queue;
+        ID3D12CommandQueue_AddRef(queue);
+    }
+    else
+    {
+        memset(&queue_desc, 0, sizeof(queue_desc));
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12Device_CreateCommandQueue(device, &queue_desc, &IID_ID3D12CommandQueue, (void **)&queue);
+    }
+    checkf(back && views && queue
+            && SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void **)&allocator))
+            && SUCCEEDED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL,
+                    &IID_ID3D12GraphicsCommandList, (void **)&list)),
+            "%sreadback buffer, view heap, queue, allocator and command list", tag);
+    if (!back || !views || !queue || !allocator || !list)
+        goto release;
+
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(views, &view);
+    ID3D12Device_CreateRenderTargetView(device, image, NULL, view);
+    /* A placed render target is discarded or cleared before its first use. */
+    ID3D12GraphicsCommandList_DiscardResource(list, image, NULL);
+    ID3D12GraphicsCommandList_ClearRenderTargetView(list, view, colour, 0, NULL);
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = image;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &barrier);
+    memset(&copy_dst, 0, sizeof(copy_dst));
+    copy_dst.pResource = back;
+    copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    copy_dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    copy_dst.PlacedFootprint.Footprint.Width = LINEAR_EDGE;
+    copy_dst.PlacedFootprint.Footprint.Height = LINEAR_EDGE;
+    copy_dst.PlacedFootprint.Footprint.Depth = 1;
+    copy_dst.PlacedFootprint.Footprint.RowPitch = LINEAR_EDGE * 4;
+    memset(&copy_src, 0, sizeof(copy_src));
+    copy_src.pResource = image;
+    copy_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &copy_dst, 0, 0, 0, &copy_src, NULL);
+    checkf(SUCCEEDED(ID3D12GraphicsCommandList_Close(list)), "%srecord discard, clear and copy of the linear image",
+            tag);
+
+    if (!(done = execute_and_wait(device, queue, list, mode, tag)))
+        goto release;
+
+    heap_address = NULL;
+    hr = funcs->MapHeap(readback.heap, &heap_address);
+    if (hr == S_OK && heap_address)
+    {
+        for (i = 0; i < LINEAR_EDGE * LINEAR_EDGE; ++i)
+            differ += ((const UINT32 *)heap_address)[i] != LINEAR_TEXEL;
+        funcs->UnmapHeap(readback.heap);
+    }
+    checkf(hr == S_OK && heap_address && !differ,
+            "%sthe cleared linear render target reads back %08x in every texel (%u differ)", tag, LINEAR_TEXEL, differ);
+
+release:
+    if (list)
+        ID3D12GraphicsCommandList_Release(list);
+    if (allocator)
+        ID3D12CommandAllocator_Release(allocator);
+    if (queue)
+        ID3D12CommandQueue_Release(queue);
+    if (views)
+        ID3D12DescriptorHeap_Release(views);
+    if (list && !done)
+    {
+        checkf(FALSE, "%sthe imported memory stays allocated: its work did not complete", tag);
+        return;
+    }
+    {
+        unsigned int zero = 0, count = 0;
+
+        count += !!image;
+        if (image && !ID3D12Resource_Release(image))
+            ++zero;
+        count += !!back;
+        if (back && !ID3D12Resource_Release(back))
+            ++zero;
+        count += !!target.heap;
+        if (target.heap && !ID3D12Heap_Release(target.heap))
+            ++zero;
+        count += !!readback.heap;
+        if (readback.heap && !ID3D12Heap_Release(readback.heap))
+            ++zero;
+        if (target.memory)
+            ctx.free_memory(ctx.vk_device, target.memory, NULL);
+        if (readback.memory)
+            ctx.free_memory(ctx.vk_device, readback.memory, NULL);
+        if (done)
+            checkf(zero == count, "%ssafe order: the linear image, its readback buffer and their heaps return 0 from "
+                    "their final Release, then vkFreeMemory", tag);
+    }
+}
+
 /* V11: QueryAdapterCaps against CheckFeatureSupport of a device made from the same CreateInfo. Every feature that
  * QueryAdapterCaps answers, with the inputs of each set: the SDK's up to OPTIONS21 and 56, 57, 61, and three that
  * vkd3d-proton's IDL has beyond the SDK (54, 64, 65, with its layouts). */
@@ -2949,6 +3241,7 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
     allocator_reuse(device, qa);
     multiple_fence_waits(device);
     imported_memory(funcs, device, info.GetInstanceProcAddr, qa, WAIT_NULL_EVENT, "INLINE imported memory: ");
+    linear_image(funcs, device, info.GetInstanceProcAddr, qa, WAIT_NULL_EVENT, "INLINE linear image: ");
 
     check(ID3D12CommandQueue_Release(qc) == 0 && !shell_queue_of(COOKIE(0xc0)), "queue C: final Release 0, unbound");
     check(ID3D12CommandQueue_Release(qb) == 0 && !shell_queue_of(COOKIE(0xb0)), "queue B: final Release 0, unbound");
@@ -3236,6 +3529,7 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
     copy_round_trip(device, NULL, D3D12_COMMAND_LIST_TYPE_DIRECT, WAIT_EVENT, "");
     compute_dispatch(device, NULL, WAIT_EVENT, "");
     imported_memory(funcs, device, info.GetInstanceProcAddr, NULL, WAIT_EVENT, "THREADED imported memory: ");
+    linear_image(funcs, device, info.GetInstanceProcAddr, NULL, WAIT_EVENT, "THREADED linear image: ");
 
     /* CreateCommandQueue is for INLINE devices only. */
     memset(&qdesc, 0, sizeof(qdesc));
@@ -3704,13 +3998,33 @@ int main(int argc, char **argv)
             && !funcs.GetVulkanHandles && !funcs.CreateHeapFromMemory && !funcs.MapHeap && !funcs.UnmapHeap
             && !funcs.QueryAdapterCaps && funcs.AbiVersion == BC250_VKD3D_ENGINE_ABI_VERSION,
             "GetFuncs(1.1) with a 1.2-sized table fills CreateDevice and CreateCommandQueue, and the 1.2 entries NULL");
+    /* A 1.2 shell's table ends before QueryLinearImage; a shell that requires 1.2 gets no 1.3 entry even in a
+     * 1.3-sized table. */
+    memset(&funcs, 0x5e, sizeof(funcs));
+    funcs.Size = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2;
+    check(get_funcs(ABI_1_2, &funcs) == S_OK && funcs.CreateDevice && funcs.QueryAdapterCaps,
+            "GetFuncs(1.2) with the 1.2 Size");
+    for (k = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2, tail_kept = TRUE; k < sizeof(funcs); ++k)
+        tail_kept &= ((const BYTE *)&funcs)[k] == 0x5e;
+    checkf(funcs.Size == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2 && tail_kept,
+            "GetFuncs(1.2) with the 1.2 Size (%u) writes nothing past it",
+            (unsigned int)BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2);
+    memset(&funcs, 0x5e, sizeof(funcs));
+    funcs.Size = sizeof(funcs);
+    check(get_funcs(ABI_1_2, &funcs) == S_OK && funcs.AbiVersion == BC250_VKD3D_ENGINE_ABI_VERSION
+            && funcs.CreateDevice && funcs.CreateCommandQueue && funcs.GetVulkanHandles
+            && funcs.CreateHeapFromMemory && funcs.MapHeap && funcs.UnmapHeap && funcs.QueryAdapterCaps
+            && !funcs.QueryLinearImage && !funcs.CreateLinearPlacedResource,
+            "GetFuncs(1.2) with a 1.3-sized table fills the entries up to 1.2, and the 1.3 entries NULL");
     memset(&funcs, 0, sizeof(funcs));
     funcs.Size = sizeof(funcs);
-    check(get_funcs(ABI_1_2, &funcs) == S_OK && funcs.AbiVersion == ABI_1_2 && funcs.CreateDevice
+    check(get_funcs(ABI_1_3, &funcs) == S_OK && funcs.AbiVersion == ABI_1_3 && funcs.CreateDevice
             && funcs.CreateCommandQueue && funcs.GetVulkanHandles && funcs.CreateHeapFromMemory && funcs.MapHeap
-            && funcs.UnmapHeap && funcs.QueryAdapterCaps, "GetFuncs(1.2) fills every entry");
+            && funcs.UnmapHeap && funcs.QueryAdapterCaps && funcs.QueryLinearImage
+            && funcs.CreateLinearPlacedResource, "GetFuncs(1.3) fills every entry");
     if (!funcs.CreateDevice || !funcs.CreateCommandQueue || !funcs.GetVulkanHandles || !funcs.CreateHeapFromMemory
-            || !funcs.MapHeap || !funcs.UnmapHeap || !funcs.QueryAdapterCaps)
+            || !funcs.MapHeap || !funcs.UnmapHeap || !funcs.QueryAdapterCaps || !funcs.QueryLinearImage
+            || !funcs.CreateLinearPlacedResource)
         return 1;
 
     memset(&info, 0, sizeof(info));
