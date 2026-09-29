@@ -417,13 +417,17 @@ static void bc250_linear_image_info(const struct vkd3d_linear_image_info *in, BC
     out->MemoryAlignment = in->memory_alignment;
 }
 
-/* V13: on failure info keeps its Size and is zero otherwise. */
+/* V13: on failure info keeps its Size and is zero otherwise. Size is the caller's, which may be larger than
+ * this structure: what lies beyond it is not touched. */
 static bool bc250_reset_linear_image_info(BC250_VKD3D_LINEAR_IMAGE_INFO *info)
 {
+    UINT32 size;
+
     if (!info || info->Size < sizeof(*info))
         return false;
+    size = info->Size;
     memset(info, 0, sizeof(*info));
-    info->Size = sizeof(*info);
+    info->Size = size;
     return true;
 }
 

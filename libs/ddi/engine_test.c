@@ -1389,7 +1389,8 @@ static BOOL execute_and_wait(ID3D12Device *device, ID3D12CommandQueue *queue, ID
     {
         event = CreateEventW(NULL, FALSE, FALSE, NULL);
         done = event && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(fence, 1, event))
-                && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0 && ID3D12Fence_GetCompletedValue(fence) >= 1;
+                && WaitForSingleObject(event, 5000) == WAIT_OBJECT_0 && ID3D12Fence_GetCompletedValue(fence) >= 1
+                && ID3D12Fence_GetCompletedValue(fence) != UINT64_MAX;
         checkf(done, "%sfence reaches 1 within 5 s", tag);
         if (event)
             CloseHandle(event);
@@ -1416,6 +1417,7 @@ struct import_ctx
     VkPhysicalDeviceMemoryProperties memory_properties;
     PFN_vkAllocateMemory allocate_memory;
     PFN_vkFreeMemory free_memory;
+    uint32_t allowed_types;         /* 0: every memory type may be tried */
 };
 
 struct import_heap
@@ -1452,6 +1454,8 @@ static BOOL import_heap_create(const struct import_ctx *ctx, D3D12_HEAP_TYPE typ
         for (i = 0; i < ctx->memory_properties.memoryTypeCount; ++i)
         {
             properties = ctx->memory_properties.memoryTypes[i].propertyFlags;
+            if (ctx->allowed_types && !(ctx->allowed_types & (1u << i)))
+                continue;
             if (((properties & wanted) == wanted) == !!pass)
                 continue;
             memset(&alloc_info, 0, sizeof(alloc_info));
@@ -1808,7 +1812,12 @@ static void linear_image(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *de
     D3D12_RESOURCE_DESC1 desc, bad;
     PFN_vkGetDeviceProcAddr gdpa;
     unsigned int i, differ = 0;
-    struct import_ctx ctx;
+    struct import_ctx ctx, image_ctx;
+    struct
+    {
+        BC250_VKD3D_LINEAR_IMAGE_INFO info;
+        UINT64 tail;
+    } larger;
     VkInstance vk_instance;
     void *heap_address;
     UINT32 family = ~0u;
@@ -1851,6 +1860,15 @@ static void linear_image(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *de
     checkf(hr == E_INVALIDARG && funcs->QueryLinearImage(device, &bad, &refused) == E_INVALIDARG
             && refused.Size == sizeof(refused) && !refused.RowPitch && !refused.MemorySize,
             "%sQueryLinearImage of two mip levels or two layers -> E_INVALIDARG, info zero but for its Size", tag);
+    /* A caller built against a later, larger structure: its Size stays and its tail is not touched. */
+    bad = desc;
+    bad.MipLevels = 2;
+    memset(&larger, 0xa5, sizeof(larger));
+    larger.info.Size = sizeof(larger);
+    checkf(funcs->QueryLinearImage(device, &bad, &larger.info) == E_INVALIDARG
+            && larger.info.Size == sizeof(larger) && !larger.info.RowPitch && !larger.info.MemorySize
+            && !larger.info.MemoryTypeBits && larger.tail == 0xa5a5a5a5a5a5a5a5ull,
+            "%sQueryLinearImage that fails with a larger info: Size kept, known fields zero, tail untouched", tag);
     bad = desc;
     bad.Format = DXGI_FORMAT_D32_FLOAT;
     bad.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -1913,12 +1931,6 @@ static void linear_image(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *de
     ctx.funcs = funcs;
     ctx.device = device;
     get_memory_properties(vk_physical_device, &ctx.memory_properties);
-    /* Only the memory types the image takes are offered to the heap. */
-    for (i = 0; i < ctx.memory_properties.memoryTypeCount; ++i)
-    {
-        if (!(queried.MemoryTypeBits & (1u << i)))
-            ctx.memory_properties.memoryTypes[i].propertyFlags = 0;
-    }
     ctx.allocate_memory = (PFN_vkAllocateMemory)gdpa(ctx.vk_device, "vkAllocateMemory");
     ctx.free_memory = (PFN_vkFreeMemory)gdpa(ctx.vk_device, "vkFreeMemory");
     if (!ctx.allocate_memory || !ctx.free_memory)
@@ -1926,8 +1938,11 @@ static void linear_image(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *de
         checkf(FALSE, "%svkAllocateMemory and vkFreeMemory of the engine's VkDevice", tag);
         return;
     }
+    /* Only the memory types the image takes are tried for its heap; the readback buffer's heap has its own. */
+    image_ctx = ctx;
+    image_ctx.allowed_types = queried.MemoryTypeBits;
     checkf(queried.MemorySize <= IMPORT_HEAP_SIZE
-            && import_heap_create(&ctx, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES,
+            && import_heap_create(&image_ctx, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES,
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &target, "DEFAULT render target")
             && import_heap_create(&ctx, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &readback, "READBACK"),
@@ -2060,12 +2075,19 @@ release:
         count += !!readback.heap;
         if (readback.heap && !ID3D12Heap_Release(readback.heap))
             ++zero;
+        /* An object that is still referenced may still use its memory: the memory stays allocated then. */
+        if (zero != count)
+        {
+            checkf(FALSE, "%sthe imported memory stays allocated: %u of %u objects returned 0 from their final "
+                    "Release", tag, zero, count);
+            return;
+        }
         if (target.memory)
             ctx.free_memory(ctx.vk_device, target.memory, NULL);
         if (readback.memory)
             ctx.free_memory(ctx.vk_device, readback.memory, NULL);
         if (done)
-            checkf(zero == count, "%ssafe order: the linear image, its readback buffer and their heaps return 0 from "
+            checkf(TRUE, "%ssafe order: the linear image, its readback buffer and their heaps return 0 from "
                     "their final Release, then vkFreeMemory", tag);
     }
 }
