@@ -23,13 +23,15 @@ void vkd3d_config_set_embedder_defaults(const char *config);
 
 /* V6: no disk cache. vkd3d-proton's default keeps vkd3d-proton.cache in the process's working directory and a
  * writer thread; a system driver loaded into every D3D12 process must not. Applications' own
- * ID3D12PipelineLibrary caches keep working. */
+ * ID3D12PipelineLibrary caches keep working.
+ * A command signature that changes state needs device generated commands. Without them vkd3d-proton
+ * creates the signature and ExecuteIndirect then executes nothing; a driver has to refuse the signature. */
 static BOOL CALLBACK bc250_set_config_defaults(PINIT_ONCE once, void *param, void **context)
 {
     (void)once;
     (void)param;
     (void)context;
-    vkd3d_config_set_embedder_defaults("pipeline_library_app_cache");
+    vkd3d_config_set_embedder_defaults("pipeline_library_app_cache,fail_unsupported_state_template");
     return TRUE;
 }
 
