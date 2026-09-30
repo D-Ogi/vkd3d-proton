@@ -180,6 +180,7 @@ static VkResult vkd3d_meta_create_compute_pipeline(struct d3d12_device *device,
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_meta_heap_mapping_info mapping_info;
     struct vkd3d_queue_timeline_trace_cookie cookie;
+    struct vkd3d_driver_cache_probe probe;
     VkComputePipelineCreateInfo pipeline_info;
     VkPipelineCreateFlags2CreateInfo flags2;
     VkShaderModule module;
@@ -224,7 +225,10 @@ static VkResult vkd3d_meta_create_compute_pipeline(struct d3d12_device *device,
         vk_prepend_struct(&pipeline_info, &flags2);
 
     cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
+    vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_info);
     vr = VK_CALL(vkCreateComputePipelines(device->vk_device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, pipeline));
+    vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, "meta-comp", VK_NULL_HANDLE, vr, 0, NULL,
+            1, &pipeline_info.stage);
     vkd3d_queue_timeline_trace_complete_pso_compile(&device->queue_timeline_trace, cookie, 0, "META COMP");
     VK_CALL(vkDestroyShaderModule(device->vk_device, module, NULL));
 
@@ -242,6 +246,7 @@ static VkResult vkd3d_meta_create_graphics_pipeline(struct vkd3d_meta_ops *meta_
     struct vkd3d_meta_heap_mapping_info mapping_info;
     VkPipelineShaderStageCreateInfo shader_stages[3];
     struct vkd3d_queue_timeline_trace_cookie cookie;
+    struct vkd3d_driver_cache_probe probe;
     VkPipelineInputAssemblyStateCreateInfo ia_state;
     VkPipelineRasterizationStateCreateInfo rs_state;
     VkPipelineRenderingCreateInfoKHR rendering_info;
@@ -401,9 +406,12 @@ static VkResult vkd3d_meta_create_graphics_pipeline(struct vkd3d_meta_ops *meta_
         vk_prepend_struct(&pipeline_info, &flags2);
 
     cookie = vkd3d_queue_timeline_trace_register_pso_compile(&meta_ops->device->queue_timeline_trace);
+    vkd3d_driver_cache_probe_begin(&meta_ops->device->disk_cache, &probe, &pipeline_info);
     if ((vr = VK_CALL(vkCreateGraphicsPipelines(meta_ops->device->vk_device,
             VK_NULL_HANDLE, 1, &pipeline_info, NULL, vk_pipeline))))
         ERR("Failed to create graphics pipeline, vr %d.\n", vr);
+    vkd3d_driver_cache_probe_end(&meta_ops->device->disk_cache, &probe, "meta-gfx", VK_NULL_HANDLE, vr,
+            ((uint64_t)color_format << 32) | ds_format, NULL, pipeline_info.stageCount, shader_stages);
     vkd3d_queue_timeline_trace_complete_pso_compile(&meta_ops->device->queue_timeline_trace, cookie, 0, "META GFX");
 
     return vr;

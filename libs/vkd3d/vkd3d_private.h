@@ -2631,6 +2631,9 @@ struct vkd3d_pipeline_library_disk_cache
     uint32_t driver_saving;
     uint64_t driver_last_save_ns;
     uint64_t driver_last_pipeline_ns;
+    /* amdgpu-wddm diagnostic: one line per pipeline creation, see vkd3d_driver_cache_probe_end. */
+    FILE *driver_log;
+    uint64_t driver_log_begin_ns;
 };
 
 struct d3d12_pipeline_library
@@ -2735,6 +2738,24 @@ void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_di
  * created since the last save and none for VKD3D_DRIVER_CACHE_IDLE_NS, so a burst is not lost when the process is
  * killed before its final Release. */
 void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk_cache *cache);
+
+/* amdgpu-wddm diagnostic: logs every pipeline creation with its create path, the driver's cache hit flag
+ * (VK_EXT_pipeline_creation_feedback) and hashes that identify it across processes, to <archive>.pso-log.txt. */
+struct vkd3d_driver_cache_probe
+{
+    VkPipelineCreationFeedbackCreateInfo info;
+    VkPipelineCreationFeedback feedback;
+    const VkPipelineCreationFeedback *result;
+    uint64_t begin_ns;
+};
+struct vkd3d_pipeline_key;
+/* Chains creation feedback into create_info unless it has some already. */
+void vkd3d_driver_cache_probe_begin(struct vkd3d_pipeline_library_disk_cache *cache,
+        struct vkd3d_driver_cache_probe *probe, void *create_info);
+void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cache,
+        const struct vkd3d_driver_cache_probe *probe, const char *path, VkPipelineCache vk_cache, VkResult vr,
+        uint64_t pso_hash, const struct vkd3d_pipeline_key *key,
+        uint32_t stage_count, const VkPipelineShaderStageCreateInfo *stages);
 
 struct vkd3d_buffer
 {

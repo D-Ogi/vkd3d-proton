@@ -3522,6 +3522,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     struct vkd3d_shader_code_debug *spirv_code_debug;
     struct vkd3d_queue_timeline_trace_cookie cookie;
     VkPipelineCreationFeedbackEXT feedbacks[1];
+    struct vkd3d_driver_cache_probe probe;
     VkComputePipelineCreateInfo pipeline_info;
     VkPipelineCreateFlags2CreateInfo flags2;
     struct vkd3d_shader_spec_info spec_info;
@@ -3607,8 +3608,11 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     if (flags2.flags)
         vk_prepend_struct(&pipeline_info, &flags2);
 
+    vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_info);
     vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
             vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+    vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, "comp", vk_cache, vr,
+            vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), NULL, 1, &pipeline_info.stage);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -3665,8 +3669,11 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
 
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
 
+        vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_info);
         vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
                 vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+        vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, "comp-fallback", vk_cache, vr,
+                vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), NULL, 1, &pipeline_info.stage);
 
         if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
         {
@@ -6762,6 +6769,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     struct vkd3d_vertex_input_pipeline_desc vertex_input_desc;
     struct vkd3d_queue_timeline_trace_cookie cookie;
     VkPipelineLibraryCreateInfoKHR library_info;
+    struct vkd3d_driver_cache_probe probe;
     VkGraphicsPipelineCreateInfo create_info;
     VkPipelineCreateFlags2CreateInfo flags2;
     VkPipeline vk_libraries[3];
@@ -6819,8 +6827,11 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     if (flags2.flags)
         vk_prepend_struct(&create_info, &flags2);
 
+    vkd3d_driver_cache_probe_begin(&state->device->disk_cache, &probe, &create_info);
     vr = VK_CALL(vkCreateGraphicsPipelines(state->device->vk_device,
             vk_cache, 1, &create_info, NULL, vk_pipeline));
+    vkd3d_driver_cache_probe_end(&state->device->disk_cache, &probe, key ? "link-fast" : "link-lto", vk_cache, vr,
+            vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key, 0, NULL);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -6857,6 +6868,8 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     VkPipelineDynamicStateCreateInfo dynamic_create_info;
     struct vkd3d_queue_timeline_trace_cookie cookie;
     struct d3d12_device *device = state->device;
+    struct vkd3d_driver_cache_probe probe;
+    const char *probe_path;
     VkGraphicsPipelineCreateInfo pipeline_desc;
     VkPipelineViewportStateCreateInfo vp_desc;
     VkPipelineCreateFlags2CreateInfo flags2;
@@ -7037,7 +7050,12 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     if (flags2.flags)
         vk_prepend_struct(&pipeline_desc, &flags2);
 
+    probe_path = library_flags ? "gfx-lib" : key ? "gfx-variant" : "gfx";
+    vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_desc);
     vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+    vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, probe_path, vk_cache, vr,
+            vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key,
+            pipeline_desc.stageCount, pipeline_desc.pStages);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
     {
@@ -7087,7 +7105,12 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         pipeline_desc.pStages = state->graphics.stages;
 
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
+        vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_desc);
         vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+        vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, library_flags ? "gfx-lib-fallback" :
+                key ? "gfx-variant-fallback" : "gfx-fallback", vk_cache, vr,
+                vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key,
+                pipeline_desc.stageCount, pipeline_desc.pStages);
 
         if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
         {

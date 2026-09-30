@@ -1910,6 +1910,9 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
     struct vkd3d_shader_code spirv;
     struct vkd3d_shader_code dxil;
     void **scratch_allocs = NULL;
+    const VkPipelineShaderStageCreateInfo *probe_stages;
+    struct vkd3d_driver_cache_probe probe;
+    uint32_t probe_stage_count;
     bool creating_library;
     bool rtpso_has_omm;
     size_t i, j;
@@ -2600,9 +2603,15 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
     TRACE("Calling vkCreateRayTracingPipelinesKHR.\n");
 
     /* amdgpu-wddm fork: the device's persisted driver cache (VK_NULL_HANDLE when there is none). */
+    probe_stage_count = pipeline_create_info.stageCount;
+    probe_stages = pipeline_create_info.pStages;
+    vkd3d_driver_cache_probe_begin(&object->device->disk_cache, &probe, &pipeline_create_info);
     vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
             object->device->disk_cache.vk_pipeline_cache, 1, &pipeline_create_info, NULL,
             creating_library ? &variant->pipeline_library : &variant->pipeline));
+    vkd3d_driver_cache_probe_end(&object->device->disk_cache, &probe, creating_library ? "rt-lib" : "rt",
+            object->device->disk_cache.vk_pipeline_cache, vr, pipeline_create_info.groupCount,
+            NULL, probe_stage_count, probe_stages);
 
     if (vr == VK_SUCCESS && (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) &&
             object->type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
@@ -2618,8 +2627,11 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
         library_info.pLibraries = &variant->pipeline_library;
 
         /* Self-link the pipeline library. */
+        vkd3d_driver_cache_probe_begin(&object->device->disk_cache, &probe, &pipeline_create_info);
         vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
                 object->device->disk_cache.vk_pipeline_cache, 1, &pipeline_create_info, NULL, &variant->pipeline));
+        vkd3d_driver_cache_probe_end(&object->device->disk_cache, &probe, "rt-selflink",
+                object->device->disk_cache.vk_pipeline_cache, vr, 0, NULL, probe_stage_count, probe_stages);
     }
 
     if (vr == VK_SUCCESS)

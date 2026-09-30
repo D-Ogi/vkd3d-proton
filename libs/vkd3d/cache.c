@@ -3378,6 +3378,15 @@ out:
     return data;
 }
 
+static unsigned long vkd3d_driver_cache_pid(void)
+{
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return getpid();
+#endif
+}
+
 /* Writes the whole VkPipelineCache to a temporary file and renames it over driver_path, when it grew since it was
  * loaded or last saved (the cache only grows) and no file this device may use holds at least as much. A device
  * that created nothing new, such as a short-lived probe device, so never replaces a warm file. */
@@ -3422,11 +3431,7 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
     }
 
     vkd3d_driver_cache_fill_header(&header, device, size, vkd3d_driver_cache_checksum(data, size));
-#ifdef _WIN32
-    snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.tmp", cache->driver_path, (unsigned long)GetCurrentProcessId());
-#else
-    snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.tmp", cache->driver_path, (unsigned long)getpid());
-#endif
+    snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.tmp", cache->driver_path, vkd3d_driver_cache_pid());
     if ((file = fopen(tmp_path, "wb")))
     {
         ok = fwrite(&header, sizeof(header), 1, file) == 1 && fwrite(data, 1, size, file) == size;
@@ -3439,6 +3444,12 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
         cache->driver_saved_size = size;
     INFO("%s driver cache %s, %zu bytes, in %.3f ms.\n", ok ? "Saved" : "Failed to save", cache->driver_path, size,
             1e-6 * (double)(vkd3d_get_current_time_ns() - begin_ns));
+    if (cache->driver_log)
+    {
+        fprintf(cache->driver_log, "# %.3f %s %zu bytes\n", 1e-6 * (double)(begin_ns - cache->driver_log_begin_ns),
+                ok ? "saved" : "save failed", size);
+        fflush(cache->driver_log);
+    }
 
 out:
     vkd3d_free(data);
@@ -3447,6 +3458,7 @@ out:
 static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    char log_path[VKD3D_PATH_MAX + 32];
     VkPipelineCacheCreateInfo info;
     size_t size = 0;
     uint64_t begin_ns;
@@ -3483,6 +3495,15 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
     cache->driver_last_save_ns = vkd3d_get_current_time_ns();
     INFO("Driver cache %s: %zu bytes loaded in %.3f ms.\n", cache->driver_path, size,
             1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
+
+    snprintf(log_path, sizeof(log_path), "%s.pso-log.txt", cache->read_path);
+    if ((cache->driver_log = fopen(log_path, "a")))
+    {
+        cache->driver_log_begin_ns = begin_ns;
+        fprintf(cache->driver_log, "# pid %lu, driver cache %zu bytes loaded; ms tid path outcome vr driver_us "
+                "wall_us pso stages key\n", vkd3d_driver_cache_pid(), size);
+        fflush(cache->driver_log);
+    }
 }
 
 /* Saves on the calling thread when at least VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS passed since the last save and, with
@@ -3531,6 +3552,131 @@ void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk
     vkd3d_driver_cache_try_save(cache, VKD3D_DRIVER_CACHE_IDLE_NS);
 }
 
+static const void *vkd3d_driver_cache_find_struct(const void *chain, VkStructureType type)
+{
+    const VkBaseInStructure *s;
+
+    for (s = chain; s; s = s->pNext)
+        if (s->sType == type)
+            return s;
+    return NULL;
+}
+
+void vkd3d_driver_cache_probe_begin(struct vkd3d_pipeline_library_disk_cache *cache,
+        struct vkd3d_driver_cache_probe *probe, void *create_info)
+{
+    const VkPipelineCreationFeedbackCreateInfo *chained;
+
+    probe->result = NULL;
+    probe->begin_ns = vkd3d_get_current_time_ns();
+    if (!cache->driver_log)
+        return;
+    if ((chained = vkd3d_driver_cache_find_struct(((VkBaseInStructure *)create_info)->pNext,
+            VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO)))
+    {
+        probe->result = chained->pPipelineCreationFeedback;
+        return;
+    }
+    memset(&probe->info, 0, sizeof(probe->info));
+    memset(&probe->feedback, 0, sizeof(probe->feedback));
+    probe->info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO;
+    probe->info.pPipelineCreationFeedback = &probe->feedback;
+    vk_prepend_struct(create_info, &probe->info);
+    probe->result = &probe->feedback;
+}
+
+/* What names a stage across processes: the SPIR-V (by the driver's module identifier), entry point, specialization
+ * and required subgroup size. Pipeline layouts and fixed-function state are not in it. */
+static uint64_t vkd3d_driver_cache_hash_stages(struct d3d12_device *device,
+        uint32_t stage_count, const VkPipelineShaderStageCreateInfo *stages)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroup;
+    const VkPipelineShaderStageModuleIdentifierCreateInfoEXT *ident;
+    VkShaderModuleIdentifierEXT module_ident;
+    const VkShaderModuleCreateInfo *module;
+    uint64_t h = hash_fnv1_init();
+    uint32_t i, j;
+
+    for (i = 0; i < stage_count; i++)
+    {
+        h = hash_fnv1_iterate_u32(h, stages[i].stage);
+        h = hash_fnv1_iterate_string(h, stages[i].pName);
+        if (stages[i].module && device->device_info.shader_module_identifier_features.shaderModuleIdentifier)
+        {
+            memset(&module_ident, 0, sizeof(module_ident));
+            module_ident.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT;
+            VK_CALL(vkGetShaderModuleIdentifierEXT(device->vk_device, stages[i].module, &module_ident));
+            for (j = 0; j < module_ident.identifierSize; j++)
+                h = hash_fnv1_iterate_u8(h, module_ident.identifier[j]);
+        }
+        else if ((ident = vkd3d_driver_cache_find_struct(stages[i].pNext,
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT)))
+        {
+            for (j = 0; j < ident->identifierSize; j++)
+                h = hash_fnv1_iterate_u8(h, ident->pIdentifier[j]);
+        }
+        else if ((module = vkd3d_driver_cache_find_struct(stages[i].pNext,
+                VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)))
+        {
+            for (j = 0; j < module->codeSize / sizeof(uint32_t); j++)
+                h = hash_fnv1_iterate_u32(h, module->pCode[j]);
+        }
+        if (stages[i].pSpecializationInfo)
+        {
+            for (j = 0; j < stages[i].pSpecializationInfo->mapEntryCount; j++)
+            {
+                h = hash_fnv1_iterate_u32(h, stages[i].pSpecializationInfo->pMapEntries[j].constantID);
+                h = hash_fnv1_iterate_u32(h, stages[i].pSpecializationInfo->pMapEntries[j].offset);
+            }
+            for (j = 0; j < stages[i].pSpecializationInfo->dataSize; j++)
+                h = hash_fnv1_iterate_u8(h, ((const uint8_t *)stages[i].pSpecializationInfo->pData)[j]);
+        }
+        if ((subgroup = vkd3d_driver_cache_find_struct(stages[i].pNext,
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO)))
+            h = hash_fnv1_iterate_u32(h, subgroup->requiredSubgroupSize);
+        h = hash_fnv1_iterate_u32(h, stages[i].flags);
+    }
+    return h;
+}
+
+/* One line per creation: ms since device creation, thread, path, outcome (hit or miss in the driver cache, nocache
+ * when created without one, nofb when the driver gave no feedback), VkResult, driver and wall microseconds, PSO
+ * compatibility hash, stage hash and the variant key (topology/dsv format/samples/view mask/dynamic topology). */
+void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cache,
+        const struct vkd3d_driver_cache_probe *probe, const char *path, VkPipelineCache vk_cache, VkResult vr,
+        uint64_t pso_hash, const struct vkd3d_pipeline_key *key,
+        uint32_t stage_count, const VkPipelineShaderStageCreateInfo *stages)
+{
+    uint64_t end_ns = vkd3d_get_current_time_ns();
+    const char *outcome;
+    char key_text[64];
+    char line[384];
+
+    if (!cache->driver_log || !probe->result)
+        return;
+    if (!vk_cache)
+        outcome = "nocache";
+    else if (!(probe->result->flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT))
+        outcome = "nofb";
+    else if (probe->result->flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
+        outcome = "hit";
+    else
+        outcome = "miss";
+    if (key)
+        snprintf(key_text, sizeof(key_text), "%u/%u/%u/%#x/%u", key->topology, key->dsv_format,
+                key->rasterization_samples, key->view_mask, key->dynamic_topology);
+    else
+        vkd3d_strlcpy(key_text, sizeof(key_text), "-");
+    snprintf(line, sizeof(line), "%.3f %u %s %s %d %"PRIu64" %"PRIu64" %016"PRIx64" %016"PRIx64" %s\n",
+            1e-6 * (double)(probe->begin_ns - cache->driver_log_begin_ns), vkd3d_get_current_thread_id(),
+            path, outcome, vr, probe->result->duration / 1000, (end_ns - probe->begin_ns) / 1000, pso_hash,
+            vkd3d_driver_cache_hash_stages(cache->library->device, stage_count, stages), key_text);
+    /* One write and a flush per line: the CRT locks the stream, and a killed game keeps what it logged. */
+    fputs(line, cache->driver_log);
+    fflush(cache->driver_log);
+}
+
 /* The device's final Release: no pipeline creation is in flight. */
 static void vkd3d_driver_cache_cleanup(struct vkd3d_pipeline_library_disk_cache *cache)
 {
@@ -3545,6 +3691,11 @@ static void vkd3d_driver_cache_cleanup(struct vkd3d_pipeline_library_disk_cache 
         vkd3d_driver_cache_save(cache, device);
     VK_CALL(vkDestroyPipelineCache(device->vk_device, cache->vk_pipeline_cache, NULL));
     cache->vk_pipeline_cache = VK_NULL_HANDLE;
+    if (cache->driver_log)
+    {
+        fclose(cache->driver_log);
+        cache->driver_log = NULL;
+    }
 }
 
 HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache,
