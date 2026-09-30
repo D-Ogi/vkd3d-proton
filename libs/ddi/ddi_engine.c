@@ -21,9 +21,9 @@
 /* libs/vkd3d/device.c: VKD3D_CONFIG defaults of the embedding module. */
 void vkd3d_config_set_embedder_defaults(const char *config);
 
-/* libs/vkd3d/cache.c: directory of the disk cache when VKD3D_SHADER_CACHE_PATH is not set, and whether the cache
- * keeps full SPIR-V instead of the driver's shader module identifiers. */
-void vkd3d_set_embedder_shader_cache_path(const char *path, bool keep_spirv);
+/* libs/vkd3d/cache.c: directory of the disk cache when VKD3D_SHADER_CACHE_PATH is not set, and whether the driver
+ * lacks a disk cache of its own (the archive then keeps SPIR-V, and the device persists a VkPipelineCache). */
+void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_disk_cache);
 
 /* The disk cache lives per user, as a vendor driver's shader cache does: %LOCALAPPDATA%\amdgpu-wddm\vkd3d, one
  * vkd3d-proton.<program>.cache pair per application. vkd3d-proton's own default is the process's working
@@ -37,6 +37,9 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool keep_spirv);
  * The cache keeps full SPIR-V. With shader module identifiers it would keep only the names of pipelines in the
  * driver's own cache, and hosted RADV has no disk cache on Windows (Mesa does not build one there), so a new
  * process would find none of them; SPIR-V at least saves the DXIL and DXBC translation on every later start.
+ * For the driver's compilation, the device creates every pipeline with one VkPipelineCache and persists it next to
+ * the archive (vkd3d-proton.<program>.cache.driver): loaded at CreateDevice, saved by a pipeline-creating thread at
+ * most every 30 s after 64 new pipelines, and at the device's final Release, all on engine callers' threads.
  * Returns FALSE when no directory could be prepared. */
 static BOOL bc250_prepare_cache_directory(void)
 {
