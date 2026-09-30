@@ -29,6 +29,10 @@ void vkd3d_set_embedder_shader_cache_path(const char *path);
  * directory, which for a system driver is the application's and often read-only (Program Files): with that
  * default a game recompiled every pipeline on every start. Without a usable per-user directory the engine
  * keeps V6's behaviour: no disk cache, applications' own ID3D12PipelineLibrary caches keep working.
+ * In the inline queue mode (V7) the cache starts no thread: libvkd3d merges and parses the archive during
+ * CreateDevice, and the thread that creates a pipeline appends it to the write archive (libs/vkd3d/cache.c).
+ * The text of V6 and V7 in bc250_vkd3d_engine.h (no files, the disk cache refused in INLINE) predates this; the
+ * header keeps its pinned revision until the next one.
  * Returns FALSE when no directory could be prepared. */
 static BOOL bc250_prepare_cache_directory(void)
 {

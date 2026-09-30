@@ -2601,6 +2601,9 @@ struct vkd3d_pipeline_library_disk_cache
     condvar_reltime_t cond;
     pthread_mutex_t lock;
     bool thread_active;
+    /* amdgpu-wddm fork: inline queue mode, no disk thread. The archive is parsed during device creation, and the
+     * thread that creates a pipeline appends it to the write archive under lock. */
+    bool threadless;
 
     struct vkd3d_pipeline_library_disk_cache_item *items;
     size_t items_count;

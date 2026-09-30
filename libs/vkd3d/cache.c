@@ -2865,6 +2865,32 @@ HRESULT vkd3d_pipeline_library_store_pipeline_to_disk_cache(
         struct vkd3d_pipeline_library_disk_cache *cache,
         struct d3d12_pipeline_state *state)
 {
+    struct vkd3d_pipeline_library_disk_cache_item item;
+    HRESULT hr;
+
+    /* amdgpu-wddm fork: without a disk thread, the creating thread serializes the pipeline while it still holds
+     * the only reference, so no other thread can run its destructor. Serializing makes no Vulkan call: the disk
+     * cache library saves no PSO blob, and shader identifiers were queried at creation. The blobs go to the write
+     * archive under cache->lock (notify_blob_insert), and the archive is flushed after each new pipeline, so a
+     * process that is killed keeps what it compiled. */
+    if (cache->threadless)
+    {
+        item.state = state;
+        if (FAILED(hr = vkd3d_pipeline_library_disk_cache_save_pipeline_state(cache, &item)))
+        {
+            /* INVALIDARG is expected for duplicates. */
+            if (hr != E_INVALIDARG)
+                ERR("Failed to serialize pipeline to disk cache, hr #%x.\n", (int)hr);
+            return S_OK;
+        }
+
+        pthread_mutex_lock(&cache->lock);
+        if (cache->stream_archive_write_file)
+            fflush(cache->stream_archive_write_file);
+        pthread_mutex_unlock(&cache->lock);
+        return S_OK;
+    }
+
     /* Push new work to disk cache thread. */
     d3d12_pipeline_state_inc_ref(state);
     pthread_mutex_lock(&cache->lock);
@@ -3297,8 +3323,10 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
 
     flags = VKD3D_PIPELINE_LIBRARY_FLAG_INTERNAL_KEYS | VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE;
 
-    /* This flag is mostly for debug. Normally we want to do shader cache management in disk thread. */
-    if (!VKD3D_CONFIG_FLAG_IS_SET(SHADER_CACHE_SYNC))
+    /* This flag is mostly for debug. Normally we want to do shader cache management in disk thread.
+     * amdgpu-wddm fork: the inline queue mode starts no thread (d3d12_device_validate_inline_mode), so the
+     * archive is merged and parsed here, as with SHADER_CACHE_SYNC. */
+    if (!VKD3D_CONFIG_FLAG_IS_SET(SHADER_CACHE_SYNC) && !device->inline_queues)
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE_PARSE_ASYNC;
 
     if (device->device_info.shader_module_identifier_features.shaderModuleIdentifier)
@@ -3320,6 +3348,14 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
 
         if (!(flags & VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE_PARSE_ASYNC))
             vkd3d_pipeline_library_disk_cache_initial_setup(cache);
+
+        if (device->inline_queues)
+        {
+            if ((rc = pthread_mutex_init(&cache->lock, NULL)) < 0)
+                goto mutex_fail;
+            cache->threadless = true;
+            return hr;
+        }
 
         cache->thread_active = true;
         if ((rc = pthread_mutex_init(&cache->lock, NULL)) < 0)
@@ -3366,6 +3402,17 @@ void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_
         condvar_reltime_destroy(&cache->cond);
         pthread_mutex_destroy(&cache->lock);
     }
+    else if (cache->threadless)
+    {
+        /* The device's final Release: no pipeline creation is in flight. */
+        if (cache->stream_archive_write_file)
+        {
+            fclose(cache->stream_archive_write_file);
+            cache->stream_archive_write_file = NULL;
+        }
+        pthread_mutex_destroy(&cache->lock);
+        cache->threadless = false;
+    }
 
     vkd3d_free(cache->items);
     cache->items = NULL;
@@ -3385,11 +3432,16 @@ void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_
         uint64_t hash, uint32_t type /* vkd3d_serialized_pipeline_stream_entry_type */,
         const void *data, size_t size)
 {
-    /* Always called from disk$ thread, so we don't have to consider thread safety. */
+    /* Always called from disk$ thread, so we don't have to consider thread safety.
+     * amdgpu-wddm fork: without the disk thread, any thread that creates a pipeline calls this; cache->lock keeps
+     * each entry whole in the archive. */
     struct vkd3d_serialized_pipeline_library_stream header;
     struct vkd3d_serialized_pipeline_stream_entry entry;
     uint8_t zero_array[VKD3D_PIPELINE_BLOB_ALIGN];
     uint32_t padding_size;
+
+    if (disk_cache->threadless)
+        pthread_mutex_lock(&disk_cache->lock);
 
     /* On first write (new blob), create a new file. */
     if (!disk_cache->stream_archive_attempted_write)
@@ -3435,6 +3487,9 @@ void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_
 
         /* Defer fflush until things quiet down. No need to spam fflush 1000s of times per second. */
     }
+
+    if (disk_cache->threadless)
+        pthread_mutex_unlock(&disk_cache->lock);
 }
 
 static void *vkd3d_pipeline_library_disk_thread_main(void *userarg)

@@ -11074,7 +11074,8 @@ bool d3d12_device_validate_shader_meta(struct d3d12_device *device, const struct
 }
 
 /* Inline queue mode (amdgpu-wddm fork): the device may start no thread. The fence workers, the
- * submission threads and the clear tracker have inline variants; refuse what would start any other. */
+ * submission threads, the clear tracker and the disk cache have inline variants; refuse what would start any
+ * other. */
 static HRESULT d3d12_device_validate_inline_mode(const struct vkd3d_device_create_info *create_info)
 {
     const struct vkd3d_inline_queue_callbacks *callbacks = create_info->inline_queue_callbacks;
@@ -11086,15 +11087,15 @@ static HRESULT d3d12_device_validate_inline_mode(const struct vkd3d_device_creat
         return E_INVALIDARG;
     }
 
-    if (vkd3d_get_env_var("VKD3D_SHADER_DEBUG_RING_SIZE_LOG2", env, sizeof(env)) ||
-            vkd3d_descriptor_debug_active_instruction_qa_checks() ||
-            vkd3d_descriptor_debug_active_descriptor_qa_checks() ||
+    if (
 #ifdef VKD3D_ENABLE_PROFILING
             vkd3d_get_env_var("VKD3D_TIMESTAMP_PROFILE", env, sizeof(env)) ||
 #endif
-            !VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_APP_CACHE_ONLY))
+            vkd3d_get_env_var("VKD3D_SHADER_DEBUG_RING_SIZE_LOG2", env, sizeof(env)) ||
+            vkd3d_descriptor_debug_active_instruction_qa_checks() ||
+            vkd3d_descriptor_debug_active_descriptor_qa_checks())
     {
-        WARN("The shader debug ring, descriptor QA, the timestamp profiler and the disk cache "
+        WARN("The shader debug ring, descriptor QA and the timestamp profiler "
                 "start threads, which the inline queue mode does not allow.\n");
         return E_INVALIDARG;
     }
