@@ -3531,7 +3531,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     VkResult vr;
     HRESULT hr;
 
-    vk_cache = state->vk_pso_cache;
+    vk_cache = vkd3d_pipeline_library_driver_cache(&device->disk_cache, state->vk_pso_cache);
     spirv_code = &state->compute.code;
 
     if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS))
@@ -6585,6 +6585,9 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         vkd3d_pipeline_library_store_pipeline_to_disk_cache(&device->disk_cache, object);
     }
 
+    /* amdgpu-wddm fork: may save the persisted driver cache on this thread. */
+    vkd3d_pipeline_library_driver_cache_notify(&device->disk_cache, !desc_cached_pso->blob.CachedBlobSizeInBytes);
+
     TRACE("Created pipeline state %p.\n", object);
 
 #ifdef VKD3D_ENABLE_PROFILING
@@ -6866,6 +6869,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
 
     *dynamic_state_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_create_info,
             dynamic_state_buffer, key);
+
+    /* amdgpu-wddm fork: the device's persisted driver cache, also for fallback variants. */
+    vk_cache = vkd3d_pipeline_library_driver_cache(&device->disk_cache, vk_cache);
 
     if (!library_flags && graphics->library)
     {

@@ -3236,16 +3236,258 @@ static void vkd3d_pipeline_library_disk_cache_initial_setup(struct vkd3d_pipelin
 /* Directory used when VKD3D_SHADER_CACHE_PATH is not set, given once by an embedding module before its first
  * device (amdgpu_wddm_vkd3d.dll: a per-user directory, since a system driver's working directory is the
  * application's and often read-only). Empty: vkd3d-proton's own default, the working directory. The embedder also
- * says whether the cache keeps SPIR-V instead of shader module identifiers. */
+ * says whether the driver lacks a disk cache of its own. */
 static char vkd3d_embedder_cache_path[VKD3D_PATH_MAX];
-/* An identifier names a pipeline in the driver's own cache, which a later process cannot use when the driver keeps
- * no disk cache (Mesa has none on Windows); SPIR-V still saves the DXIL and DXBC translation. */
-static bool vkd3d_embedder_cache_keeps_spirv;
+/* The driver keeps no pipeline binaries across processes (Mesa has no disk cache on Windows). The archive then keeps
+ * SPIR-V instead of shader module identifiers, which name pipelines in the driver's cache that a later process
+ * cannot find, and the device persists one VkPipelineCache of its own next to the archive (driver_path). */
+static bool vkd3d_embedder_cache_for_driver;
 
-void vkd3d_set_embedder_shader_cache_path(const char *path, bool keep_spirv)
+void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_disk_cache)
 {
     vkd3d_strlcpy(vkd3d_embedder_cache_path, sizeof(vkd3d_embedder_cache_path), path ? path : "");
-    vkd3d_embedder_cache_keeps_spirv = keep_spirv;
+    vkd3d_embedder_cache_for_driver = driver_without_disk_cache;
+}
+
+/* The driver cache file: this header, then vkGetPipelineCacheData's data. A new engine build, driver build
+ * (pipelineCacheUUID; RADV derives it from its DLL's timestamp on Windows), driver version or GPU discards it. */
+#define VKD3D_DRIVER_CACHE_MAGIC MAKE_MAGIC('V','K','P','C')
+#define VKD3D_DRIVER_CACHE_VERSION 1
+#define VKD3D_DRIVER_CACHE_MAX_SIZE (512u << 20)
+#define VKD3D_DRIVER_CACHE_SAVE_PIPELINES 64
+#define VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS (30ull * 1000000000ull)
+
+struct vkd3d_driver_cache_header
+{
+    uint32_t magic;
+    uint32_t version;
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint32_t driver_version;
+    uint32_t driver_id;
+    uint64_t vkd3d_build;
+    uint8_t cache_uuid[VK_UUID_SIZE];
+    uint64_t data_size;
+    uint64_t checksum;
+};
+
+static uint64_t vkd3d_driver_cache_checksum(const uint8_t *data, size_t size)
+{
+    uint64_t h = hash_fnv1_init();
+    uint64_t word;
+    size_t i;
+
+    for (i = 0; i + sizeof(word) <= size; i += sizeof(word))
+    {
+        memcpy(&word, data + i, sizeof(word));
+        h = (h ^ word) * 0x100000001b3ull;
+    }
+    for (; i < size; i++)
+        h = hash_fnv1_iterate_u8(h, data[i]);
+    return h;
+}
+
+static void vkd3d_driver_cache_fill_header(struct vkd3d_driver_cache_header *header, struct d3d12_device *device,
+        size_t data_size, uint64_t checksum)
+{
+    const VkPhysicalDeviceProperties *properties = &device->device_info.properties2.properties;
+
+    memset(header, 0, sizeof(*header));
+    header->magic = VKD3D_DRIVER_CACHE_MAGIC;
+    header->version = VKD3D_DRIVER_CACHE_VERSION;
+    header->vendor_id = properties->vendorID;
+    header->device_id = properties->deviceID;
+    header->driver_version = properties->driverVersion;
+    header->driver_id = device->device_info.vulkan_1_2_properties.driverID;
+    header->vkd3d_build = vkd3d_build;
+    memcpy(header->cache_uuid, properties->pipelineCacheUUID, VK_UUID_SIZE);
+    header->data_size = data_size;
+    header->checksum = checksum;
+}
+
+/* The saved data, or NULL when there is none this device may use. */
+static void *vkd3d_driver_cache_read(const char *path, struct d3d12_device *device, size_t *size)
+{
+    struct vkd3d_driver_cache_header header, expected;
+    VkPipelineCacheHeaderVersionOne vk_header;
+    void *data = NULL;
+    FILE *file;
+
+    if (!(file = fopen(path, "rb")))
+        return NULL;
+
+    vkd3d_driver_cache_fill_header(&expected, device, 0, 0);
+    if (fread(&header, sizeof(header), 1, file) != 1)
+        goto out;
+    expected.data_size = header.data_size;
+    expected.checksum = header.checksum;
+    if (memcmp(&header, &expected, sizeof(header)) || header.data_size < sizeof(vk_header) ||
+            header.data_size > VKD3D_DRIVER_CACHE_MAX_SIZE)
+    {
+        INFO("Driver cache %s is from another engine, driver or GPU, ignoring it.\n", path);
+        goto out;
+    }
+    if (!(data = vkd3d_malloc(header.data_size)) || fread(data, 1, header.data_size, file) != header.data_size ||
+            vkd3d_driver_cache_checksum(data, header.data_size) != header.checksum)
+    {
+        INFO("Driver cache %s is truncated or corrupt, ignoring it.\n", path);
+        goto fail;
+    }
+    memcpy(&vk_header, data, sizeof(vk_header));
+    if (vk_header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+            vk_header.vendorID != expected.vendor_id || vk_header.deviceID != expected.device_id ||
+            memcmp(vk_header.pipelineCacheUUID, expected.cache_uuid, VK_UUID_SIZE))
+    {
+        INFO("Driver cache %s has a foreign Vulkan header, ignoring it.\n", path);
+        goto fail;
+    }
+    *size = header.data_size;
+    goto out;
+
+fail:
+    vkd3d_free(data);
+    data = NULL;
+out:
+    fclose(file);
+    return data;
+}
+
+/* Writes the whole VkPipelineCache to a temporary file and renames it over driver_path. */
+static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    struct vkd3d_driver_cache_header header;
+    char tmp_path[VKD3D_PATH_MAX + 32];
+    size_t size = 0, capacity;
+    uint64_t begin_ns;
+    void *data = NULL;
+    bool ok = false;
+    FILE *file;
+    VkResult vr;
+
+    begin_ns = vkd3d_get_current_time_ns();
+    if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, NULL))) || !size)
+        return;
+    if (size > VKD3D_DRIVER_CACHE_MAX_SIZE)
+    {
+        /* Start over next time rather than keep a cache that can no longer be saved. */
+        WARN("Driver cache of %zu bytes exceeds the bound, dropping %s.\n", size, cache->driver_path);
+        vkd3d_file_delete(cache->driver_path);
+        return;
+    }
+    /* Other threads may add pipelines between the two calls. */
+    capacity = size + size / 8 + (1u << 20);
+    if (!(data = vkd3d_malloc(capacity)))
+        return;
+    size = capacity;
+    if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, data))))
+    {
+        WARN("vkGetPipelineCacheData failed, vr %d.\n", vr);
+        goto out;
+    }
+
+    vkd3d_driver_cache_fill_header(&header, device, size, vkd3d_driver_cache_checksum(data, size));
+#ifdef _WIN32
+    snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.tmp", cache->driver_path, (unsigned long)GetCurrentProcessId());
+#else
+    snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.tmp", cache->driver_path, (unsigned long)getpid());
+#endif
+    if ((file = fopen(tmp_path, "wb")))
+    {
+        ok = fwrite(&header, sizeof(header), 1, file) == 1 && fwrite(data, 1, size, file) == size;
+        ok = !fclose(file) && ok;
+        ok = ok && vkd3d_file_rename_overwrite(tmp_path, cache->driver_path);
+        if (!ok)
+            vkd3d_file_delete(tmp_path);
+    }
+    INFO("%s driver cache %s, %zu bytes, in %.3f ms.\n", ok ? "Saved" : "Failed to save", cache->driver_path, size,
+            1e-6 * (double)(vkd3d_get_current_time_ns() - begin_ns));
+
+out:
+    vkd3d_free(data);
+}
+
+static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkPipelineCacheCreateInfo info;
+    size_t size = 0;
+    uint64_t begin_ns;
+    void *data;
+    VkResult vr;
+
+    if (!vkd3d_embedder_cache_for_driver || !VKD3D_CONFIG_FLAG_IS_SET(GLOBAL_PIPELINE_CACHE))
+        return;
+
+    begin_ns = vkd3d_get_current_time_ns();
+    snprintf(cache->driver_path, sizeof(cache->driver_path), "%s.driver", cache->read_path);
+    data = vkd3d_driver_cache_read(cache->driver_path, device, &size);
+
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    info.initialDataSize = data ? size : 0;
+    info.pInitialData = data;
+    if ((vr = VK_CALL(vkCreatePipelineCache(device->vk_device, &info, NULL, &cache->vk_pipeline_cache))) && data)
+    {
+        WARN("Driver cache %s refused, vr %d; starting empty.\n", cache->driver_path, vr);
+        info.initialDataSize = 0;
+        info.pInitialData = NULL;
+        vr = VK_CALL(vkCreatePipelineCache(device->vk_device, &info, NULL, &cache->vk_pipeline_cache));
+        size = 0;
+    }
+    vkd3d_free(data);
+    if (vr)
+    {
+        cache->vk_pipeline_cache = VK_NULL_HANDLE;
+        return;
+    }
+
+    cache->driver_cache_cold = !size;
+    cache->driver_last_save_ns = vkd3d_get_current_time_ns();
+    INFO("Driver cache %s: %zu bytes loaded in %.3f ms.\n", cache->driver_path, size,
+            1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
+}
+
+void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache, bool new_pipeline)
+{
+    struct d3d12_device *device;
+    uint64_t now_ns;
+
+    /* A pipeline the archive already had is in a warm driver cache too; a cold one takes every pipeline. */
+    if (!cache->vk_pipeline_cache || (!new_pipeline && !cache->driver_cache_cold))
+        return;
+    if (vkd3d_atomic_uint32_increment(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed) <
+            VKD3D_DRIVER_CACHE_SAVE_PIPELINES)
+        return;
+    /* One saver at a time; the others go on. The save runs on this, the creating, thread. */
+    if (vkd3d_atomic_uint32_compare_exchange(&cache->driver_saving, 0, 1,
+            vkd3d_memory_order_acquire, vkd3d_memory_order_relaxed) != 0)
+        return;
+    now_ns = vkd3d_get_current_time_ns();
+    if (now_ns - cache->driver_last_save_ns >= VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS)
+    {
+        vkd3d_atomic_uint32_store_explicit(&cache->driver_new_pipelines, 0, vkd3d_memory_order_relaxed);
+        device = cache->library->device;
+        vkd3d_driver_cache_save(cache, device);
+        cache->driver_last_save_ns = vkd3d_get_current_time_ns();
+    }
+    vkd3d_atomic_uint32_store_explicit(&cache->driver_saving, 0, vkd3d_memory_order_release);
+}
+
+/* The device's final Release: no pipeline creation is in flight. */
+static void vkd3d_driver_cache_cleanup(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    const struct vkd3d_vk_device_procs *vk_procs;
+    struct d3d12_device *device;
+
+    if (!cache->vk_pipeline_cache)
+        return;
+    device = cache->library->device;
+    vk_procs = &device->vk_procs;
+    if (cache->driver_new_pipelines)
+        vkd3d_driver_cache_save(cache, device);
+    VK_CALL(vkDestroyPipelineCache(device->vk_device, cache->vk_pipeline_cache, NULL));
+    cache->vk_pipeline_cache = VK_NULL_HANDLE;
 }
 
 HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache,
@@ -3335,7 +3577,7 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE_PARSE_ASYNC;
 
     if (device->device_info.shader_module_identifier_features.shaderModuleIdentifier &&
-            !vkd3d_embedder_cache_keeps_spirv)
+            !vkd3d_embedder_cache_for_driver)
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER;
     else if (!VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV))
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_SAVE_FULL_SPIRV;
@@ -3360,6 +3602,7 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
             if ((rc = pthread_mutex_init(&cache->lock, NULL)) < 0)
                 goto mutex_fail;
             cache->threadless = true;
+            vkd3d_driver_cache_init(cache, device);
             return hr;
         }
 
@@ -3370,6 +3613,7 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
             goto cond_fail;
         if ((rc = pthread_create(&cache->thread, NULL, vkd3d_pipeline_library_disk_thread_main, cache)) < 0)
             goto thread_fail;
+        vkd3d_driver_cache_init(cache, device);
     }
 
     return hr;
@@ -3389,6 +3633,8 @@ mutex_fail:
 
 void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache)
 {
+    vkd3d_driver_cache_cleanup(cache);
+
     /* Ask disk thread to tear down as quick as possible if it's busy parsing stuff
      * in the disk$ thread. */
     if (cache->library)

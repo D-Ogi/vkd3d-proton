@@ -2617,6 +2617,18 @@ struct vkd3d_pipeline_library_disk_cache
      * on demand. */
     FILE *stream_archive_write_file;
     bool stream_archive_attempted_write;
+
+    /* amdgpu-wddm fork: the driver's pipeline binaries across processes, when the embedder asks for it
+     * (vkd3d_set_embedder_shader_cache_path). One VkPipelineCache for every pipeline the device creates, loaded
+     * from driver_path at device creation and saved by the thread that creates a pipeline (at most every
+     * VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS, after VKD3D_DRIVER_CACHE_SAVE_PIPELINES new ones) and by the device's
+     * final Release. VK_NULL_HANDLE otherwise. */
+    VkPipelineCache vk_pipeline_cache;
+    char driver_path[VKD3D_PATH_MAX];
+    bool driver_cache_cold;
+    uint32_t driver_new_pipelines;
+    uint32_t driver_saving;
+    uint64_t driver_last_save_ns;
 };
 
 struct d3d12_pipeline_library
@@ -2709,6 +2721,15 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
         struct d3d12_device *device);
 /* Called on device destroy. */
 void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache);
+/* amdgpu-wddm fork: the VkPipelineCache pipelines are created with when the PSO has none of its own. */
+static inline VkPipelineCache vkd3d_pipeline_library_driver_cache(const struct vkd3d_pipeline_library_disk_cache *cache,
+        VkPipelineCache vk_cache)
+{
+    return vk_cache ? vk_cache : cache->vk_pipeline_cache;
+}
+/* amdgpu-wddm fork: a pipeline was created with the driver cache; new is FALSE when it came from the vkd3d
+ * archive. May save the driver cache on the calling thread. */
+void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache, bool new_pipeline);
 
 struct vkd3d_buffer
 {

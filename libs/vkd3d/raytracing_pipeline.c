@@ -2599,8 +2599,9 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
 
     TRACE("Calling vkCreateRayTracingPipelinesKHR.\n");
 
+    /* amdgpu-wddm fork: the device's persisted driver cache (VK_NULL_HANDLE when there is none). */
     vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
-            VK_NULL_HANDLE, 1, &pipeline_create_info, NULL,
+            object->device->disk_cache.vk_pipeline_cache, 1, &pipeline_create_info, NULL,
             creating_library ? &variant->pipeline_library : &variant->pipeline));
 
     if (vr == VK_SUCCESS && (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) &&
@@ -2618,8 +2619,11 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
 
         /* Self-link the pipeline library. */
         vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
-                VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &variant->pipeline));
+                object->device->disk_cache.vk_pipeline_cache, 1, &pipeline_create_info, NULL, &variant->pipeline));
     }
+
+    if (vr == VK_SUCCESS)
+        vkd3d_pipeline_library_driver_cache_notify(&object->device->disk_cache, true);
 
     for (i = 0; i < scratch_allocs_count; i++)
         vkd3d_free(scratch_allocs[i]);
