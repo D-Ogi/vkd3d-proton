@@ -3207,6 +3207,16 @@ static void vkd3d_pipeline_library_disk_cache_initial_setup(struct vkd3d_pipelin
     cache->library->disk_cache_listener = cache;
 }
 
+/* Directory used when VKD3D_SHADER_CACHE_PATH is not set, given once by an embedding module before its first
+ * device (amdgpu_wddm_vkd3d.dll: a per-user directory, since a system driver's working directory is the
+ * application's and often read-only). Empty: vkd3d-proton's own default, the working directory. */
+static char vkd3d_embedder_cache_path[VKD3D_PATH_MAX];
+
+void vkd3d_set_embedder_shader_cache_path(const char *path)
+{
+    vkd3d_strlcpy(vkd3d_embedder_cache_path, sizeof(vkd3d_embedder_cache_path), path ? path : "");
+}
+
 HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache,
         struct d3d12_device *device)
 {
@@ -3228,6 +3238,8 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
     /* Match DXVK style here. The environment variable is a directory.
      * If not set, it is in current working directory. */
     vkd3d_get_env_var("VKD3D_SHADER_CACHE_PATH", path_buf, sizeof(path_buf));
+    if (*path_buf == '\0')
+        vkd3d_strlcpy(path_buf, sizeof(path_buf), vkd3d_embedder_cache_path);
     path = *path_buf != '\0' ? path_buf : NULL;
 
     if (path)

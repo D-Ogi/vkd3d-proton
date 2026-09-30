@@ -21,17 +21,45 @@
 /* libs/vkd3d/device.c: VKD3D_CONFIG defaults of the embedding module. */
 void vkd3d_config_set_embedder_defaults(const char *config);
 
-/* V6: no disk cache. vkd3d-proton's default keeps vkd3d-proton.cache in the process's working directory and a
- * writer thread; a system driver loaded into every D3D12 process must not. Applications' own
- * ID3D12PipelineLibrary caches keep working.
- * A command signature that changes state needs device generated commands. Without them vkd3d-proton
+/* libs/vkd3d/cache.c: directory of the disk cache when VKD3D_SHADER_CACHE_PATH is not set. */
+void vkd3d_set_embedder_shader_cache_path(const char *path);
+
+/* The disk cache lives per user, as a vendor driver's shader cache does: %LOCALAPPDATA%\amdgpu-wddm\vkd3d, one
+ * vkd3d-proton.<program>.cache pair per application. vkd3d-proton's own default is the process's working
+ * directory, which for a system driver is the application's and often read-only (Program Files): with that
+ * default a game recompiled every pipeline on every start. Without a usable per-user directory the engine
+ * keeps V6's behaviour: no disk cache, applications' own ID3D12PipelineLibrary caches keep working.
+ * Returns FALSE when no directory could be prepared. */
+static BOOL bc250_prepare_cache_directory(void)
+{
+    char path[MAX_PATH];
+    DWORD length = GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path));
+    static const char suffix[] = "\\amdgpu-wddm";
+    static const char leaf[] = "\\vkd3d";
+
+    if (!length || length + sizeof(suffix) + sizeof(leaf) > sizeof(path))
+        return FALSE;
+    strcat(path, suffix);
+    if (!CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return FALSE;
+    strcat(path, leaf);
+    if (!CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return FALSE;
+    vkd3d_set_embedder_shader_cache_path(path);
+    return TRUE;
+}
+
+/* A command signature that changes state needs device generated commands. Without them vkd3d-proton
  * creates the signature and ExecuteIndirect then executes nothing; a driver has to refuse the signature. */
 static BOOL CALLBACK bc250_set_config_defaults(PINIT_ONCE once, void *param, void **context)
 {
     (void)once;
     (void)param;
     (void)context;
-    vkd3d_config_set_embedder_defaults("pipeline_library_app_cache,fail_unsupported_state_template");
+    if (bc250_prepare_cache_directory())
+        vkd3d_config_set_embedder_defaults("fail_unsupported_state_template");
+    else
+        vkd3d_config_set_embedder_defaults("pipeline_library_app_cache,fail_unsupported_state_template");
     return TRUE;
 }
 
