@@ -3249,8 +3249,11 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_
     vkd3d_embedder_cache_for_driver = driver_without_disk_cache;
 }
 
-/* The driver cache file: this header, then vkGetPipelineCacheData's data. A new engine build, driver build
- * (pipelineCacheUUID), driver version or GPU discards it. */
+/* The driver cache file: this header, then vkGetPipelineCacheData's data. A new driver build (pipelineCacheUUID),
+ * driver version or GPU discards it. A new engine build does not: the driver keys each pipeline by everything its
+ * creation passes (SPIR-V, layout, state), so a pipeline the new build creates differently is a miss, never a wrong
+ * hit, while the SPIR-V the new build produces unchanged still hits although its stream archive starts over.
+ * vkd3d_build is written for the record only. */
 #define VKD3D_DRIVER_CACHE_MAGIC MAKE_MAGIC('V','K','P','C')
 #define VKD3D_DRIVER_CACHE_VERSION 1
 #define VKD3D_DRIVER_CACHE_MAX_SIZE (512u << 20)
@@ -3315,6 +3318,7 @@ static bool vkd3d_driver_cache_read_header(FILE *file, struct d3d12_device *devi
     if (fread(header, sizeof(*header), 1, file) != 1)
         return false;
     vkd3d_driver_cache_fill_header(&expected, device, header->data_size, header->checksum);
+    expected.vkd3d_build = header->vkd3d_build;
     return !memcmp(header, &expected, sizeof(*header)) &&
             header->data_size >= sizeof(VkPipelineCacheHeaderVersionOne) &&
             header->data_size <= VKD3D_DRIVER_CACHE_MAX_SIZE;
@@ -3350,7 +3354,7 @@ static void *vkd3d_driver_cache_read(const char *path, struct d3d12_device *devi
     vkd3d_driver_cache_fill_header(&expected, device, 0, 0);
     if (!vkd3d_driver_cache_read_header(file, device, &header))
     {
-        INFO("Driver cache %s is from another engine, driver or GPU, ignoring it.\n", path);
+        INFO("Driver cache %s is from another driver or GPU, ignoring it.\n", path);
         goto out;
     }
     if (!(data = vkd3d_malloc(header.data_size)) || fread(data, 1, header.data_size, file) != header.data_size ||
