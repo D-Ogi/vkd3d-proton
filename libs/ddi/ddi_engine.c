@@ -21,8 +21,9 @@
 /* libs/vkd3d/device.c: VKD3D_CONFIG defaults of the embedding module. */
 void vkd3d_config_set_embedder_defaults(const char *config);
 
-/* libs/vkd3d/cache.c: directory of the disk cache when VKD3D_SHADER_CACHE_PATH is not set. */
-void vkd3d_set_embedder_shader_cache_path(const char *path);
+/* libs/vkd3d/cache.c: directory of the disk cache when VKD3D_SHADER_CACHE_PATH is not set, and whether the cache
+ * keeps full SPIR-V instead of the driver's shader module identifiers. */
+void vkd3d_set_embedder_shader_cache_path(const char *path, bool keep_spirv);
 
 /* The disk cache lives per user, as a vendor driver's shader cache does: %LOCALAPPDATA%\amdgpu-wddm\vkd3d, one
  * vkd3d-proton.<program>.cache pair per application. vkd3d-proton's own default is the process's working
@@ -33,6 +34,9 @@ void vkd3d_set_embedder_shader_cache_path(const char *path);
  * CreateDevice, and the thread that creates a pipeline appends it to the write archive (libs/vkd3d/cache.c).
  * The text of V6 and V7 in bc250_vkd3d_engine.h (no files, the disk cache refused in INLINE) predates this; the
  * header keeps its pinned revision until the next one.
+ * The cache keeps full SPIR-V. With shader module identifiers it would keep only the names of pipelines in the
+ * driver's own cache, and hosted RADV has no disk cache on Windows (Mesa does not build one there), so a new
+ * process would find none of them; SPIR-V at least saves the DXIL and DXBC translation on every later start.
  * Returns FALSE when no directory could be prepared. */
 static BOOL bc250_prepare_cache_directory(void)
 {
@@ -49,7 +53,7 @@ static BOOL bc250_prepare_cache_directory(void)
     strcat(path, leaf);
     if (!CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
         return FALSE;
-    vkd3d_set_embedder_shader_cache_path(path);
+    vkd3d_set_embedder_shader_cache_path(path, true);
     return TRUE;
 }
 

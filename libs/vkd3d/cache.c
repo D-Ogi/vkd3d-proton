@@ -3235,12 +3235,17 @@ static void vkd3d_pipeline_library_disk_cache_initial_setup(struct vkd3d_pipelin
 
 /* Directory used when VKD3D_SHADER_CACHE_PATH is not set, given once by an embedding module before its first
  * device (amdgpu_wddm_vkd3d.dll: a per-user directory, since a system driver's working directory is the
- * application's and often read-only). Empty: vkd3d-proton's own default, the working directory. */
+ * application's and often read-only). Empty: vkd3d-proton's own default, the working directory. The embedder also
+ * says whether the cache keeps SPIR-V instead of shader module identifiers. */
 static char vkd3d_embedder_cache_path[VKD3D_PATH_MAX];
+/* An identifier names a pipeline in the driver's own cache, which a later process cannot use when the driver keeps
+ * no disk cache (Mesa has none on Windows); SPIR-V still saves the DXIL and DXBC translation. */
+static bool vkd3d_embedder_cache_keeps_spirv;
 
-void vkd3d_set_embedder_shader_cache_path(const char *path)
+void vkd3d_set_embedder_shader_cache_path(const char *path, bool keep_spirv)
 {
     vkd3d_strlcpy(vkd3d_embedder_cache_path, sizeof(vkd3d_embedder_cache_path), path ? path : "");
+    vkd3d_embedder_cache_keeps_spirv = keep_spirv;
 }
 
 HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache,
@@ -3329,7 +3334,8 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
     if (!VKD3D_CONFIG_FLAG_IS_SET(SHADER_CACHE_SYNC) && !device->inline_queues)
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_STREAM_ARCHIVE_PARSE_ASYNC;
 
-    if (device->device_info.shader_module_identifier_features.shaderModuleIdentifier)
+    if (device->device_info.shader_module_identifier_features.shaderModuleIdentifier &&
+            !vkd3d_embedder_cache_keeps_spirv)
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER;
     else if (!VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV))
         flags |= VKD3D_PIPELINE_LIBRARY_FLAG_SAVE_FULL_SPIRV;
