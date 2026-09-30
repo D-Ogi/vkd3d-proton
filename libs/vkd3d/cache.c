@@ -3396,7 +3396,7 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
     struct vkd3d_driver_cache_header header;
     char tmp_path[VKD3D_PATH_MAX + 32];
     size_t size = 0, capacity, on_disk;
-    uint64_t begin_ns;
+    uint64_t begin_ns, end_ns;
     void *data = NULL;
     bool ok = false;
     FILE *file;
@@ -3442,12 +3442,14 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
     }
     if (ok)
         cache->driver_saved_size = size;
+    end_ns = vkd3d_get_current_time_ns();
     INFO("%s driver cache %s, %zu bytes, in %.3f ms.\n", ok ? "Saved" : "Failed to save", cache->driver_path, size,
-            1e-6 * (double)(vkd3d_get_current_time_ns() - begin_ns));
+            1e-6 * (double)(end_ns - begin_ns));
     if (cache->driver_log)
     {
-        fprintf(cache->driver_log, "# %.3f %s %zu bytes\n", 1e-6 * (double)(begin_ns - cache->driver_log_begin_ns),
-                ok ? "saved" : "save failed", size);
+        fprintf(cache->driver_log, "# %.3f %s %zu bytes in %.3f ms\n",
+                1e-6 * (double)(begin_ns - cache->driver_log_begin_ns), ok ? "saved" : "save failed", size,
+                1e-6 * (double)(end_ns - begin_ns));
         fflush(cache->driver_log);
     }
 
@@ -3496,6 +3498,10 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
     INFO("Driver cache %s: %zu bytes loaded in %.3f ms.\n", cache->driver_path, size,
             1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
 
+    /* The pipeline log is opt-in, so one build serves lab diagnosis and production. Without it no creation
+     * feedback is chained and each creation costs one clock read. */
+    if (!vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_PSO_LOG", 0))
+        return;
     snprintf(log_path, sizeof(log_path), "%s.pso-log.txt", cache->read_path);
     if ((cache->driver_log = fopen(log_path, "a")))
     {

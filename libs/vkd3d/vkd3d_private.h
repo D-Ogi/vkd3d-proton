@@ -2739,8 +2739,9 @@ void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_di
  * lost when the process is killed before its final Release. */
 void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk_cache *cache);
 
-/* amdgpu-wddm diagnostic: logs every pipeline creation with its create path, the driver's cache hit flag
- * (VK_EXT_pipeline_creation_feedback) and hashes that identify it across processes, to <archive>.pso-log.txt. */
+/* amdgpu-wddm diagnostic, with AMDGPU_WDDM_VKD3D_PSO_LOG=1: logs every pipeline creation with its create path, the
+ * driver's cache hit flag (VK_EXT_pipeline_creation_feedback) and hashes that identify it across processes, to
+ * <archive>.pso-log.txt. */
 struct vkd3d_driver_cache_probe
 {
     VkPipelineCreationFeedbackCreateInfo info;
