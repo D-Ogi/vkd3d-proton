@@ -3260,6 +3260,10 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_
 #define VKD3D_DRIVER_CACHE_SAVE_PIPELINES 64
 #define VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS (30ull * 1000000000ull)
 #define VKD3D_DRIVER_CACHE_IDLE_NS (2ull * 1000000000ull)
+/* The pipeline log's pending lines are queued for writing once this much is pending, or on a submission once the
+ * oldest of them is this old. */
+#define VKD3D_DRIVER_CACHE_LOG_FLUSH_SIZE (64u << 10)
+#define VKD3D_DRIVER_CACHE_LOG_FLUSH_NS (1000000000ull)
 
 struct vkd3d_driver_cache_header
 {
@@ -3309,23 +3313,27 @@ static void vkd3d_driver_cache_fill_header(struct vkd3d_driver_cache_header *hea
     header->checksum = checksum;
 }
 
-/* Reads the header of an open driver cache file; true when this device may use its data. */
-static bool vkd3d_driver_cache_read_header(FILE *file, struct d3d12_device *device,
+/* Reads the header of an open driver cache file; true when its data is for the driver, driver version and GPU of
+ * expected (a header of vkd3d_driver_cache_fill_header). The engine build, data size and checksum are the file's.
+ * Needs no device, so that a job (vkd3d_driver_cache_run_save) can check a file after the device is gone. */
+static bool vkd3d_driver_cache_read_header(FILE *file, const struct vkd3d_driver_cache_header *expected,
         struct vkd3d_driver_cache_header *header)
 {
-    struct vkd3d_driver_cache_header expected;
+    struct vkd3d_driver_cache_header match;
 
     if (fread(header, sizeof(*header), 1, file) != 1)
         return false;
-    vkd3d_driver_cache_fill_header(&expected, device, header->data_size, header->checksum);
-    expected.vkd3d_build = header->vkd3d_build;
-    return !memcmp(header, &expected, sizeof(*header)) &&
+    match = *expected;
+    match.vkd3d_build = header->vkd3d_build;
+    match.data_size = header->data_size;
+    match.checksum = header->checksum;
+    return !memcmp(header, &match, sizeof(*header)) &&
             header->data_size >= sizeof(VkPipelineCacheHeaderVersionOne) &&
             header->data_size <= VKD3D_DRIVER_CACHE_MAX_SIZE;
 }
 
-/* The data size of the file at path when this device may use it, else 0. */
-static size_t vkd3d_driver_cache_file_size(const char *path, struct d3d12_device *device)
+/* The data size of the file at path when it is for the driver and GPU of expected, else 0. */
+static size_t vkd3d_driver_cache_file_size(const char *path, const struct vkd3d_driver_cache_header *expected)
 {
     struct vkd3d_driver_cache_header header;
     size_t size = 0;
@@ -3333,7 +3341,7 @@ static size_t vkd3d_driver_cache_file_size(const char *path, struct d3d12_device
 
     if ((file = fopen(path, "rb")))
     {
-        if (vkd3d_driver_cache_read_header(file, device, &header))
+        if (vkd3d_driver_cache_read_header(file, expected, &header))
             size = header.data_size;
         fclose(file);
     }
@@ -3352,7 +3360,7 @@ static void *vkd3d_driver_cache_read(const char *path, struct d3d12_device *devi
         return NULL;
 
     vkd3d_driver_cache_fill_header(&expected, device, 0, 0);
-    if (!vkd3d_driver_cache_read_header(file, device, &header))
+    if (!vkd3d_driver_cache_read_header(file, &expected, &header))
     {
         INFO("Driver cache %s is from another driver or GPU, ignoring it.\n", path);
         goto out;
@@ -3391,81 +3399,294 @@ static unsigned long vkd3d_driver_cache_pid(void)
 #endif
 }
 
-/* Writes the whole VkPipelineCache to a temporary file and renames it over driver_path, when it grew since it was
- * loaded or last saved (the cache only grows) and no file this device may use holds at least as much. A device
- * that created nothing new, such as a short-lived probe device, so never replaces a warm file. */
+/* The driver cache's file work, off the engine caller's thread. The caller does what needs the device
+ * (vkGetPipelineCacheData, the expected header) and queues a job that owns copies of all it needs. A job makes no
+ * Vulkan call and holds no reference to the device, which may be gone, and this module released by the embedder's
+ * FreeLibrary, before the job runs. On Windows one work item of the process thread pool at a time runs the queued
+ * jobs in order. It holds a reference to this module until it returns (FreeLibraryWhenCallbackReturns), so neither
+ * a device's final Release nor FreeLibrary waits for the disk, and the module is never unmapped under a job. A
+ * process that exits first loses the queued jobs, as it would lose a save it never reached: the file is only ever
+ * replaced by a rename, never left half written. Without a work item (not Windows, or a failed submission) the jobs
+ * run on the calling thread. The device starts no thread of its own for this (V7): the work item belongs to the
+ * process's thread pool. */
+struct vkd3d_driver_cache_job
+{
+    struct vkd3d_driver_cache_job *next;
+    /* A save when data is set: header and data go to path unless the file there holds at least as much. A drop
+     * deletes path. */
+    char path[VKD3D_PATH_MAX];
+    struct vkd3d_driver_cache_header header;
+    void *data;
+    bool drop;
+    uint32_t sequence;
+    uint64_t save_begin_ns;
+    double caller_ms;
+    /* Pipeline log lines to append to log_path, then a line on the save when log_save is set. */
+    char log_path[VKD3D_PATH_MAX + 32];
+    char *log_text;
+    size_t log_size;
+    bool log_save;
+    uint64_t log_begin_ns;
+};
+
+/* Zero is SRWLOCK_INIT. pending_saves counts saves queued and not yet run, of every device in the process. */
+static struct
+{
+#ifdef _WIN32
+    SRWLOCK lock;
+    struct vkd3d_driver_cache_job *head, *tail;
+    bool draining;
+#endif
+    uint32_t pending_saves;
+    uint32_t sequence;
+} vkd3d_driver_cache_jobs;
+
+static void vkd3d_driver_cache_free_job(struct vkd3d_driver_cache_job *job)
+{
+    vkd3d_free(job->data);
+    vkd3d_free(job->log_text);
+    vkd3d_free(job);
+}
+
+/* Writes the data to a temporary file and renames it over the path, unless the file there already holds at least
+ * as much (another process, or an earlier job of this one, may have saved more meanwhile). So a device that created
+ * nothing new, such as a short-lived probe device, never replaces a warm file. */
+static void vkd3d_driver_cache_run_save(struct vkd3d_driver_cache_job *job, char *outcome, size_t outcome_size)
+{
+    size_t size = job->header.data_size;
+    char tmp_path[VKD3D_PATH_MAX + 48];
+    bool ok = false;
+    size_t on_disk;
+    FILE *file;
+
+    if (job->drop)
+    {
+        vkd3d_file_delete(job->path);
+        snprintf(outcome, outcome_size, "dropped at %zu bytes", size);
+        return;
+    }
+    if ((on_disk = vkd3d_driver_cache_file_size(job->path, &job->header)) >= size)
+    {
+        snprintf(outcome, outcome_size, "kept %zu bytes on disk over %zu", on_disk, size);
+        return;
+    }
+    job->header.checksum = vkd3d_driver_cache_checksum(job->data, size);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.%u.tmp", job->path, vkd3d_driver_cache_pid(), job->sequence);
+    if ((file = fopen(tmp_path, "wb")))
+    {
+        ok = fwrite(&job->header, sizeof(job->header), 1, file) == 1 && fwrite(job->data, 1, size, file) == size;
+        ok = !fclose(file) && ok;
+        ok = ok && vkd3d_file_rename_overwrite(tmp_path, job->path);
+        if (!ok)
+            vkd3d_file_delete(tmp_path);
+    }
+    snprintf(outcome, outcome_size, "%s %zu bytes", ok ? "saved" : "save failed", size);
+}
+
+static void vkd3d_driver_cache_run_job(struct vkd3d_driver_cache_job *job)
+{
+    uint64_t begin_ns = 0, end_ns = 0;
+    char outcome[96] = "";
+    FILE *log;
+
+    if (job->data || job->drop)
+    {
+        begin_ns = vkd3d_get_current_time_ns();
+        vkd3d_driver_cache_run_save(job, outcome, sizeof(outcome));
+        end_ns = vkd3d_get_current_time_ns();
+        INFO("Driver cache %s: %s, %.3f ms on the calling thread, %.3f ms in a job.\n", job->path, outcome,
+                job->caller_ms, 1e-6 * (double)(end_ns - begin_ns));
+        vkd3d_atomic_uint32_decrement(&vkd3d_driver_cache_jobs.pending_saves, vkd3d_memory_order_release);
+    }
+    if ((!job->log_size && !job->log_save) || !(log = fopen(job->log_path, "a")))
+        return;
+    if (job->log_size)
+        fwrite(job->log_text, 1, job->log_size, log);
+    /* Starts like the line of the synchronous save ("# ms saved N bytes in T ms"), T now the calling thread's. */
+    if (job->log_save)
+        fprintf(log, "# %.3f %s in %.3f ms, written in %.3f ms by a job\n",
+                1e-6 * (double)(job->save_begin_ns - job->log_begin_ns), outcome, job->caller_ms,
+                1e-6 * (double)(end_ns - begin_ns));
+    fclose(log);
+}
+
+#ifdef _WIN32
+/* Runs the queued jobs in order until there are none. */
+static void vkd3d_driver_cache_drain(void)
+{
+    struct vkd3d_driver_cache_job *job;
+
+    for (;;)
+    {
+        AcquireSRWLockExclusive(&vkd3d_driver_cache_jobs.lock);
+        if (!(job = vkd3d_driver_cache_jobs.head))
+            vkd3d_driver_cache_jobs.draining = false;
+        else if (!(vkd3d_driver_cache_jobs.head = job->next))
+            vkd3d_driver_cache_jobs.tail = NULL;
+        ReleaseSRWLockExclusive(&vkd3d_driver_cache_jobs.lock);
+        if (!job)
+            return;
+        vkd3d_driver_cache_run_job(job);
+        vkd3d_driver_cache_free_job(job);
+    }
+}
+
+static void CALLBACK vkd3d_driver_cache_work(PTP_CALLBACK_INSTANCE instance, void *module)
+{
+    /* The reference taken at submission goes once this returns, not before. */
+    FreeLibraryWhenCallbackReturns(instance, module);
+    vkd3d_driver_cache_drain();
+}
+#endif
+
+/* Takes ownership of job. Never waits for the disk, unless no work item can be had. */
+static void vkd3d_driver_cache_queue_job(struct vkd3d_driver_cache_job *job)
+{
+#ifdef _WIN32
+    HMODULE module;
+    bool start;
+#endif
+
+    if (job->data || job->drop)
+        vkd3d_atomic_uint32_increment(&vkd3d_driver_cache_jobs.pending_saves, vkd3d_memory_order_relaxed);
+#ifdef _WIN32
+    job->next = NULL;
+    AcquireSRWLockExclusive(&vkd3d_driver_cache_jobs.lock);
+    if (vkd3d_driver_cache_jobs.tail)
+        vkd3d_driver_cache_jobs.tail->next = job;
+    else
+        vkd3d_driver_cache_jobs.head = job;
+    vkd3d_driver_cache_jobs.tail = job;
+    start = !vkd3d_driver_cache_jobs.draining;
+    vkd3d_driver_cache_jobs.draining = true;
+    ReleaseSRWLockExclusive(&vkd3d_driver_cache_jobs.lock);
+    if (!start)
+        return;
+    /* A reference to the module that holds this code, named by an address in it. */
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&vkd3d_driver_cache_jobs, &module))
+    {
+        if (TrySubmitThreadpoolCallback(vkd3d_driver_cache_work, module, NULL))
+            return;
+        FreeLibrary(module);
+    }
+    WARN("No thread pool work item, writing the driver cache on this thread.\n");
+    vkd3d_driver_cache_drain();
+#else
+    vkd3d_driver_cache_run_job(job);
+    vkd3d_driver_cache_free_job(job);
+#endif
+}
+
+/* Moves the pending pipeline log lines into job. */
+static void vkd3d_driver_cache_take_log(struct vkd3d_pipeline_library_disk_cache *cache,
+        struct vkd3d_driver_cache_job *job)
+{
+    vkd3d_strlcpy(job->log_path, sizeof(job->log_path), cache->driver_log_path);
+    job->log_begin_ns = cache->driver_log_begin_ns;
+    pthread_mutex_lock(&cache->driver_log_lock);
+    job->log_text = cache->driver_log_text;
+    job->log_size = cache->driver_log_size;
+    cache->driver_log_text = NULL;
+    cache->driver_log_size = 0;
+    cache->driver_log_capacity = 0;
+    pthread_mutex_unlock(&cache->driver_log_lock);
+}
+
+/* Queues the pending pipeline log lines on their own. */
+static void vkd3d_driver_cache_flush_log(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    struct vkd3d_driver_cache_job *job;
+
+    if (!(job = vkd3d_calloc(1, sizeof(*job))))
+        return;
+    vkd3d_driver_cache_take_log(cache, job);
+    if (job->log_size)
+        vkd3d_driver_cache_queue_job(job);
+    else
+        vkd3d_driver_cache_free_job(job);
+}
+
+/* Adds a line to the pipeline log; queues the pending lines once VKD3D_DRIVER_CACHE_LOG_FLUSH_SIZE are pending. */
+static void vkd3d_driver_cache_log(struct vkd3d_pipeline_library_disk_cache *cache, const char *line)
+{
+    size_t length = strlen(line);
+    bool flush;
+
+    pthread_mutex_lock(&cache->driver_log_lock);
+    if (vkd3d_array_reserve((void **)&cache->driver_log_text, &cache->driver_log_capacity,
+            cache->driver_log_size + length, 1))
+    {
+        if (!cache->driver_log_size)
+            cache->driver_log_pending_ns = vkd3d_get_current_time_ns();
+        memcpy(cache->driver_log_text + cache->driver_log_size, line, length);
+        cache->driver_log_size += length;
+    }
+    flush = cache->driver_log_size >= VKD3D_DRIVER_CACHE_LOG_FLUSH_SIZE;
+    pthread_mutex_unlock(&cache->driver_log_lock);
+    if (flush)
+        vkd3d_driver_cache_flush_log(cache);
+}
+
+/* Takes the whole VkPipelineCache on the calling thread, when it grew since it was loaded or last queued for
+ * saving (the cache only grows), and queues its write (vkd3d_driver_cache_run_save). A write that then fails is
+ * tried again only once the cache grows further. */
 static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    struct vkd3d_driver_cache_header header;
-    char tmp_path[VKD3D_PATH_MAX + 32];
-    size_t size = 0, capacity, on_disk;
-    uint64_t begin_ns, end_ns;
-    void *data = NULL;
-    bool ok = false;
-    FILE *file;
+    struct vkd3d_driver_cache_job *job;
+    size_t size = 0, capacity;
+    uint64_t begin_ns;
     VkResult vr;
 
     begin_ns = vkd3d_get_current_time_ns();
     if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, NULL))) ||
             size <= max(cache->driver_saved_size, sizeof(VkPipelineCacheHeaderVersionOne)))
         return;
-    if ((on_disk = vkd3d_driver_cache_file_size(cache->driver_path, device)) >= size)
-    {
-        INFO("Driver cache %s already holds %zu bytes, keeping it over %zu.\n", cache->driver_path, on_disk, size);
-        cache->driver_saved_size = size;
+    if (!(job = vkd3d_calloc(1, sizeof(*job))))
         return;
-    }
     if (size > VKD3D_DRIVER_CACHE_MAX_SIZE)
     {
         /* Start over next time rather than keep a cache that can no longer be saved. */
         WARN("Driver cache of %zu bytes exceeds the bound, dropping %s.\n", size, cache->driver_path);
-        vkd3d_file_delete(cache->driver_path);
-        return;
+        job->drop = true;
     }
-    /* Other threads may add pipelines between the two calls. */
-    capacity = size + size / 8 + (1u << 20);
-    if (!(data = vkd3d_malloc(capacity)))
-        return;
-    size = capacity;
-    if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, data))))
+    else
     {
-        WARN("vkGetPipelineCacheData failed, vr %d.\n", vr);
-        goto out;
+        /* Other threads may add pipelines between the two calls. */
+        capacity = size + size / 8 + (1u << 20);
+        if (!(job->data = vkd3d_malloc(capacity)))
+            goto fail;
+        size = capacity;
+        if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, job->data))))
+        {
+            WARN("vkGetPipelineCacheData failed, vr %d.\n", vr);
+            goto fail;
+        }
     }
-
-    vkd3d_driver_cache_fill_header(&header, device, size, vkd3d_driver_cache_checksum(data, size));
-    snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.tmp", cache->driver_path, vkd3d_driver_cache_pid());
-    if ((file = fopen(tmp_path, "wb")))
-    {
-        ok = fwrite(&header, sizeof(header), 1, file) == 1 && fwrite(data, 1, size, file) == size;
-        ok = !fclose(file) && ok;
-        ok = ok && vkd3d_file_rename_overwrite(tmp_path, cache->driver_path);
-        if (!ok)
-            vkd3d_file_delete(tmp_path);
-    }
-    if (ok)
-        cache->driver_saved_size = size;
-    end_ns = vkd3d_get_current_time_ns();
-    INFO("%s driver cache %s, %zu bytes, in %.3f ms.\n", ok ? "Saved" : "Failed to save", cache->driver_path, size,
-            1e-6 * (double)(end_ns - begin_ns));
+    cache->driver_saved_size = size;
+    /* The checksum is the job's. */
+    vkd3d_driver_cache_fill_header(&job->header, device, size, 0);
+    vkd3d_strlcpy(job->path, sizeof(job->path), cache->driver_path);
+    job->sequence = vkd3d_atomic_uint32_increment(&vkd3d_driver_cache_jobs.sequence, vkd3d_memory_order_relaxed);
+    job->save_begin_ns = begin_ns;
+    job->caller_ms = 1e-6 * (double)(vkd3d_get_current_time_ns() - begin_ns);
     if (cache->driver_log)
     {
-        fprintf(cache->driver_log, "# %.3f %s %zu bytes in %.3f ms\n",
-                1e-6 * (double)(begin_ns - cache->driver_log_begin_ns), ok ? "saved" : "save failed", size,
-                1e-6 * (double)(end_ns - begin_ns));
-        fflush(cache->driver_log);
+        vkd3d_driver_cache_take_log(cache, job);
+        job->log_save = true;
     }
+    vkd3d_driver_cache_queue_job(job);
+    return;
 
-out:
-    vkd3d_free(data);
+fail:
+    vkd3d_driver_cache_free_job(job);
 }
 
 static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    char log_path[VKD3D_PATH_MAX + 32];
     VkPipelineCacheCreateInfo info;
+    char line[160];
     size_t size = 0;
     uint64_t begin_ns;
     void *data;
@@ -3503,31 +3724,32 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
             1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
 
     /* The pipeline log is opt-in, so one build serves lab diagnosis and production. Without it no creation
-     * feedback is chained and each creation costs one clock read. */
-    if (!vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_PSO_LOG", 0))
+     * feedback is chained and each creation costs one clock read. With it the file is opened by the jobs only. */
+    if (!vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_PSO_LOG", 0) || pthread_mutex_init(&cache->driver_log_lock, NULL))
         return;
-    snprintf(log_path, sizeof(log_path), "%s.pso-log.txt", cache->read_path);
-    if ((cache->driver_log = fopen(log_path, "a")))
-    {
-        cache->driver_log_begin_ns = begin_ns;
-        fprintf(cache->driver_log, "# pid %lu, driver cache %zu bytes loaded; ms tid path outcome vr driver_us "
-                "wall_us pso stages key\n", vkd3d_driver_cache_pid(), size);
-        fflush(cache->driver_log);
-    }
+    snprintf(cache->driver_log_path, sizeof(cache->driver_log_path), "%s.pso-log.txt", cache->read_path);
+    cache->driver_log_begin_ns = begin_ns;
+    cache->driver_log = true;
+    snprintf(line, sizeof(line), "# pid %lu, driver cache %zu bytes loaded; ms tid path outcome vr driver_us "
+            "wall_us pso stages key\n", vkd3d_driver_cache_pid(), size);
+    vkd3d_driver_cache_log(cache, line);
 }
 
-/* Saves on the calling thread. During a burst (idle_ns 0) only when at least VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS
- * passed since the last save, so a long burst is not slowed by a save every few pipelines. After a burst as soon as
- * no pipeline was created for idle_ns, however recent the last save: a game killed by its harness loses only what
- * it created in its last idle_ns. (A game in a lab trial created 18 pipelines in the 2.4 s after a save and was
- * killed some 20 s later, before the interval allowed the next save; the next run compiled them again.) One saver
- * at a time; the others go on. */
+/* Saves from the calling thread: the snapshot there, the file by a job. During a burst (idle_ns 0) only when at
+ * least VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS passed since the last save, so a long burst is not slowed by a snapshot
+ * every few pipelines. After a burst as soon as no pipeline was created for idle_ns, however recent the last save:
+ * a game killed by its harness loses only what it created in its last idle_ns. (A game in a lab trial created 18
+ * pipelines in the 2.4 s after a save and was killed some 20 s later, before the interval allowed the next save;
+ * the next run compiled them again.) One saver at a time; the others go on. While a save of any device of the
+ * process is still queued, the next one waits for a later call, so a slow disk never piles up copies of the
+ * cache in memory. */
 static void vkd3d_driver_cache_try_save(struct vkd3d_pipeline_library_disk_cache *cache, uint64_t idle_ns)
 {
     uint64_t now_ns;
     bool due;
 
-    if (vkd3d_atomic_uint32_compare_exchange(&cache->driver_saving, 0, 1,
+    if (vkd3d_atomic_uint32_load_explicit(&vkd3d_driver_cache_jobs.pending_saves, vkd3d_memory_order_acquire) ||
+            vkd3d_atomic_uint32_compare_exchange(&cache->driver_saving, 0, 1,
             vkd3d_memory_order_acquire, vkd3d_memory_order_relaxed) != 0)
         return;
     now_ns = vkd3d_get_current_time_ns();
@@ -3556,19 +3778,33 @@ void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_di
     if (vkd3d_atomic_uint32_increment(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed) <
             VKD3D_DRIVER_CACHE_SAVE_PIPELINES)
         return;
-    /* During a long burst of creation: the save runs on this, the creating, thread. */
+    /* During a long burst of creation: the snapshot is taken on this, the creating, thread. */
     vkd3d_driver_cache_try_save(cache, 0);
+}
+
+/* Whether the oldest pending pipeline log line is VKD3D_DRIVER_CACHE_LOG_FLUSH_NS old. */
+static bool vkd3d_driver_cache_log_due(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    bool due;
+
+    pthread_mutex_lock(&cache->driver_log_lock);
+    due = cache->driver_log_size &&
+            vkd3d_get_current_time_ns() - cache->driver_log_pending_ns >= VKD3D_DRIVER_CACHE_LOG_FLUSH_NS;
+    pthread_mutex_unlock(&cache->driver_log_lock);
+    return due;
 }
 
 void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk_cache *cache)
 {
+    if (!cache->vk_pipeline_cache)
+        return;
     /* After a burst: a game that is killed rather than closed never reaches the final Release, and a burst of
      * fewer than VKD3D_DRIVER_CACHE_SAVE_PIPELINES, or the tail of a longer one, would otherwise never be saved.
      * A save that finds no growth (only cache hits since the last one) costs a size query. */
-    if (!cache->vk_pipeline_cache ||
-            !vkd3d_atomic_uint32_load_explicit(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed))
-        return;
-    vkd3d_driver_cache_try_save(cache, VKD3D_DRIVER_CACHE_IDLE_NS);
+    if (vkd3d_atomic_uint32_load_explicit(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed))
+        vkd3d_driver_cache_try_save(cache, VKD3D_DRIVER_CACHE_IDLE_NS);
+    if (cache->driver_log && vkd3d_driver_cache_log_due(cache))
+        vkd3d_driver_cache_flush_log(cache);
 }
 
 static const void *vkd3d_driver_cache_find_struct(const void *chain, VkStructureType type)
@@ -3691,12 +3927,14 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
             1e-6 * (double)(probe->begin_ns - cache->driver_log_begin_ns), vkd3d_get_current_thread_id(),
             path, outcome, vr, probe->result->duration / 1000, (end_ns - probe->begin_ns) / 1000, pso_hash,
             vkd3d_driver_cache_hash_stages(cache->library->device, stage_count, stages), key_text);
-    /* One write and a flush per line: the CRT locks the stream, and a killed game keeps what it logged. */
-    fputs(line, cache->driver_log);
-    fflush(cache->driver_log);
+    /* The lines reach the file in order through the driver cache's jobs: once VKD3D_DRIVER_CACHE_LOG_FLUSH_SIZE are
+     * pending, on a submission once the oldest is VKD3D_DRIVER_CACHE_LOG_FLUSH_NS old, with a save, and at the final
+     * Release. A killed game loses the lines since then. */
+    vkd3d_driver_cache_log(cache, line);
 }
 
-/* The device's final Release: no pipeline creation is in flight. */
+/* The device's final Release: no pipeline creation is in flight. It queues the last save and log lines and waits
+ * for neither, nor for any job still queued; the jobs own their data. */
 static void vkd3d_driver_cache_cleanup(struct vkd3d_pipeline_library_disk_cache *cache)
 {
     const struct vkd3d_vk_device_procs *vk_procs;
@@ -3712,8 +3950,11 @@ static void vkd3d_driver_cache_cleanup(struct vkd3d_pipeline_library_disk_cache 
     cache->vk_pipeline_cache = VK_NULL_HANDLE;
     if (cache->driver_log)
     {
-        fclose(cache->driver_log);
-        cache->driver_log = NULL;
+        vkd3d_driver_cache_flush_log(cache);
+        vkd3d_free(cache->driver_log_text);
+        cache->driver_log_text = NULL;
+        pthread_mutex_destroy(&cache->driver_log_lock);
+        cache->driver_log = false;
     }
 }
 

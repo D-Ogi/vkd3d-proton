@@ -2623,7 +2623,9 @@ struct vkd3d_pipeline_library_disk_cache
      * from driver_path at device creation and saved by the thread that creates a pipeline (at most every
      * VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS, after VKD3D_DRIVER_CACHE_SAVE_PIPELINES created ones), by a submitting
      * thread once no pipeline was created for VKD3D_DRIVER_CACHE_IDLE_NS, and by the device's final Release, and
-     * only when the cache grew past driver_saved_size (the data loaded or last saved). VK_NULL_HANDLE otherwise. */
+     * only when the cache grew past driver_saved_size (the data loaded or last queued for saving).
+     * VK_NULL_HANDLE otherwise. A save takes the data on that thread and leaves the file to a job
+     * (vkd3d_driver_cache_queue_job in cache.c), so no engine caller waits for the disk. */
     VkPipelineCache vk_pipeline_cache;
     char driver_path[VKD3D_PATH_MAX];
     size_t driver_saved_size;
@@ -2631,9 +2633,16 @@ struct vkd3d_pipeline_library_disk_cache
     uint32_t driver_saving;
     uint64_t driver_last_save_ns;
     uint64_t driver_last_pipeline_ns;
-    /* amdgpu-wddm diagnostic: one line per pipeline creation, see vkd3d_driver_cache_probe_end. */
-    FILE *driver_log;
+    /* amdgpu-wddm diagnostic: one line per pipeline creation, see vkd3d_driver_cache_probe_end. The lines collect
+     * in driver_log_text under driver_log_lock and go to driver_log_path by the same jobs as the saves. */
+    bool driver_log;
+    pthread_mutex_t driver_log_lock;
+    char driver_log_path[VKD3D_PATH_MAX + 32];
+    char *driver_log_text;
+    size_t driver_log_size;
+    size_t driver_log_capacity;
     uint64_t driver_log_begin_ns;
+    uint64_t driver_log_pending_ns;
 };
 
 struct d3d12_pipeline_library
@@ -2732,16 +2741,18 @@ static inline VkPipelineCache vkd3d_pipeline_library_driver_cache(const struct v
 {
     return vk_cache ? vk_cache : cache->vk_pipeline_cache;
 }
-/* amdgpu-wddm fork: a pipeline was created with the driver cache. May save the driver cache on the calling thread. */
+/* amdgpu-wddm fork: a pipeline was created with the driver cache. May take a snapshot of the driver cache on the
+ * calling thread and queue its write. */
 void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache);
-/* amdgpu-wddm fork: called on every submission; saves the driver cache on the calling thread when pipelines were
- * created since the last save and none for VKD3D_DRIVER_CACHE_IDLE_NS, however recent that save, so a burst is not
- * lost when the process is killed before its final Release. */
+/* amdgpu-wddm fork: called on every submission; takes a snapshot of the driver cache on the calling thread and
+ * queues its write when pipelines were created since the last save and none for VKD3D_DRIVER_CACHE_IDLE_NS,
+ * however recent that save, so a burst is not lost when the process is killed before its final Release. Also
+ * queues pipeline log lines older than VKD3D_DRIVER_CACHE_LOG_FLUSH_NS. */
 void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk_cache *cache);
 
 /* amdgpu-wddm diagnostic, with AMDGPU_WDDM_VKD3D_PSO_LOG=1: logs every pipeline creation with its create path, the
  * driver's cache hit flag (VK_EXT_pipeline_creation_feedback) and hashes that identify it across processes, to
- * <archive>.pso-log.txt. */
+ * <archive>.pso-log.txt, written by the driver cache's jobs. */
 struct vkd3d_driver_cache_probe
 {
     VkPipelineCreationFeedbackCreateInfo info;
