@@ -23953,6 +23953,9 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
     if (!command_list_count)
         return;
 
+    /* amdgpu-wddm fork: may save the persisted driver cache on this thread once pipeline creation went quiet. */
+    vkd3d_pipeline_library_driver_cache_idle(&command_queue->device->disk_cache);
+
     if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
     {
         d3d12_device_mark_as_removed(command_queue->device, hr,

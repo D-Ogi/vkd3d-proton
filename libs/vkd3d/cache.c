@@ -3256,6 +3256,7 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_
 #define VKD3D_DRIVER_CACHE_MAX_SIZE (512u << 20)
 #define VKD3D_DRIVER_CACHE_SAVE_PIPELINES 64
 #define VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS (30ull * 1000000000ull)
+#define VKD3D_DRIVER_CACHE_IDLE_NS (2ull * 1000000000ull)
 
 struct vkd3d_driver_cache_header
 {
@@ -3484,31 +3485,50 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
             1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
 }
 
-void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache)
+/* Saves on the calling thread when at least VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS passed since the last save and, with
+ * idle_ns, no pipeline was created for that long. One saver at a time; the others go on. */
+static void vkd3d_driver_cache_try_save(struct vkd3d_pipeline_library_disk_cache *cache, uint64_t idle_ns)
 {
-    struct d3d12_device *device;
     uint64_t now_ns;
 
-    /* Every pipeline counts: one the archive knew may still be missing from the driver cache. The save itself
-     * checks for new data. */
-    if (!cache->vk_pipeline_cache)
-        return;
-    if (vkd3d_atomic_uint32_increment(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed) <
-            VKD3D_DRIVER_CACHE_SAVE_PIPELINES)
-        return;
-    /* One saver at a time; the others go on. The save runs on this, the creating, thread. */
     if (vkd3d_atomic_uint32_compare_exchange(&cache->driver_saving, 0, 1,
             vkd3d_memory_order_acquire, vkd3d_memory_order_relaxed) != 0)
         return;
     now_ns = vkd3d_get_current_time_ns();
-    if (now_ns - cache->driver_last_save_ns >= VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS)
+    if (now_ns - cache->driver_last_save_ns >= VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS &&
+            now_ns - vkd3d_atomic_uint64_load_explicit(&cache->driver_last_pipeline_ns,
+            vkd3d_memory_order_relaxed) >= idle_ns)
     {
         vkd3d_atomic_uint32_store_explicit(&cache->driver_new_pipelines, 0, vkd3d_memory_order_relaxed);
-        device = cache->library->device;
-        vkd3d_driver_cache_save(cache, device);
+        vkd3d_driver_cache_save(cache, cache->library->device);
         cache->driver_last_save_ns = vkd3d_get_current_time_ns();
     }
     vkd3d_atomic_uint32_store_explicit(&cache->driver_saving, 0, vkd3d_memory_order_release);
+}
+
+void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    /* Every pipeline counts: one the archive knew may still be missing from the driver cache. The save itself
+     * checks for new data. */
+    if (!cache->vk_pipeline_cache)
+        return;
+    vkd3d_atomic_uint64_store_explicit(&cache->driver_last_pipeline_ns, vkd3d_get_current_time_ns(),
+            vkd3d_memory_order_relaxed);
+    if (vkd3d_atomic_uint32_increment(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed) <
+            VKD3D_DRIVER_CACHE_SAVE_PIPELINES)
+        return;
+    /* During a long burst of creation: the save runs on this, the creating, thread. */
+    vkd3d_driver_cache_try_save(cache, 0);
+}
+
+void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    /* After a burst: a game that is killed rather than closed never reaches the final Release, and a burst of
+     * fewer than VKD3D_DRIVER_CACHE_SAVE_PIPELINES, or the tail of a longer one, would otherwise never be saved. */
+    if (!cache->vk_pipeline_cache ||
+            !vkd3d_atomic_uint32_load_explicit(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed))
+        return;
+    vkd3d_driver_cache_try_save(cache, VKD3D_DRIVER_CACHE_IDLE_NS);
 }
 
 /* The device's final Release: no pipeline creation is in flight. */

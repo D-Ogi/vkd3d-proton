@@ -2630,6 +2630,7 @@ struct vkd3d_pipeline_library_disk_cache
     uint32_t driver_new_pipelines;
     uint32_t driver_saving;
     uint64_t driver_last_save_ns;
+    uint64_t driver_last_pipeline_ns;
 };
 
 struct d3d12_pipeline_library
@@ -2730,6 +2731,10 @@ static inline VkPipelineCache vkd3d_pipeline_library_driver_cache(const struct v
 }
 /* amdgpu-wddm fork: a pipeline was created with the driver cache. May save the driver cache on the calling thread. */
 void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache);
+/* amdgpu-wddm fork: called on every submission; saves the driver cache on the calling thread when pipelines were
+ * created since the last save and none for VKD3D_DRIVER_CACHE_IDLE_NS, so a burst is not lost when the process is
+ * killed before its final Release. */
+void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk_cache *cache);
 
 struct vkd3d_buffer
 {
