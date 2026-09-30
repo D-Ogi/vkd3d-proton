@@ -7261,6 +7261,9 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
         return VK_NULL_HANDLE;
     }
 
+    /* amdgpu-wddm fork: a variant created at draw time also grows the driver cache. */
+    vkd3d_pipeline_library_driver_cache_notify(&device->disk_cache);
+
     if (d3d12_pipeline_state_put_pipeline_to_cache(state, &pipeline_key, vk_pipeline, *dynamic_state_flags))
         return vk_pipeline;
 

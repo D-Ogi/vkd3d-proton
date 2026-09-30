@@ -2621,9 +2621,9 @@ struct vkd3d_pipeline_library_disk_cache
     /* amdgpu-wddm fork: the driver's pipeline binaries across processes, when the embedder asks for it
      * (vkd3d_set_embedder_shader_cache_path). One VkPipelineCache for every pipeline the device creates, loaded
      * from driver_path at device creation and saved by the thread that creates a pipeline (at most every
-     * VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS, after VKD3D_DRIVER_CACHE_SAVE_PIPELINES created ones) and by the device's
-     * final Release, and only when the cache grew past driver_saved_size (the data loaded or last saved).
-     * VK_NULL_HANDLE otherwise. */
+     * VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS, after VKD3D_DRIVER_CACHE_SAVE_PIPELINES created ones), by a submitting
+     * thread once no pipeline was created for VKD3D_DRIVER_CACHE_IDLE_NS, and by the device's final Release, and
+     * only when the cache grew past driver_saved_size (the data loaded or last saved). VK_NULL_HANDLE otherwise. */
     VkPipelineCache vk_pipeline_cache;
     char driver_path[VKD3D_PATH_MAX];
     size_t driver_saved_size;
@@ -2735,8 +2735,8 @@ static inline VkPipelineCache vkd3d_pipeline_library_driver_cache(const struct v
 /* amdgpu-wddm fork: a pipeline was created with the driver cache. May save the driver cache on the calling thread. */
 void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache);
 /* amdgpu-wddm fork: called on every submission; saves the driver cache on the calling thread when pipelines were
- * created since the last save and none for VKD3D_DRIVER_CACHE_IDLE_NS, so a burst is not lost when the process is
- * killed before its final Release. */
+ * created since the last save and none for VKD3D_DRIVER_CACHE_IDLE_NS, however recent that save, so a burst is not
+ * lost when the process is killed before its final Release. */
 void vkd3d_pipeline_library_driver_cache_idle(struct vkd3d_pipeline_library_disk_cache *cache);
 
 /* amdgpu-wddm diagnostic: logs every pipeline creation with its create path, the driver's cache hit flag
