@@ -3250,7 +3250,7 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_
 }
 
 /* The driver cache file: this header, then vkGetPipelineCacheData's data. A new engine build, driver build
- * (pipelineCacheUUID; RADV derives it from its DLL's timestamp on Windows), driver version or GPU discards it. */
+ * (pipelineCacheUUID), driver version or GPU discards it. */
 #define VKD3D_DRIVER_CACHE_MAGIC MAKE_MAGIC('V','K','P','C')
 #define VKD3D_DRIVER_CACHE_VERSION 1
 #define VKD3D_DRIVER_CACHE_MAX_SIZE (512u << 20)
@@ -3305,6 +3305,36 @@ static void vkd3d_driver_cache_fill_header(struct vkd3d_driver_cache_header *hea
     header->checksum = checksum;
 }
 
+/* Reads the header of an open driver cache file; true when this device may use its data. */
+static bool vkd3d_driver_cache_read_header(FILE *file, struct d3d12_device *device,
+        struct vkd3d_driver_cache_header *header)
+{
+    struct vkd3d_driver_cache_header expected;
+
+    if (fread(header, sizeof(*header), 1, file) != 1)
+        return false;
+    vkd3d_driver_cache_fill_header(&expected, device, header->data_size, header->checksum);
+    return !memcmp(header, &expected, sizeof(*header)) &&
+            header->data_size >= sizeof(VkPipelineCacheHeaderVersionOne) &&
+            header->data_size <= VKD3D_DRIVER_CACHE_MAX_SIZE;
+}
+
+/* The data size of the file at path when this device may use it, else 0. */
+static size_t vkd3d_driver_cache_file_size(const char *path, struct d3d12_device *device)
+{
+    struct vkd3d_driver_cache_header header;
+    size_t size = 0;
+    FILE *file;
+
+    if ((file = fopen(path, "rb")))
+    {
+        if (vkd3d_driver_cache_read_header(file, device, &header))
+            size = header.data_size;
+        fclose(file);
+    }
+    return size;
+}
+
 /* The saved data, or NULL when there is none this device may use. */
 static void *vkd3d_driver_cache_read(const char *path, struct d3d12_device *device, size_t *size)
 {
@@ -3317,12 +3347,7 @@ static void *vkd3d_driver_cache_read(const char *path, struct d3d12_device *devi
         return NULL;
 
     vkd3d_driver_cache_fill_header(&expected, device, 0, 0);
-    if (fread(&header, sizeof(header), 1, file) != 1)
-        goto out;
-    expected.data_size = header.data_size;
-    expected.checksum = header.checksum;
-    if (memcmp(&header, &expected, sizeof(header)) || header.data_size < sizeof(vk_header) ||
-            header.data_size > VKD3D_DRIVER_CACHE_MAX_SIZE)
+    if (!vkd3d_driver_cache_read_header(file, device, &header))
     {
         INFO("Driver cache %s is from another engine, driver or GPU, ignoring it.\n", path);
         goto out;
@@ -3352,13 +3377,15 @@ out:
     return data;
 }
 
-/* Writes the whole VkPipelineCache to a temporary file and renames it over driver_path. */
+/* Writes the whole VkPipelineCache to a temporary file and renames it over driver_path, when it grew since it was
+ * loaded or last saved (the cache only grows) and no file this device may use holds at least as much. A device
+ * that created nothing new, such as a short-lived probe device, so never replaces a warm file. */
 static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_driver_cache_header header;
     char tmp_path[VKD3D_PATH_MAX + 32];
-    size_t size = 0, capacity;
+    size_t size = 0, capacity, on_disk;
     uint64_t begin_ns;
     void *data = NULL;
     bool ok = false;
@@ -3366,8 +3393,15 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
     VkResult vr;
 
     begin_ns = vkd3d_get_current_time_ns();
-    if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, NULL))) || !size)
+    if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, NULL))) ||
+            size <= max(cache->driver_saved_size, sizeof(VkPipelineCacheHeaderVersionOne)))
         return;
+    if ((on_disk = vkd3d_driver_cache_file_size(cache->driver_path, device)) >= size)
+    {
+        INFO("Driver cache %s already holds %zu bytes, keeping it over %zu.\n", cache->driver_path, on_disk, size);
+        cache->driver_saved_size = size;
+        return;
+    }
     if (size > VKD3D_DRIVER_CACHE_MAX_SIZE)
     {
         /* Start over next time rather than keep a cache that can no longer be saved. */
@@ -3400,6 +3434,8 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
         if (!ok)
             vkd3d_file_delete(tmp_path);
     }
+    if (ok)
+        cache->driver_saved_size = size;
     INFO("%s driver cache %s, %zu bytes, in %.3f ms.\n", ok ? "Saved" : "Failed to save", cache->driver_path, size,
             1e-6 * (double)(vkd3d_get_current_time_ns() - begin_ns));
 
@@ -3442,19 +3478,20 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
         return;
     }
 
-    cache->driver_cache_cold = !size;
+    cache->driver_saved_size = size;
     cache->driver_last_save_ns = vkd3d_get_current_time_ns();
     INFO("Driver cache %s: %zu bytes loaded in %.3f ms.\n", cache->driver_path, size,
             1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
 }
 
-void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache, bool new_pipeline)
+void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache)
 {
     struct d3d12_device *device;
     uint64_t now_ns;
 
-    /* A pipeline the archive already had is in a warm driver cache too; a cold one takes every pipeline. */
-    if (!cache->vk_pipeline_cache || (!new_pipeline && !cache->driver_cache_cold))
+    /* Every pipeline counts: one the archive knew may still be missing from the driver cache. The save itself
+     * checks for new data. */
+    if (!cache->vk_pipeline_cache)
         return;
     if (vkd3d_atomic_uint32_increment(&cache->driver_new_pipelines, vkd3d_memory_order_relaxed) <
             VKD3D_DRIVER_CACHE_SAVE_PIPELINES)

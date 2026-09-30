@@ -2623,7 +2623,7 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
     }
 
     if (vr == VK_SUCCESS)
-        vkd3d_pipeline_library_driver_cache_notify(&object->device->disk_cache, true);
+        vkd3d_pipeline_library_driver_cache_notify(&object->device->disk_cache);
 
     for (i = 0; i < scratch_allocs_count; i++)
         vkd3d_free(scratch_allocs[i]);

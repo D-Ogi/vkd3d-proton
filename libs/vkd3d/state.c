@@ -6586,7 +6586,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     }
 
     /* amdgpu-wddm fork: may save the persisted driver cache on this thread. */
-    vkd3d_pipeline_library_driver_cache_notify(&device->disk_cache, !desc_cached_pso->blob.CachedBlobSizeInBytes);
+    vkd3d_pipeline_library_driver_cache_notify(&device->disk_cache);
 
     TRACE("Created pipeline state %p.\n", object);
 
