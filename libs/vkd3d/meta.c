@@ -1766,9 +1766,12 @@ static void vkd3d_multi_dispatch_indirect_ops_cleanup(
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VK_CALL(vkDestroyPipeline(device->vk_device,
+            meta_multi_dispatch_indirect_ops->vk_multi_trace_rays_indirect_pipeline, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device,
             meta_multi_dispatch_indirect_ops->vk_multi_dispatch_indirect_pipeline, NULL));
     VK_CALL(vkDestroyPipelineLayout(device->vk_device,
             meta_multi_dispatch_indirect_ops->vk_multi_dispatch_indirect_layout, NULL));
+    pthread_mutex_destroy(&meta_multi_dispatch_indirect_ops->mutex);
 }
 
 static HRESULT vkd3d_multi_dispatch_indirect_ops_init(
@@ -1777,8 +1780,13 @@ static HRESULT vkd3d_multi_dispatch_indirect_ops_init(
 {
     VkPushConstantRange push_constant_range;
     VkResult vr;
+    int rc;
 
     memset(meta_multi_dispatch_indirect_ops, 0, sizeof(*meta_multi_dispatch_indirect_ops));
+    /* Before any failure path: the cleanup destroys the mutex. */
+    if ((rc = pthread_mutex_init(&meta_multi_dispatch_indirect_ops->mutex, NULL)))
+        return hresult_from_errno(rc);
+
     push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     push_constant_range.offset = 0;
     push_constant_range.size = sizeof(struct vkd3d_multi_dispatch_indirect_args);
@@ -1900,6 +1908,41 @@ void vkd3d_meta_get_multi_dispatch_indirect_pipeline(struct vkd3d_meta_ops *meta
 {
     info->vk_pipeline = meta_ops->multi_dispatch_indirect.vk_multi_dispatch_indirect_pipeline;
     info->vk_pipeline_layout = meta_ops->multi_dispatch_indirect.vk_multi_dispatch_indirect_layout;
+}
+
+/* amdgpu-wddm fork: the pipeline that compacts DISPATCH_RAYS records against a count buffer
+ * (d3d12_command_list_emit_multi_trace_rays_indirect_count), created on the first call. It shares the multi
+ * dispatch layout: the push constants (struct vkd3d_multi_dispatch_indirect_args) are the same. */
+HRESULT vkd3d_meta_get_multi_trace_rays_indirect_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_multi_dispatch_indirect_info *info)
+{
+    struct vkd3d_multi_dispatch_indirect_ops *ops = &meta_ops->multi_dispatch_indirect;
+    HRESULT hr = S_OK;
+    VkResult vr;
+    int rc;
+
+    if ((rc = pthread_mutex_lock(&ops->mutex)))
+    {
+        ERR("Failed to lock mutex, error %d.\n", rc);
+        return hresult_from_errno(rc);
+    }
+
+    if (!ops->vk_multi_trace_rays_indirect_pipeline)
+    {
+        if ((vr = vkd3d_meta_create_compute_pipeline(meta_ops->device,
+                sizeof(cs_execute_indirect_multi_trace_rays), cs_execute_indirect_multi_trace_rays,
+                ops->vk_multi_dispatch_indirect_layout, NULL, true, NULL,
+                &ops->vk_multi_trace_rays_indirect_pipeline)) < 0)
+        {
+            ops->vk_multi_trace_rays_indirect_pipeline = VK_NULL_HANDLE;
+            hr = hresult_from_vk_result(vr);
+        }
+    }
+
+    info->vk_pipeline = ops->vk_multi_trace_rays_indirect_pipeline;
+    info->vk_pipeline_layout = ops->vk_multi_dispatch_indirect_layout;
+    pthread_mutex_unlock(&ops->mutex);
+    return hr;
 }
 
 static HRESULT vkd3d_execute_indirect_ops_init(struct vkd3d_execute_indirect_ops *meta_indirect_ops,

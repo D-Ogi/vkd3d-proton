@@ -5134,6 +5134,10 @@ struct vkd3d_multi_dispatch_indirect_ops
 {
     VkPipelineLayout vk_multi_dispatch_indirect_layout;
     VkPipeline vk_multi_dispatch_indirect_pipeline;
+    /* amdgpu-wddm fork: the DISPATCH_RAYS variant (cs_execute_indirect_multi_trace_rays.comp) on the same layout,
+     * created under the mutex on first use, so that devices which never count indirect ray dispatches pay nothing. */
+    pthread_mutex_t mutex;
+    VkPipeline vk_multi_trace_rays_indirect_pipeline;
 };
 
 struct vkd3d_execute_indirect_args
@@ -5350,6 +5354,8 @@ void vkd3d_meta_get_predicate_pipeline(struct vkd3d_meta_ops *meta_ops,
         enum vkd3d_predicate_command_type command_type, struct vkd3d_predicate_command_info *info);
 
 void vkd3d_meta_get_multi_dispatch_indirect_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_multi_dispatch_indirect_info *info);
+HRESULT vkd3d_meta_get_multi_trace_rays_indirect_pipeline(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_multi_dispatch_indirect_info *info);
 
 static inline uint32_t vkd3d_meta_get_multi_dispatch_indirect_workgroup_size(void)

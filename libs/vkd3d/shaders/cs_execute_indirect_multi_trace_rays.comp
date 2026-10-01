@@ -1,0 +1,58 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+// ExecuteIndirect with a DISPATCH_RAYS signature and a count buffer: copies each of max_commands
+// D3D12_DISPATCH_RAYS_DESC records (stride_words apart in the argument buffer) into a packed array of
+// VkTraceRaysIndirectCommand2KHR (the same 104-byte layout, asserted in command.c). A record at or beyond the count
+// is written as zeros: width, height and depth 0 make its vkCmdTraceRaysIndirect2KHR launch nothing, and the
+// application's bytes past the count, which D3D12 leaves undefined, never reach the driver.
+
+layout(local_size_x = 32) in;
+
+layout(buffer_reference_align = 4, std430, buffer_reference) readonly buffer Indirect
+{
+	uint values[];
+};
+
+layout(buffer_reference_align = 4, std430, buffer_reference) writeonly buffer IndirectOutput
+{
+	uint values[];
+};
+
+layout(buffer_reference_align = 4, std430, buffer_reference) readonly buffer IndirectCount
+{
+	uint value;
+};
+
+layout(push_constant) uniform Registers
+{
+	Indirect indirect;
+	IndirectCount count;
+	IndirectOutput out_rays;
+	uint stride_words;
+	uint max_commands;
+};
+
+// sizeof(VkTraceRaysIndirectCommand2KHR) / 4
+const uint RECORD_WORDS = 26u;
+
+void main()
+{
+	uint cmd_index = gl_GlobalInvocationID.x;
+	if (cmd_index >= max_commands)
+		return;
+
+	uint out_offset = cmd_index * RECORD_WORDS;
+
+	if (cmd_index < count.value)
+	{
+		uint in_offset = cmd_index * stride_words;
+		for (uint i = 0u; i < RECORD_WORDS; i++)
+			out_rays.values[out_offset + i] = indirect.values[in_offset + i];
+	}
+	else
+	{
+		for (uint i = 0u; i < RECORD_WORDS; i++)
+			out_rays.values[out_offset + i] = 0u;
+	}
+}

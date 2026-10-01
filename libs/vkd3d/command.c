@@ -9221,6 +9221,84 @@ static bool d3d12_command_list_emit_multi_dispatch_indirect_count(struct d3d12_c
     return true;
 }
 
+/* amdgpu-wddm fork: ExecuteIndirect of DISPATCH_RAYS with a count buffer. The same scheme as the dispatch variant
+ * above: a meta compute pass writes max_commands VkTraceRaysIndirectCommand2KHR records into scratch, packed at
+ * sizeof(VkTraceRaysIndirectCommand2KHR) (the D3D12_DISPATCH_RAYS_DESC layout), the records at or beyond the count
+ * all zero, so the caller can unroll max_commands vkCmdTraceRaysIndirect2KHR calls over scratch. The pass goes to
+ * the post-indirect command buffer when no indirect argument barrier was seen in this sequence, else inline,
+ * followed by a compute write -> indirect command read barrier. */
+static bool d3d12_command_list_emit_multi_trace_rays_indirect_count(struct d3d12_command_list *list,
+        VkDeviceAddress indirect_args, uint32_t stride, uint32_t max_commands,
+        VkDeviceAddress count_arg,
+        struct vkd3d_scratch_allocation *scratch)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    struct vkd3d_multi_dispatch_indirect_info pipeline_info;
+    struct vkd3d_multi_dispatch_indirect_args args;
+    VkCommandBuffer vk_patch_cmd_buffer;
+    VkMemoryBarrier2 vk_barrier;
+    VkDependencyInfo dep_info;
+
+    if (FAILED(vkd3d_meta_get_multi_trace_rays_indirect_pipeline(&list->device->meta_ops, &pipeline_info)))
+    {
+        ERR("Failed to create the multi trace rays indirect pipeline.\n");
+        return false;
+    }
+
+    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
+            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
+            sizeof(VkTraceRaysIndirectCommand2KHR) * (VkDeviceSize)max_commands, sizeof(uint32_t), ~0u, scratch))
+        return false;
+
+    d3d12_command_list_end_current_render_pass(list, false);
+    d3d12_command_list_end_transfer_batch(list, true);
+
+    d3d12_command_allocator_allocate_init_post_indirect_command_buffer(list->allocator, list);
+    vk_patch_cmd_buffer = list->cmd.vk_post_indirect_barrier_commands;
+
+    if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer)
+        d3d12_command_list_invalidate_current_pipeline(list, true);
+    else
+        list->cmd.indirect_meta->need_compute_to_indirect_barrier = true;
+
+    args.indirect_va = indirect_args;
+    args.count_va = count_arg;
+    args.output_va = scratch->va;
+    args.stride_words = stride / sizeof(uint32_t);
+    args.max_commands = max_commands;
+
+    VK_CALL(vkCmdBindPipeline(vk_patch_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_info.vk_pipeline));
+    d3d12_command_list_meta_push_data(list, vk_patch_cmd_buffer,
+            pipeline_info.vk_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            sizeof(args), &args);
+
+    VK_CALL(vkCmdDispatch(vk_patch_cmd_buffer,
+            vkd3d_compute_workgroup_count(max_commands, vkd3d_meta_get_multi_dispatch_indirect_workgroup_size()),
+            1, 1));
+
+    if (vk_patch_cmd_buffer == list->cmd.vk_command_buffer)
+    {
+        memset(&dep_info, 0, sizeof(dep_info));
+        dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep_info.memoryBarrierCount = 1;
+        dep_info.pMemoryBarriers = &vk_barrier;
+
+        /* vkCmdTraceRaysIndirect2KHR consumes its record in the draw indirect stage. */
+        memset(&vk_barrier, 0, sizeof(vk_barrier));
+        vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        vk_barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+        vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+        vk_barrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+
+        VK_CALL(vkCmdPipelineBarrier2(vk_patch_cmd_buffer, &dep_info));
+    }
+
+    VKD3D_BREADCRUMB_COMMAND(EXECUTE_INDIRECT_PATCH_COMPUTE);
+    return true;
+}
+
 static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list *list,
         enum vkd3d_predicate_command_type command_type, VkDeviceAddress indirect_args,
         const union vkd3d_predicate_command_direct_args *direct_args, struct vkd3d_scratch_allocation *scratch)
@@ -18841,6 +18919,18 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
 
             unrolled_stride = sizeof(VkDispatchIndirectCommand);
         }
+        else if (last_arg_desc->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS &&
+                list->device->device_info.ray_tracing_maintenance1_features.rayTracingPipelineTraceRaysIndirect2)
+        {
+            /* amdgpu-wddm fork: the ray dispatch counterpart, records compacted into scratch. */
+            if (!d3d12_command_list_emit_multi_trace_rays_indirect_count(list,
+                    arg_impl->res.va + arg_buffer_offset,
+                    unrolled_stride, max_command_count,
+                    count_impl->res.va + count_buffer_offset, &scratch))
+                return;
+
+            unrolled_stride = sizeof(VkTraceRaysIndirectCommand2KHR);
+        }
         else
         {
             scratch.buffer = count_impl->res.vk_buffer;
@@ -18949,14 +19039,6 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS:
             /* If we're breaking suspend resume here, need to latch conditional rendering state now. */
             d3d12_command_list_update_conditional_rendering_state(list, false);
-            if (max_command_count != 1)
-                FIXME("Ignoring command count %u.\n", max_command_count);
-
-            if (count_buffer)
-            {
-                FIXME_ONCE("Count buffers not supported for indirect ray dispatch.\n");
-                break;
-            }
 
             if (!d3d12_command_list_update_raygen_state(list))
             {
@@ -18970,7 +19052,18 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
                 break;
             }
 
-            VK_CALL(vkCmdTraceRaysIndirect2KHR(list->cmd.vk_command_buffer, scratch.va));
+            /* amdgpu-wddm fork: one vkCmdTraceRaysIndirect2KHR per record, as the dispatch case unrolls. Without a
+             * count buffer the records are the application's, ByteStride apart (a multiple of 4, so every record
+             * address satisfies the 4-byte alignment of indirectDeviceAddress); with one, they are the scratch
+             * records of d3d12_command_list_emit_multi_trace_rays_indirect_count, those past the count of zero
+             * size. Upstream traced the first record only and skipped the dispatch when a count buffer was given. */
+            for (i = 0; i < max_command_count; i++)
+            {
+                VK_CALL(vkCmdTraceRaysIndirect2KHR(list->cmd.vk_command_buffer, scratch.va));
+                VKD3D_BREADCRUMB_AUX32(i);
+                VKD3D_BREADCRUMB_COMMAND(TRACE_RAYS);
+                scratch.va += unrolled_stride;
+            }
             break;
 
         default:
