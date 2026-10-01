@@ -9223,10 +9223,14 @@ static bool d3d12_command_list_emit_multi_dispatch_indirect_count(struct d3d12_c
 
 /* amdgpu-wddm fork: ExecuteIndirect of DISPATCH_RAYS with a count buffer. The same scheme as the dispatch variant
  * above: a meta compute pass writes max_commands VkTraceRaysIndirectCommand2KHR records into scratch, packed at
- * sizeof(VkTraceRaysIndirectCommand2KHR) (the D3D12_DISPATCH_RAYS_DESC layout), the records at or beyond the count
- * all zero, so the caller can unroll max_commands vkCmdTraceRaysIndirect2KHR calls over scratch. The pass goes to
- * the post-indirect command buffer when no indirect argument barrier was seen in this sequence, else inline,
- * followed by a compute write -> indirect command read barrier. */
+ * sizeof(VkTraceRaysIndirectCommand2KHR) (the D3D12_DISPATCH_RAYS_DESC layout), so the caller can unroll
+ * max_commands vkCmdTraceRaysIndirect2KHR calls over scratch. A record at or beyond the count has width, height and
+ * depth 0 and names, for all four shader tables, a zeroed region at the start of the allocation (aligned to
+ * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, which bounds shaderGroupBaseAlignment whenever DXR is exposed):
+ * zero table addresses lose the device on NVIDIA even with nothing to launch. On return scratch points at the
+ * first record. The pass goes to the post-indirect command buffer when no indirect argument barrier was seen in
+ * this sequence, else inline, followed by a compute write -> indirect command read barrier. */
+#define VKD3D_MULTI_TRACE_RAYS_NULL_TABLE_SIZE D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT
 static bool d3d12_command_list_emit_multi_trace_rays_indirect_count(struct d3d12_command_list *list,
         VkDeviceAddress indirect_args, uint32_t stride, uint32_t max_commands,
         VkDeviceAddress count_arg,
@@ -9247,7 +9251,8 @@ static bool d3d12_command_list_emit_multi_trace_rays_indirect_count(struct d3d12
 
     if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
             VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
-            sizeof(VkTraceRaysIndirectCommand2KHR) * (VkDeviceSize)max_commands, sizeof(uint32_t), ~0u, scratch))
+            VKD3D_MULTI_TRACE_RAYS_NULL_TABLE_SIZE + sizeof(VkTraceRaysIndirectCommand2KHR) * (VkDeviceSize)max_commands,
+            VKD3D_MULTI_TRACE_RAYS_NULL_TABLE_SIZE, ~0u, scratch))
         return false;
 
     d3d12_command_list_end_current_render_pass(list, false);
@@ -9294,6 +9299,9 @@ static bool d3d12_command_list_emit_multi_trace_rays_indirect_count(struct d3d12
 
         VK_CALL(vkCmdPipelineBarrier2(vk_patch_cmd_buffer, &dep_info));
     }
+
+    scratch->va += VKD3D_MULTI_TRACE_RAYS_NULL_TABLE_SIZE;
+    scratch->offset += VKD3D_MULTI_TRACE_RAYS_NULL_TABLE_SIZE;
 
     VKD3D_BREADCRUMB_COMMAND(EXECUTE_INDIRECT_PATCH_COMPUTE);
     return true;
@@ -19056,7 +19064,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
              * count buffer the records are the application's, ByteStride apart (a multiple of 4, so every record
              * address satisfies the 4-byte alignment of indirectDeviceAddress); with one, they are the scratch
              * records of d3d12_command_list_emit_multi_trace_rays_indirect_count, those past the count of zero
-             * size. Upstream traced the first record only and skipped the dispatch when a count buffer was given. */
+             * dimensions over zeroed tables. Upstream traced the first record only and skipped the dispatch when a
+             * count buffer was given. */
             for (i = 0; i < max_command_count; i++)
             {
                 VK_CALL(vkCmdTraceRaysIndirect2KHR(list->cmd.vk_command_buffer, scratch.va));

@@ -1,10 +1,14 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 // ExecuteIndirect with a DISPATCH_RAYS signature and a count buffer: copies each of max_commands
 // D3D12_DISPATCH_RAYS_DESC records (stride_words apart in the argument buffer) into a packed array of
-// VkTraceRaysIndirectCommand2KHR (the same 104-byte layout, asserted in command.c). A record at or beyond the count
-// is written as zeros: width, height and depth 0 make its vkCmdTraceRaysIndirect2KHR launch nothing, and the
+// VkTraceRaysIndirectCommand2KHR (the same 104-byte layout, asserted in command.c), which starts NULL_WORDS after
+// out_rays. The first NULL_WORDS of out_rays (out_rays is aligned to shaderGroupBaseAlignment, at most 64 bytes when
+// DXR is exposed) are zeroed and serve as the shader tables of every record at or beyond the count: such a record
+// names that valid, zeroed memory for all four tables, with zero sizes and strides, and launches nothing (width,
+// height and depth 0). Zero addresses instead lose the device on at least one implementation (NVIDIA), and the
 // application's bytes past the count, which D3D12 leaves undefined, never reach the driver.
 
 layout(local_size_x = 32) in;
@@ -35,6 +39,8 @@ layout(push_constant) uniform Registers
 
 // sizeof(VkTraceRaysIndirectCommand2KHR) / 4
 const uint RECORD_WORDS = 26u;
+// The zeroed shader table region before the records: D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT / 4.
+const uint NULL_WORDS = 16u;
 
 void main()
 {
@@ -42,7 +48,13 @@ void main()
 	if (cmd_index >= max_commands)
 		return;
 
-	uint out_offset = cmd_index * RECORD_WORDS;
+	if (cmd_index == 0u)
+	{
+		for (uint i = 0u; i < NULL_WORDS; i++)
+			out_rays.values[i] = 0u;
+	}
+
+	uint out_offset = NULL_WORDS + cmd_index * RECORD_WORDS;
 
 	if (cmd_index < count.value)
 	{
@@ -52,7 +64,17 @@ void main()
 	}
 	else
 	{
+		// The raygen record, miss, hit group and callable table addresses are words 0, 4, 10 and 16; every other
+		// word (sizes, strides, width, height, depth, padding) is zero.
+		uvec2 null_tables = uvec2(out_rays);
 		for (uint i = 0u; i < RECORD_WORDS; i++)
-			out_rays.values[out_offset + i] = 0u;
+		{
+			uint value = 0u;
+			if (i == 0u || i == 4u || i == 10u || i == 16u)
+				value = null_tables.x;
+			else if (i == 1u || i == 5u || i == 11u || i == 17u)
+				value = null_tables.y;
+			out_rays.values[out_offset + i] = value;
+		}
 	}
 }
