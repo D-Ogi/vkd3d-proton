@@ -2965,6 +2965,10 @@ struct vkd3d_pipeline_bindings
     uint32_t dirty_flags; /* vkd3d_pipeline_dirty_flags */
 
     uint32_t descriptor_tables[D3D12_MAX_ROOT_COST];
+    /* amdgpu-wddm fork: the bound root signature's descriptor_tables in table order, which is the block
+     * d3d12_command_list_update_descriptor_table_offsets pushes. Kept by the table sets and gathered again when the
+     * root signature changes (draw-path2). */
+    uint32_t descriptor_table_offsets[D3D12_MAX_ROOT_COST];
     uint64_t legacy_descriptor_set_dirty_mask;
 
     /* Needed when VK_KHR_push_descriptor is not available. */

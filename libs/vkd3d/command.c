@@ -7933,21 +7933,24 @@ static void d3d12_command_list_update_descriptor_table_offsets(struct d3d12_comm
 {
     const struct d3d12_root_signature *root_signature = bindings->root_signature;
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    /* amdgpu-wddm fork: the table sets keep the offsets in table order, so nothing is gathered here (draw-path2). */
+    const uint32_t *table_offsets = bindings->descriptor_table_offsets;
+#ifdef VKD3D_ENABLE_BREADCRUMBS
     const struct vkd3d_shader_descriptor_table *table;
-    uint32_t table_offsets[D3D12_MAX_ROOT_COST];
     unsigned int root_parameter_index;
     uint64_t descriptor_table_mask;
+#endif
 
     assert(root_signature->descriptor_table_count);
+
+#ifdef VKD3D_ENABLE_BREADCRUMBS
     descriptor_table_mask = root_signature->descriptor_table_mask;
 
     while (descriptor_table_mask)
     {
         root_parameter_index = vkd3d_bitmask_iter64(&descriptor_table_mask);
         table = root_signature_get_descriptor_table(root_signature, root_parameter_index);
-        table_offsets[table->table_index] = bindings->descriptor_tables[root_parameter_index];
 
-#ifdef VKD3D_ENABLE_BREADCRUMBS
         if (root_signature->descriptor_table_mask_sampler & (1ull << root_parameter_index))
         {
             if (!list->descriptor_heap.buffers.sampler.heap)
@@ -7974,8 +7977,8 @@ static void d3d12_command_list_update_descriptor_table_offsets(struct d3d12_comm
                     list->descriptor_heap.buffers.resource.heap->desc.NumDescriptors);
             }
         }
-#endif
     }
+#endif
 
     /* Set descriptor offsets */
     if (d3d12_device_use_descriptor_heap(list->device))
@@ -14998,6 +15001,31 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetDescriptorHeaps(d3d12_comman
         d3d12_command_list_set_descriptor_heaps_sets(list, heap_count, heaps);
 }
 
+/* amdgpu-wddm fork (draw-path2): descriptor_table_offsets holds descriptor_tables in the table order of the bound root
+ * signature, so that a draw after a table set pushes the block as it is instead of gathering every table's offset. A
+ * set to a parameter that is no table of the root signature only goes to descriptor_tables, as before. */
+static inline void d3d12_command_list_store_descriptor_table_offset(struct vkd3d_pipeline_bindings *bindings,
+        const struct d3d12_root_signature *root_signature, unsigned int index)
+{
+    if (root_signature->descriptor_table_mask & (1ull << index))
+        bindings->descriptor_table_offsets[root_signature_get_descriptor_table(root_signature, index)->table_index] =
+                bindings->descriptor_tables[index];
+}
+
+static void d3d12_command_list_gather_descriptor_table_offsets(struct vkd3d_pipeline_bindings *bindings)
+{
+    const struct d3d12_root_signature *root_signature = bindings->root_signature;
+    uint64_t descriptor_table_mask = root_signature->descriptor_table_mask;
+    unsigned int root_parameter_index;
+
+    while (descriptor_table_mask)
+    {
+        root_parameter_index = vkd3d_bitmask_iter64(&descriptor_table_mask);
+        bindings->descriptor_table_offsets[root_signature_get_descriptor_table(root_signature,
+                root_parameter_index)->table_index] = bindings->descriptor_tables[root_parameter_index];
+    }
+}
+
 static void d3d12_command_list_set_root_signature(struct d3d12_command_list *list,
         struct vkd3d_pipeline_bindings *bindings, const struct d3d12_root_signature *root_signature)
 {
@@ -15008,7 +15036,11 @@ static void d3d12_command_list_set_root_signature(struct d3d12_command_list *lis
     bindings->static_sampler_set = VK_NULL_HANDLE;
 
     if (root_signature)
+    {
         bindings->static_sampler_set = root_signature->vk_sampler_set;
+        /* The tables set so far, in the new signature's table order: what the next push used to gather. */
+        d3d12_command_list_gather_descriptor_table_offsets(bindings);
+    }
 
     d3d12_command_list_invalidate_root_parameters(list, bindings, true, NULL);
 }
@@ -15092,6 +15124,7 @@ static inline void d3d12_command_list_set_descriptor_table_embedded(struct d3d12
 
     if (root_signature)
     {
+        d3d12_command_list_store_descriptor_table_offset(bindings, root_signature, index);
 #ifdef VKD3D_ENABLE_BREADCRUMBS
         /* This path is quite hot, so skip debug checks in release builds. */
         d3d12_command_list_validate_heap_index(list, root_signature, index,
@@ -15130,6 +15163,7 @@ static inline void d3d12_command_list_set_descriptor_table(struct d3d12_command_
 
     if (root_signature)
     {
+        d3d12_command_list_store_descriptor_table_offset(bindings, root_signature, index);
 #ifdef VKD3D_ENABLE_BREADCRUMBS
         /* This path is quite hot, so skip debug checks in release builds. */
         d3d12_command_list_validate_heap_index(list, root_signature, index,
