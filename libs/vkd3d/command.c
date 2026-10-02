@@ -15602,32 +15602,18 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
     VKD3D_BREADCRUMB_COMMAND_STATE(IBO);
 }
 
-static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_command_list_iface *iface,
-        UINT start_slot, UINT view_count, const D3D12_VERTEX_BUFFER_VIEW *views)
+/* amdgpu-wddm fork: the part of IASetVertexBuffers that resolves and records views, out of line so that a call that
+ * sets every slot to the view it already holds returns without its frame (draw-path2). */
+static VKD3D_NOINLINE void d3d12_command_list_set_vertex_buffers(struct d3d12_command_list *list,
+        UINT start_slot, UINT view_count, const D3D12_VERTEX_BUFFER_VIEW *views, uint32_t generation)
 {
-    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     struct vkd3d_dynamic_state *dyn_state = &list->dynamic_state;
     const struct vkd3d_unique_resource *resource = NULL;
     uint32_t vbo_invalidate_mask = 0;
     bool invalidate = false;
-    uint32_t generation;
     unsigned int i;
     bool keys;
 
-    TRACE("iface %p, start_slot %u, view_count %u, views %p.\n", iface, start_slot, view_count, views);
-
-    if (start_slot >= ARRAY_SIZE(dyn_state->vertex_strides) ||
-            view_count > ARRAY_SIZE(dyn_state->vertex_strides) - start_slot)
-    {
-        WARN("Invalid start slot %u / view count %u.\n", start_slot, view_count);
-        return;
-    }
-
-    /* Native drivers appear to ignore this call. Buffer bindings are kept as-is. */
-    if (!views)
-        return;
-
-    generation = vkd3d_va_map_generation(&list->device->memory_allocator.va_map);
     if (dyn_state->vertex_view_generation != generation)
     {
         dyn_state->vertex_view_mask = 0;
@@ -15712,6 +15698,48 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
 
     if (invalidate)
         d3d12_command_list_invalidate_current_pipeline(list, false);
+}
+
+static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_command_list_iface *iface,
+        UINT start_slot, UINT view_count, const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+    struct vkd3d_dynamic_state *dyn_state = &list->dynamic_state;
+    uint32_t generation, slots;
+    unsigned int i;
+
+    TRACE("iface %p, start_slot %u, view_count %u, views %p.\n", iface, start_slot, view_count, views);
+
+    if (start_slot >= ARRAY_SIZE(dyn_state->vertex_strides) ||
+            view_count > ARRAY_SIZE(dyn_state->vertex_strides) - start_slot)
+    {
+        WARN("Invalid start slot %u / view count %u.\n", start_slot, view_count);
+        return;
+    }
+
+    /* Native drivers appear to ignore this call. Buffer bindings are kept as-is. */
+    if (!views)
+        return;
+
+    /* amdgpu-wddm fork: every slot set again to the view it holds, under the generation it was resolved in, is the
+     * call d3d12_command_list_set_vertex_buffers would skip slot by slot (draw-path2). */
+    generation = vkd3d_va_map_generation(&list->device->memory_allocator.va_map);
+    if (dyn_state->vertex_view_generation == generation && d3d12_command_list_buffer_view_keys_usable())
+    {
+        slots = (uint32_t)(((1ull << view_count) - 1u) << start_slot);
+        if ((dyn_state->vertex_view_mask & slots) == slots)
+        {
+            for (i = 0; i < view_count; ++i)
+            {
+                if (!vkd3d_vertex_buffer_view_equal(&views[i], &dyn_state->vertex_views[start_slot + i]))
+                    break;
+            }
+            if (i == view_count)
+                return;
+        }
+    }
+
+    d3d12_command_list_set_vertex_buffers(list, start_slot, view_count, views, generation);
 }
 
 static void STDMETHODCALLTYPE d3d12_command_list_SOSetTargets(d3d12_command_list_iface *iface,
