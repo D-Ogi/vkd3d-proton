@@ -3462,13 +3462,18 @@ struct vkd3d_timestamp_profiler_submitted_work;
 /* Read-only texture transitions held while a render pass is active (d3d12_command_list_defer_read_barriers). */
 #define VKD3D_MAX_DEFERRED_READ_BARRIER_COUNT 16u
 
-/* amdgpu-wddm fork: the barrier counters of BC250_DRAW_STATS (command.c, vkd3d_barrier_stats_on). */
+/* amdgpu-wddm fork: the barrier counters of BC250_DRAW_STATS (command.c, vkd3d_barrier_stats_on). The c23_ ones
+ * count what the barriers and draws tell the ICD about their resources (vkd3d_bc250_*): resources named, barrier
+ * calls with a memory barrier whose resources are all named (complete) or not (partial), names lost to the list's
+ * size; storage hint checks at draws and dispatches, hints sent, their bindings, those not complete; the time of the
+ * checks and of the descriptor walks among them, in ns. */
 #define VKD3D_BARRIER_STATS(X) \
     X(ecl_calls) X(ecl_lists) X(ecl_init_transitions) X(lists) X(rb_calls) X(rb_copy_deferred) X(rb_read_held) \
     X(rb_vk_barriers) X(vk_batches) X(tr_total) X(tr_texture) X(tr_buffer) X(tr_layout) X(tr_rt_read) \
     X(tr_read_rt) X(tr_ds_read) X(tr_read_ds) X(tr_uav_read) X(tr_read_uav) X(tr_copy_read) X(tr_read_copy) \
     X(tr_read_read) X(tr_common) X(tr_other) X(uav) X(uav_null) X(alias) X(held_flushes) X(force_pre) \
-    X(force_post) X(pass_pre) X(clear_uav_syncs)
+    X(force_post) X(pass_pre) X(clear_uav_syncs) X(c23_named) X(c23_complete) X(c23_partial) X(c23_overflow) \
+    X(c23_checks) X(c23_hints) X(c23_hint_bindings) X(c23_hint_partial) X(c23_ns) X(c23_walk_ns)
 
 enum vkd3d_barrier_stat
 {
@@ -3476,6 +3481,81 @@ enum vkd3d_barrier_stat
     VKD3D_BARRIER_STATS(VKD3D_BARRIER_STAT_ENUM)
 #undef VKD3D_BARRIER_STAT_ENUM
     VKD3D_BARRIER_STAT_COUNT
+};
+
+/* amdgpu-wddm fork: under BC250_DRAW_STATS, pNext structures of vkCmdPipelineBarrier2 that tell the ICD which
+ * resources a barrier's memory barrier stands for (barrier resources), and which storage resources the draws or
+ * dispatches of a pipeline may write (a uav hint, a call without barriers). The layouts must match the ICD's
+ * (amdgpu-wddm Mesa fork, radv_cmd_buffer.c). */
+#define VKD3D_BC250_STRUCTURE_TYPE_BARRIER_RESOURCES ((VkStructureType)0x7fbc2501)
+#define VKD3D_BC250_STRUCTURE_TYPE_UAV_HINT ((VkStructureType)0x7fbc2502)
+
+/* An image, a buffer range, or with neither the copies pending in the transfer tracking; with the masks of its own
+ * part of the barrier. */
+struct vkd3d_bc250_barrier_resource
+{
+    VkImage image;
+    VkDeviceAddress va;
+    VkDeviceSize size;
+    VkPipelineStageFlags2 src_stages;
+    VkAccessFlags2 src_access;
+    VkAccessFlags2 dst_access;
+};
+
+struct vkd3d_bc250_barrier_resources
+{
+    VkStructureType sType;
+    const void *pNext;
+    uint32_t count;
+    VkBool32 complete;
+    const struct vkd3d_bc250_barrier_resource *resources;
+};
+
+/* An image view, a buffer range, or a descriptor in the shader visible heap (an image, or a buffer at its start or
+ * at raw_offset). */
+struct vkd3d_bc250_uav_binding
+{
+    VkImageView view;
+    VkDeviceAddress va;
+    VkDeviceSize size;
+    const void *descriptor;
+    uint32_t raw_offset;
+};
+
+struct vkd3d_bc250_uav_hint
+{
+    VkStructureType sType;
+    const void *pNext;
+    VkPipelineBindPoint bind_point;
+    VkPipeline pipeline;
+    uint32_t count;
+    VkBool32 complete;
+    const struct vkd3d_bc250_uav_binding *bindings;
+};
+
+/* The resources named for the barrier batches being built, a stack: a batch's are contiguous from its
+ * bc250_first, nested batches' above them. */
+#define VKD3D_BC250_NAMED_MAX 64u
+
+struct vkd3d_bc250_named
+{
+    uint32_t top;
+    struct vkd3d_bc250_barrier_resource resources[VKD3D_BC250_NAMED_MAX];
+};
+
+/* What the last uav hint of a bind point (graphics, compute and ray tracing) was sent for: the command buffer,
+ * pipeline, root signature, heap and a hash of the bound tables and root descriptors with storage resources. The
+ * masks are the root signature's (rs_masks) parameters with storage ranges and its root storage descriptors. */
+struct vkd3d_bc250_hint_state
+{
+    VkCommandBuffer vk_command_buffer;
+    VkPipeline pipeline;
+    const struct d3d12_root_signature *root_signature;
+    const struct d3d12_descriptor_heap *heap;
+    uint64_t hash;
+    const struct d3d12_root_signature *rs_masks;
+    uint64_t table_mask;
+    uint64_t root_mask;
 };
 
 /* Writes the barrier counters if they changed since the last line (a device's end). */
@@ -3677,6 +3757,8 @@ struct d3d12_command_list
 
     /* BC250_DRAW_STATS: this recording's barrier counters, added to the process's totals and cleared at Close. */
     uint32_t barrier_stats[VKD3D_BARRIER_STAT_COUNT];
+    struct vkd3d_bc250_named bc250_named;
+    struct vkd3d_bc250_hint_state bc250_hint[2];
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     unsigned int breadcrumb_context_index;

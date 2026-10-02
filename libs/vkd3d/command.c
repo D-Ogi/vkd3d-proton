@@ -53,6 +53,10 @@ struct d3d12_command_list_barrier_batch
     VkMemoryBarrier2 vk_memory_barrier;
     uint32_t image_barrier_count;
     uint32_t recorded; /* vkCmdPipelineBarrier2 calls, for BC250_DRAW_STATS */
+    /* BC250_DRAW_STATS: the resources named for vk_memory_barrier (bc250_count of the list's bc250_named from
+     * bc250_first), and whether something else went into it. */
+    uint16_t bc250_first, bc250_count;
+    bool bc250_incomplete;
 };
 
 static void d3d12_command_list_barrier_batch_init(struct d3d12_command_list_barrier_batch *batch);
@@ -7678,6 +7682,8 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
     list->query_resolve_count = 0;
     list->submit_allocator = NULL;
     list->dgc_batch.draws_count = 0;
+    list->bc250_named.top = 0;
+    memset(list->bc250_hint, 0, sizeof(list->bc250_hint));
 
 #ifdef VKD3D_ENABLE_PROFILING
     vkd3d_timestamp_profiler_reset_command_list(list->device->timestamp_profiler, list);
@@ -8787,6 +8793,338 @@ static void d3d12_command_list_update_descriptors(struct d3d12_command_list *lis
     }
 }
 
+/* BC250_DRAW_STATS (C23): names a resource of batch's memory barrier, with the masks of its own part: an image, a
+ * buffer range, or with neither the copies pending in the transfer tracking. One that does not fit leaves the
+ * batch's names incomplete. */
+static void d3d12_command_list_barrier_batch_name(struct d3d12_command_list *list,
+        struct d3d12_command_list_barrier_batch *batch, VkImage vk_image, VkDeviceAddress va, VkDeviceSize size,
+        VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
+{
+    struct vkd3d_bc250_named *named = &list->bc250_named;
+    struct vkd3d_bc250_barrier_resource *resource;
+
+    if (!batch->bc250_count)
+        batch->bc250_first = named->top;
+    if (named->top != batch->bc250_first + batch->bc250_count || named->top == VKD3D_BC250_NAMED_MAX)
+    {
+        batch->bc250_incomplete = true;
+        list->barrier_stats[VKD3D_BARRIER_STAT_c23_overflow]++;
+        return;
+    }
+
+    resource = &named->resources[named->top++];
+    resource->image = vk_image;
+    resource->va = va;
+    resource->size = size;
+    resource->src_stages = src_stages;
+    resource->src_access = src_access;
+    resource->dst_access = dst_access;
+    batch->bc250_count++;
+}
+
+/* BC250_DRAW_STATS (C23): names a D3D12 resource, or for none (all resources) leaves the names incomplete. */
+static void d3d12_command_list_barrier_batch_name_resource(struct d3d12_command_list *list,
+        struct d3d12_command_list_barrier_batch *batch, const struct d3d12_resource *resource,
+        VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
+{
+    if (resource && d3d12_resource_is_texture(resource))
+        d3d12_command_list_barrier_batch_name(list, batch, resource->res.vk_image, 0, 0,
+                src_stages, src_access, dst_access);
+    else if (resource && resource->res.va && resource->desc.Width)
+        d3d12_command_list_barrier_batch_name(list, batch, VK_NULL_HANDLE, resource->res.va, resource->desc.Width,
+                src_stages, src_access, dst_access);
+    else
+        batch->bc250_incomplete = true;
+}
+
+/* As d3d12_command_list_barrier_batch_add_global_transition, for the barrier of one named resource (vk_image, or
+ * the buffer range at va, or with neither the pending copies). */
+static void d3d12_command_list_barrier_batch_add_named_transition(struct d3d12_command_list *list,
+        struct d3d12_command_list_barrier_batch *batch, VkImage vk_image, VkDeviceAddress va, VkDeviceSize size,
+        VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+        VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask)
+{
+    batch->vk_memory_barrier.srcStageMask |= srcStageMask;
+    batch->vk_memory_barrier.srcAccessMask |= srcAccessMask;
+    batch->vk_memory_barrier.dstStageMask |= dstStageMask;
+    batch->vk_memory_barrier.dstAccessMask |= dstAccessMask;
+
+    if (vkd3d_barrier_stats_on() && (srcStageMask || dstStageMask))
+        d3d12_command_list_barrier_batch_name(list, batch, vk_image, va, size, srcStageMask, srcAccessMask,
+                dstAccessMask);
+}
+
+/* As d3d12_command_list_barrier_batch_add_global_transition, for the barrier of resource (all where NULL). */
+static void d3d12_command_list_barrier_batch_add_resource_transition(struct d3d12_command_list *list,
+        struct d3d12_command_list_barrier_batch *batch, const struct d3d12_resource *resource,
+        VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+        VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask)
+{
+    batch->vk_memory_barrier.srcStageMask |= srcStageMask;
+    batch->vk_memory_barrier.srcAccessMask |= srcAccessMask;
+    batch->vk_memory_barrier.dstStageMask |= dstStageMask;
+    batch->vk_memory_barrier.dstAccessMask |= dstAccessMask;
+
+    if (vkd3d_barrier_stats_on() && (srcStageMask || dstStageMask))
+        d3d12_command_list_barrier_batch_name_resource(list, batch, resource, srcStageMask, srcAccessMask,
+                dstAccessMask);
+}
+
+/* BC250_DRAW_STATS (C23): puts the names of batch's memory barrier on dep_info. */
+static void d3d12_command_list_barrier_batch_attach_names(struct d3d12_command_list *list,
+        const struct d3d12_command_list_barrier_batch *batch, VkDependencyInfo *dep_info,
+        struct vkd3d_bc250_barrier_resources *names)
+{
+    memset(names, 0, sizeof(*names));
+    names->sType = VKD3D_BC250_STRUCTURE_TYPE_BARRIER_RESOURCES;
+    names->count = batch->bc250_count;
+    names->complete = !batch->bc250_incomplete;
+    names->resources = batch->bc250_count ? &list->bc250_named.resources[batch->bc250_first] : NULL;
+    dep_info->pNext = names;
+
+    list->barrier_stats[VKD3D_BARRIER_STAT_c23_named] += batch->bc250_count;
+    if (batch->bc250_incomplete)
+        list->barrier_stats[VKD3D_BARRIER_STAT_c23_partial]++;
+    else
+        list->barrier_stats[VKD3D_BARRIER_STAT_c23_complete]++;
+}
+
+/* BC250_DRAW_STATS (C23): a late barrier of the transfer tracking, whose memory barrier stands for the pending copies
+ * only. */
+static void d3d12_command_list_name_copies(struct d3d12_command_list *list, VkDependencyInfo *dep_info,
+        struct vkd3d_bc250_barrier_resources *names, struct vkd3d_bc250_barrier_resource *copies)
+{
+    memset(copies, 0, sizeof(*copies));
+    copies->src_stages = dep_info->pMemoryBarriers[0].srcStageMask;
+    copies->src_access = dep_info->pMemoryBarriers[0].srcAccessMask;
+    copies->dst_access = dep_info->pMemoryBarriers[0].dstAccessMask;
+
+    memset(names, 0, sizeof(*names));
+    names->sType = VKD3D_BC250_STRUCTURE_TYPE_BARRIER_RESOURCES;
+    names->count = 1;
+    names->complete = VK_TRUE;
+    names->resources = copies;
+    dep_info->pNext = names;
+
+    list->barrier_stats[VKD3D_BARRIER_STAT_c23_named]++;
+    list->barrier_stats[VKD3D_BARRIER_STAT_c23_complete]++;
+}
+
+#define VKD3D_BC250_HINT_MAX 64u
+
+static inline uint64_t vkd3d_bc250_hash(uint64_t hash, uint64_t value)
+{
+    return (hash ^ value) * 0x100000001b3ull;
+}
+
+/* The parameters of root_signature with storage ranges in their tables, and its root storage descriptors. */
+static void vkd3d_bc250_hint_masks(struct vkd3d_bc250_hint_state *state, const struct d3d12_root_signature *rs)
+{
+    const struct vkd3d_shader_root_parameter *p;
+    unsigned int i, j;
+
+    state->rs_masks = rs;
+    state->table_mask = 0;
+    state->root_mask = 0;
+    for (i = 0; rs && i < rs->parameter_count && i < 64; i++)
+    {
+        p = &rs->parameters[i];
+        if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV)
+        {
+            state->root_mask |= 1ull << i;
+        }
+        else if (p->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        {
+            for (j = 0; j < p->descriptor_table.binding_count; j++)
+            {
+                if (p->descriptor_table.first_binding[j].type == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV)
+                    state->table_mask |= 1ull << i;
+            }
+        }
+    }
+}
+
+/* Descriptor index of the shader visible heap as a binding: the buffer range of its metadata, or the descriptor
+ * itself for the ICD to read. False for a null descriptor. */
+static bool vkd3d_bc250_hint_descriptor(struct d3d12_device *device, const struct d3d12_descriptor_heap *heap,
+        uint32_t index, struct vkd3d_bc250_uav_binding *binding)
+{
+    const struct vkd3d_bindless_state *bindless = &device->bindless_state;
+    const struct vkd3d_descriptor_metadata_view *meta;
+    const uint8_t *payload;
+
+    payload = (const uint8_t *)heap->cpu_va.ptr + (size_t)index * bindless->cbv_srv_uav_size;
+    memset(binding, 0, sizeof(*binding));
+
+    if (bindless->flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA)
+    {
+        meta = (const struct vkd3d_descriptor_metadata_view *)(payload + bindless->packed_metadata_offset);
+        if (!(meta->info.flags & VKD3D_DESCRIPTOR_FLAG_NON_NULL))
+            return false;
+        if (meta->info.flags & VKD3D_DESCRIPTOR_FLAG_BUFFER_VA_RANGE)
+        {
+            binding->va = meta->info.buffer.va;
+            binding->size = meta->info.buffer.range;
+            return binding->va && binding->size;
+        }
+    }
+
+    binding->descriptor = payload;
+    binding->raw_offset = bindless->packed_raw_buffer_offset;
+    return true;
+}
+
+/* BC250_DRAW_STATS (C23): before a draw or dispatch, tells the ICD which storage resources the bound pipeline's work
+ * may write: those in the bound tables' storage ranges and the root storage descriptors. Sent again only where the
+ * command buffer, pipeline, root signature, heap or those bindings changed; descriptors rewritten in place after
+ * that go unseen. Unbounded ranges, a ray tracing pipeline's local root signatures and what does not fit leave the
+ * hint incomplete. */
+static VKD3D_NOINLINE void d3d12_command_list_bc250_uav_hint(struct d3d12_command_list *list,
+        const struct vkd3d_pipeline_bindings *bindings, VkPipelineBindPoint vk_bind_point)
+{
+    struct vkd3d_bc250_hint_state *state = &list->bc250_hint[vk_bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? 0 : 1];
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    const struct d3d12_root_signature *rs = bindings->root_signature;
+    struct vkd3d_bc250_uav_binding out[VKD3D_BC250_HINT_MAX];
+    const struct vkd3d_shader_descriptor_table *table;
+    const struct vkd3d_shader_resource_binding *b;
+    const struct vkd3d_unique_resource *resource;
+    struct d3d12_device *device = list->device;
+    const struct d3d12_descriptor_heap *heap;
+    uint32_t *counts = list->barrier_stats;
+    uint64_t start, walk, end, hash, mask;
+    struct vkd3d_bc250_uav_hint hint;
+    unsigned int i, j, k, count;
+    VkDependencyInfo dep_info;
+    VkDeviceAddress va;
+    uint32_t index;
+    bool complete;
+
+    start = vkd3d_get_current_time_ns();
+    counts[VKD3D_BARRIER_STAT_c23_checks]++;
+
+    heap = d3d12_device_use_descriptor_heap(device) && d3d12_device_use_embedded_mutable_descriptors(device) ?
+            list->descriptor_heap.buffers.resource.heap : NULL;
+    if (state->rs_masks != rs)
+        vkd3d_bc250_hint_masks(state, rs);
+
+    hash = 0xcbf29ce484222325ull;
+    for (mask = state->table_mask; mask; )
+        hash = vkd3d_bc250_hash(hash, bindings->descriptor_tables[vkd3d_bitmask_iter64(&mask)]);
+    for (mask = state->root_mask; mask; )
+        hash = vkd3d_bc250_hash(hash, bindings->root_descriptors[vkd3d_bitmask_iter64(&mask)].info.va);
+
+    if (state->vk_command_buffer == list->cmd.vk_command_buffer && state->pipeline == list->command_buffer_pipeline &&
+            state->root_signature == rs && state->heap == heap && state->hash == hash)
+    {
+        counts[VKD3D_BARRIER_STAT_c23_ns] += vkd3d_get_current_time_ns() - start;
+        return;
+    }
+
+    walk = vkd3d_get_current_time_ns();
+    complete = rs && vk_bind_point != VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR;
+    count = 0;
+
+    for (mask = state->table_mask; mask; )
+    {
+        i = vkd3d_bitmask_iter64(&mask);
+        table = &rs->parameters[i].descriptor_table;
+        if (!heap)
+        {
+            complete = false;
+            break;
+        }
+
+        for (j = 0; j < table->binding_count; j++)
+        {
+            b = &table->first_binding[j];
+            if (b->type != VKD3D_SHADER_DESCRIPTOR_TYPE_UAV)
+                continue;
+
+            /* A range can have more than one binding (buffer and image views, counters). */
+            for (k = 0; k < j; k++)
+            {
+                if (table->first_binding[k].type == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV &&
+                        table->first_binding[k].descriptor_offset == b->descriptor_offset &&
+                        table->first_binding[k].register_count == b->register_count)
+                    break;
+            }
+            if (k < j)
+                continue;
+
+            if (b->register_count == UINT_MAX)
+            {
+                complete = false;
+                continue;
+            }
+
+            for (k = 0; k < b->register_count; k++)
+            {
+                index = bindings->descriptor_tables[i] + b->descriptor_offset + k;
+                if (index >= heap->desc.NumDescriptors || count == VKD3D_BC250_HINT_MAX)
+                {
+                    complete = false;
+                    break;
+                }
+                if (vkd3d_bc250_hint_descriptor(device, heap, index, &out[count]))
+                    count++;
+            }
+        }
+    }
+
+    for (mask = state->root_mask; mask; )
+    {
+        i = vkd3d_bitmask_iter64(&mask);
+        if (!(rs->root_descriptor_raw_va_mask & (1ull << i)) || count == VKD3D_BC250_HINT_MAX)
+        {
+            complete = false;
+            continue;
+        }
+        if (!(va = bindings->root_descriptors[i].info.va))
+            continue;
+
+        memset(&out[count], 0, sizeof(out[count]));
+        if ((resource = vkd3d_va_map_deref(&device->memory_allocator.va_map, va)))
+        {
+            out[count].va = resource->va;
+            out[count].size = resource->size;
+        }
+        else
+        {
+            out[count].va = va;
+            out[count].size = 1;
+        }
+        count++;
+    }
+
+    memset(&hint, 0, sizeof(hint));
+    hint.sType = VKD3D_BC250_STRUCTURE_TYPE_UAV_HINT;
+    hint.bind_point = vk_bind_point;
+    hint.pipeline = list->command_buffer_pipeline;
+    hint.count = count;
+    hint.complete = complete;
+    hint.bindings = out;
+
+    memset(&dep_info, 0, sizeof(dep_info));
+    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_info.pNext = &hint;
+    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+
+    state->vk_command_buffer = list->cmd.vk_command_buffer;
+    state->pipeline = list->command_buffer_pipeline;
+    state->root_signature = rs;
+    state->heap = heap;
+    state->hash = hash;
+
+    counts[VKD3D_BARRIER_STAT_c23_hints]++;
+    counts[VKD3D_BARRIER_STAT_c23_hint_bindings] += count;
+    if (!complete)
+        counts[VKD3D_BARRIER_STAT_c23_hint_partial]++;
+    end = vkd3d_get_current_time_ns();
+    counts[VKD3D_BARRIER_STAT_c23_ns] += end - start;
+    counts[VKD3D_BARRIER_STAT_c23_walk_ns] += end - walk;
+}
+
 static void d3d12_command_list_check_pre_compute_barrier(
         struct d3d12_command_list *list, VkPipelineStageFlagBits2 vk_dst_stage);
 
@@ -8799,6 +9137,8 @@ static bool d3d12_command_list_update_compute_state(struct d3d12_command_list *l
 
     d3d12_command_list_check_pre_compute_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     d3d12_command_list_update_descriptors(list);
+    if (vkd3d_barrier_stats_on())
+        d3d12_command_list_bc250_uav_hint(list, &list->compute_bindings, VK_PIPELINE_BIND_POINT_COMPUTE);
 
 #ifdef VKD3D_ENABLE_PROFILING
     vkd3d_timestamp_profiler_mark_pre_command(list->device->timestamp_profiler, list);
@@ -8828,6 +9168,8 @@ static bool d3d12_command_list_update_raygen_state(struct d3d12_command_list *li
      * raygen bind point in Vulkan. */
     d3d12_command_list_check_pre_compute_barrier(list, VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR);
     d3d12_command_list_update_descriptors(list);
+    if (vkd3d_barrier_stats_on())
+        d3d12_command_list_bc250_uav_hint(list, &list->compute_bindings, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
 
     /* If we have a static sampler set for local root signatures, bind it now.
      * Don't bother with dirty tracking of this for time being.
@@ -9421,6 +9763,8 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
             d3d12_command_list_update_dynamic_state(list);
 
         d3d12_command_list_update_descriptors(list);
+        if (vkd3d_barrier_stats_on())
+            d3d12_command_list_bc250_uav_hint(list, &list->graphics_bindings, VK_PIPELINE_BIND_POINT_GRAPHICS);
     }
 
     if (list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE)
@@ -12087,6 +12431,8 @@ static void d3d12_command_list_begin_transfer(struct d3d12_command_list *list)
     if (list->transfer_batch.write_after_read_hazard_stages & ~list->transfer_batch.shader_resource_execution_stages_are_idle)
     {
         const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+        struct vkd3d_bc250_barrier_resources names;
+        struct vkd3d_bc250_barrier_resource copies;
         VkMemoryBarrier2 vk_memory_barrier;
         VkDependencyInfo dep_info;
 
@@ -12113,6 +12459,8 @@ static void d3d12_command_list_begin_transfer(struct d3d12_command_list *list)
          * Until we observe actual resource work, we can ignore any further RESOURCE -> COPY_DEST barrier. */
         list->transfer_batch.shader_resource_execution_stages_are_idle |= vk_memory_barrier.srcStageMask;
 
+        if (vkd3d_barrier_stats_on())
+            d3d12_command_list_name_copies(list, &dep_info, &names, &copies);
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
         d3d12_command_list_debug_mark_label(list, "RESOURCE -> COPY_DEST", 1.0f, 1.0f, 0.0f, 1.0f);
         VKD3D_BREADCRUMB_TAG("RESOURCE -> COPY_DEST late barrier");
@@ -12187,6 +12535,7 @@ static VKD3D_NOINLINE void d3d12_command_list_end_transfer_batch_copies(struct d
         barriers.vk_memory_barrier.dstStageMask |= list->transfer_batch.vk_stages | VK_PIPELINE_STAGE_2_COPY_BIT;
         barriers.vk_memory_barrier.srcAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
         barriers.vk_memory_barrier.dstAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barriers.bc250_incomplete = true;
         d3d12_command_list_debug_mark_label(list, "Transfer WAW (lost tracking)", 0.8f, 1.0f, 0.8f, 1.0f);
         d3d12_command_list_reset_transfer_waw_tracking(list);
     }
@@ -12220,6 +12569,8 @@ static void d3d12_command_list_end_transfer_batch(struct d3d12_command_list *lis
     if (resolve_shader_resource_barrier && list->transfer_batch.read_after_write_hazard_stages)
     {
         const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+        struct vkd3d_bc250_barrier_resources names;
+        struct vkd3d_bc250_barrier_resource copies;
         VkMemoryBarrier2 vk_memory_barrier;
         VkDependencyInfo dep_info;
 
@@ -12240,6 +12591,8 @@ static void d3d12_command_list_end_transfer_batch(struct d3d12_command_list *lis
 
         list->transfer_batch.read_after_write_hazard_stages = 0;
 
+        if (vkd3d_barrier_stats_on())
+            d3d12_command_list_name_copies(list, &dep_info, &names, &copies);
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
         d3d12_command_list_debug_mark_label(list, "COPY_DEST -> RESOURCE", 1.0f, 1.0f, 0.0f, 1.0f);
         VKD3D_BREADCRUMB_TAG("COPY_DEST -> RESOURCE late barrier");
@@ -13362,6 +13715,7 @@ static void d3d12_command_list_resolve_subresource(struct d3d12_command_list *li
     {
         batch.vk_memory_barrier.srcStageMask |= VK_PIPELINE_STAGE_2_RESOLVE_BIT;
         batch.vk_memory_barrier.dstStageMask |= VK_PIPELINE_STAGE_2_RESOLVE_BIT;
+        batch.bc250_incomplete = true;
         d3d12_command_list_barrier_batch_end(list, &batch);
     }
 
@@ -14097,6 +14451,9 @@ static void d3d12_command_list_barrier_batch_init(struct d3d12_command_list_barr
 {
     batch->image_barrier_count = 0;
     batch->recorded = 0;
+    batch->bc250_first = 0;
+    batch->bc250_count = 0;
+    batch->bc250_incomplete = false;
 
     memset(&batch->vk_memory_barrier, 0, sizeof(batch->vk_memory_barrier));
     batch->vk_memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -14106,6 +14463,7 @@ static void d3d12_command_list_barrier_batch_end(struct d3d12_command_list *list
         struct d3d12_command_list_barrier_batch *batch)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    struct vkd3d_bc250_barrier_resources names;
     VkDependencyInfo dep_info;
 
     memset(&dep_info, 0, sizeof(dep_info));
@@ -14137,6 +14495,9 @@ static void d3d12_command_list_barrier_batch_end(struct d3d12_command_list *list
     {
         d3d12_command_list_check_end_of_command_list_cleanup(list);
 
+        if (dep_info.memoryBarrierCount && vkd3d_barrier_stats_on())
+            d3d12_command_list_barrier_batch_attach_names(list, batch, &dep_info, &names);
+
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
         batch->recorded++;
         VKD3D_BARRIER_STAT(list, vk_batches);
@@ -14147,6 +14508,18 @@ static void d3d12_command_list_barrier_batch_end(struct d3d12_command_list *list
         batch->vk_memory_barrier.dstAccessMask = 0;
 
         batch->image_barrier_count = 0;
+        batch->bc250_incomplete = false;
+    }
+    else if (batch->bc250_count)
+    {
+        /* What they were named for stays behind in the masks without its names. */
+        batch->bc250_incomplete = true;
+    }
+
+    if (batch->bc250_count)
+    {
+        list->bc250_named.top = batch->bc250_first;
+        batch->bc250_count = 0;
     }
 }
 
@@ -14278,6 +14651,8 @@ static void d3d12_command_list_barrier_batch_add_global_transition(
     batch->vk_memory_barrier.srcAccessMask |= srcAccessMask;
     batch->vk_memory_barrier.dstStageMask |= dstStageMask;
     batch->vk_memory_barrier.dstAccessMask |= dstAccessMask;
+    /* BC250_DRAW_STATS: nothing names what this one stands for. */
+    batch->bc250_incomplete |= (srcStageMask | dstStageMask) != 0;
 }
 
 static void d3d12_command_list_merge_copy_tracking(struct d3d12_command_list *list,
@@ -14286,7 +14661,7 @@ static void d3d12_command_list_merge_copy_tracking(struct d3d12_command_list *li
     /* If we're going to do transfer barriers and we have
      * pending copies in flight which need to be synchronized,
      * we should just resolve that while we're at it. */
-    d3d12_command_list_barrier_batch_add_global_transition(list, batch,
+    d3d12_command_list_barrier_batch_add_named_transition(list, batch, VK_NULL_HANDLE, 0, 0,
             list->transfer_batch.vk_stages, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             list->transfer_batch.vk_stages, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
@@ -14295,7 +14670,7 @@ static void d3d12_command_list_merge_copy_tracking(struct d3d12_command_list *li
         if (list->transfer_batch.read_after_write_hazard_stages)
         {
             /* If we're doing a transfer barrier, fuse in any lingering COPY -> RESOURCE barrier. */
-            d3d12_command_list_barrier_batch_add_global_transition(list, batch,
+            d3d12_command_list_barrier_batch_add_named_transition(list, batch, VK_NULL_HANDLE, 0, 0,
                    VK_PIPELINE_STAGE_2_COPY_BIT, 0,
                    list->transfer_batch.read_after_write_hazard_stages, VK_ACCESS_2_SHADER_READ_BIT);
             list->transfer_batch.read_after_write_hazard_stages = 0;
@@ -14304,7 +14679,7 @@ static void d3d12_command_list_merge_copy_tracking(struct d3d12_command_list *li
         if (list->transfer_batch.write_after_read_hazard_stages)
         {
             /* If we're doing a transfer barrier, fuse in any lingering RESOURCE -> COPY barrier. */
-            d3d12_command_list_barrier_batch_add_global_transition(list, batch,
+            d3d12_command_list_barrier_batch_add_named_transition(list, batch, VK_NULL_HANDLE, 0, 0,
                     list->transfer_batch.write_after_read_hazard_stages, 0,
                     VK_PIPELINE_STAGE_2_COPY_BIT, 0);
             list->transfer_batch.shader_resource_execution_stages_are_idle |= list->transfer_batch.write_after_read_hazard_stages;
@@ -14951,7 +15326,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                 }
                 else
                 {
-                    d3d12_command_list_barrier_batch_add_global_transition(list, &batch,
+                    d3d12_command_list_barrier_batch_add_resource_transition(list, &batch, preserve_resource,
                             transition_src_stage_mask, transition_src_access,
                             transition_dst_stage_mask, transition_dst_access);
                 }
@@ -14964,6 +15339,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
             case D3D12_RESOURCE_BARRIER_TYPE_UAV:
             {
                 const D3D12_RESOURCE_UAV_BARRIER *uav = &current->UAV;
+                VkPipelineStageFlags2 uav_src_stages, uav_dst_stages;
+                VkAccessFlags2 uav_src_access, uav_dst_access;
                 uint32_t state_mask;
 
                 preserve_resource = impl_from_ID3D12Resource(uav->pResource);
@@ -14992,15 +15369,16 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
 
                 assert(state_mask);
 
+                uav_src_stages = 0;
+                uav_src_access = 0;
+                uav_dst_stages = 0;
+                uav_dst_access = 0;
                 vk_access_and_stage_flags_from_d3d12_resource_state(list, preserve_resource,
-                        state_mask, list->vk_queue_flags,
-                        &batch.vk_memory_barrier.srcStageMask,
-                        &batch.vk_memory_barrier.srcAccessMask);
-
+                        state_mask, list->vk_queue_flags, &uav_src_stages, &uav_src_access);
                 vk_access_and_stage_flags_from_d3d12_resource_state(list, preserve_resource,
-                        state_mask, list->vk_queue_flags,
-                        &batch.vk_memory_barrier.dstStageMask,
-                        &batch.vk_memory_barrier.dstAccessMask);
+                        state_mask, list->vk_queue_flags, &uav_dst_stages, &uav_dst_access);
+                d3d12_command_list_barrier_batch_add_resource_transition(list, &batch, preserve_resource,
+                        uav_src_stages, uav_src_access, uav_dst_stages, uav_dst_access);
 
                 list->cmd.clear_uav_pending = false;
 
@@ -15067,6 +15445,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                     batch.vk_memory_barrier.srcAccessMask |= alias_src_access;
                     batch.vk_memory_barrier.dstStageMask |= VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
                     batch.vk_memory_barrier.dstAccessMask |= alias_dst_access;
+                    batch.bc250_incomplete = true;
 
                     /* Update staging copies of aliased images before the current barrier batch gets submitted */
                     d3d12_command_list_flush_subresource_updates(list);
