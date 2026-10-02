@@ -66,7 +66,68 @@ void vkd3d_dbg_disable_debug_file(void)
 #ifdef _WIN32
 typedef int (*PFN_wine_log)(const char *);
 static PFN_wine_log wine_log_output;
+#include <fcntl.h>
+#include <io.h>
 #endif
+
+/* amdgpu-wddm: the engine runs inside the application, and the application's stdio is not ours. 3DMark's helper
+ * processes pipe stderr without reading it and blocked in WriteFile once ~12 KB of driver lines had filled the
+ * pipe (session 283). So without VKD3D_LOG_FILE the log goes where AMDGPU_WDDM_LOG says, the switch the D3D12
+ * shell and the RADV ICD read too: "stderr" is upstream's stderr, "file:<path>" appends to a shared file, and
+ * anything else, unset included, prints nothing on stdio. An explicit VKD3D_DEBUG, VKD3D_SHADER_DEBUG or
+ * VKD3D_LOG_BUFFERED asks for stderr as upstream does. Without any of them only errors are kept, on the
+ * debugger's output and bounded, and the level is err, so info and fixme lines cost nothing. */
+static bool vkd3d_log_debugger_only;
+static uint32_t vkd3d_debugger_budget = 1024;
+
+static FILE *vkd3d_open_shared_log(const char *path)
+{
+#ifdef _WIN32
+    /* Append only and shared: the shell and the ICD may write to the same file, and so may other processes. */
+    HANDLE handle = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    FILE *file;
+    int fd;
+
+    if (handle == INVALID_HANDLE_VALUE)
+        return NULL;
+    if ((fd = _open_osfhandle((intptr_t)handle, _O_APPEND | _O_WRONLY)) < 0)
+    {
+        CloseHandle(handle);
+        return NULL;
+    }
+    if (!(file = _fdopen(fd, "a")))
+    {
+        _close(fd);
+        return NULL;
+    }
+    setvbuf(file, NULL, _IONBF, 0);
+    return file;
+#else
+    return fopen(path, "a");
+#endif
+}
+
+enum vkd3d_amdgpu_wddm_sink
+{
+    VKD3D_AMDGPU_WDDM_SINK_NONE,
+    VKD3D_AMDGPU_WDDM_SINK_STDERR,
+    VKD3D_AMDGPU_WDDM_SINK_FILE,
+};
+
+static enum vkd3d_amdgpu_wddm_sink vkd3d_amdgpu_wddm_log_sink(char *path, size_t path_size)
+{
+    char value[VKD3D_PATH_MAX];
+
+    if (!vkd3d_get_env_var("AMDGPU_WDDM_LOG", value, sizeof(value)))
+        return VKD3D_AMDGPU_WDDM_SINK_NONE;
+    if (!strcmp(value, "stderr"))
+        return VKD3D_AMDGPU_WDDM_SINK_STDERR;
+    if (strncmp(value, "file:", 5) || !value[5] || strlen(value + 5) >= path_size)
+        return VKD3D_AMDGPU_WDDM_SINK_NONE;
+    strcpy(path, value + 5);
+    return VKD3D_AMDGPU_WDDM_SINK_FILE;
+}
 
 /* With breadcrumbs trace and similar intensive logging operations,
  * reduce stdio/syscall overhead to an absolute minimum. */
@@ -80,6 +141,9 @@ static struct vkd3d_string_stream vkd3d_dbg_buffer;
 
 static void vkd3d_dbg_init_once(void)
 {
+    bool explicit_request = false, log_file_requested;
+    enum vkd3d_amdgpu_wddm_sink sink;
+    char sink_path[VKD3D_PATH_MAX];
     char vkd3d_debug[VKD3D_PATH_MAX];
     unsigned int channel, i;
 
@@ -95,6 +159,27 @@ static void vkd3d_dbg_init_once(void)
         /* Default debug level. */
         if (vkd3d_dbg_level[channel] == VKD3D_DBG_LEVEL_UNKNOWN)
             vkd3d_dbg_level[channel] = VKD3D_DBG_LEVEL_FIXME;
+        else
+            explicit_request = true;
+    }
+
+    if (vkd3d_get_env_var("VKD3D_LOG_BUFFERED", vkd3d_debug, sizeof(vkd3d_debug)))
+        explicit_request = true;
+
+    /* amdgpu-wddm: VKD3D_LOG_FILE first, then AMDGPU_WDDM_LOG, then an explicit request; else no stdio. */
+    sink = vkd3d_amdgpu_wddm_log_sink(sink_path, sizeof(sink_path));
+    log_file_requested = !vkd3d_disable_file &&
+            vkd3d_get_env_var("VKD3D_LOG_FILE", vkd3d_debug, sizeof(vkd3d_debug));
+    if (!log_file_requested && sink == VKD3D_AMDGPU_WDDM_SINK_FILE &&
+            !(vkd3d_log_file = vkd3d_open_shared_log(sink_path)))
+        sink = VKD3D_AMDGPU_WDDM_SINK_NONE;
+    if (!log_file_requested && sink == VKD3D_AMDGPU_WDDM_SINK_NONE && !explicit_request)
+    {
+        vkd3d_log_debugger_only = true;
+        for (channel = 0; channel < VKD3D_DBG_CHANNEL_COUNT; channel++)
+            vkd3d_dbg_level[channel] = VKD3D_DBG_LEVEL_ERR;
+        vkd3d_atomic_uint32_store_explicit(&vkd3d_dbg_initialized, 1, vkd3d_memory_order_release);
+        return;
     }
 
     if (vkd3d_get_env_var("VKD3D_LOG_BUFFERED", vkd3d_debug, sizeof(vkd3d_debug)))
@@ -103,7 +188,8 @@ static void vkd3d_dbg_init_once(void)
         vkd3d_dbg_buffer.size = strtoul(vkd3d_debug, NULL, 0);
         if (!vkd3d_dbg_buffer.size)
             vkd3d_dbg_buffer.size = 64 * 1024;
-        fprintf(stderr, "Using VKD3D_LOG_BUFFERED with %zu byte chunks.\n", vkd3d_dbg_buffer.size);
+        fprintf(vkd3d_log_file ? vkd3d_log_file : stderr, "Using VKD3D_LOG_BUFFERED with %zu byte chunks.\n",
+                vkd3d_dbg_buffer.size);
         vkd3d_dbg_buffer.buffer = malloc(vkd3d_dbg_buffer.size);
     }
 
@@ -117,7 +203,7 @@ static void vkd3d_dbg_init_once(void)
             fflush(stderr);
         }
     }
-    else
+    else if (!vkd3d_log_file)
     {
 #ifdef _WIN32
         HMODULE module = LoadLibraryA("ntdll.dll");
@@ -181,6 +267,26 @@ void vkd3d_dbg_printf(enum vkd3d_dbg_channel channel, enum vkd3d_dbg_level level
     if (vkd3d_dbg_get_level(channel) < level)
         return;
     assert(level < ARRAY_SIZE(debug_level_names));
+
+    if (vkd3d_log_debugger_only)
+    {
+#ifdef _WIN32
+        char local_buffer[1024];
+        int offset;
+
+        if (level > VKD3D_DBG_LEVEL_ERR || vkd3d_atomic_uint32_decrement(
+                &vkd3d_debugger_budget, vkd3d_memory_order_relaxed) >= 0x80000000u)
+            return;
+        offset = snprintf(local_buffer, sizeof(local_buffer), "amdgpu_wddm_vkd3d %04x:%s:%s: ",
+                vkd3d_get_current_thread_id(), debug_level_names[level], function);
+        va_start(args, fmt);
+        if (offset > 0 && offset < (int)sizeof(local_buffer))
+            vsnprintf(local_buffer + offset, sizeof(local_buffer) - offset, fmt, args);
+        va_end(args);
+        OutputDebugStringA(local_buffer);
+#endif
+        return;
+    }
 
     log_file = vkd3d_log_file ? vkd3d_log_file : stderr;
 
