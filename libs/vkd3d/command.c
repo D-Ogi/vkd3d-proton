@@ -14329,6 +14329,30 @@ static bool d3d12_command_list_check_resource_barrier_trivial_copy_resource(
     return true;
 }
 
+/* amdgpu-wddm fork: the resources a game transitions are mostly cold in the CPU caches, and on unit A (Witcher 3,
+ * lab profile 298) ResourceBarrier waited for memory at the first read of each (its dimension) and again at its
+ * flags. Ending the render pass and the transfer batch comes before those reads, so the lines they need are asked
+ * for first: the description, the flags and layouts, and the format pointer. Only a hint: nothing is read here. */
+#define VKD3D_BARRIER_PREFETCH_COUNT 8
+
+static void d3d12_command_list_prefetch_barrier_resources(UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
+{
+    const struct d3d12_resource *resource;
+    unsigned int i;
+
+    for (i = 0; i < min(barrier_count, VKD3D_BARRIER_PREFETCH_COUNT); ++i)
+    {
+        if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !barriers[i].Transition.pResource)
+            continue;
+
+        /* Not impl_from_ID3D12Resource, whose assert reads the object. */
+        resource = CONTAINING_RECORD(barriers[i].Transition.pResource, struct d3d12_resource, ID3D12Resource_iface);
+        vkd3d_prefetch(&resource->desc);
+        vkd3d_prefetch(&resource->flags);
+        vkd3d_prefetch(&resource->format);
+    }
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_list_iface *iface,
         UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
 {
@@ -14338,6 +14362,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
     unsigned int i, j;
 
     TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
+
+    d3d12_command_list_prefetch_barrier_resources(barrier_count, barriers);
 
     /* Ignore enhanced barriers. They are much harder to reason about due to the transient nature of Vulkan-style
      * barriers. This is more or less just a workaround too for terribly written games,
