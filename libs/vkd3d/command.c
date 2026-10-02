@@ -11736,13 +11736,84 @@ static void d3d12_command_list_begin_transfer(struct d3d12_command_list *list)
     }
 }
 
-static void d3d12_command_list_end_transfer_batch(struct d3d12_command_list *list, bool resolve_shader_resource_barrier)
+/* The copies of a texture copy batch. Their barrier batch (MAX_BATCHED_IMAGE_BARRIERS image barriers) is more than a
+ * page of stack, which costs a stack probe and frame setup in the prologue of the function that holds it. Out of
+ * line, it is not paid by end_transfer_batch with nothing batched, which begin_render_pass calls before every draw
+ * (bc250: end_transfer_batch's own time and its __chkstk under begin_render_pass were 0.04 ms of the main thread's
+ * frame in the CPU profile of Witcher 3, lab session 291). */
+static VKD3D_NOINLINE void d3d12_command_list_end_transfer_batch_copies(struct d3d12_command_list *list)
 {
     struct d3d12_command_list_barrier_batch barriers;
     bool has_waw_skip = false;
     uint32_t old_count = 0;
     size_t i;
 
+    d3d12_command_list_end_current_render_pass(list, false);
+    d3d12_command_list_debug_mark_begin_region(list, "CopyBatch");
+    d3d12_command_list_barrier_batch_init(&barriers);
+    for (i = 0; i < list->transfer_batch.batch_len; i++)
+        d3d12_command_list_before_copy_texture_region(list, &barriers, &list->transfer_batch.batch[i]);
+    d3d12_command_list_barrier_batch_end(list, &barriers);
+    d3d12_command_list_barrier_batch_init(&barriers);
+
+    for (i = 0; i < list->transfer_batch.batch_len; i++)
+    {
+        old_count = barriers.image_barrier_count;
+        d3d12_command_list_copy_texture_region(list, &barriers, &list->transfer_batch.batch[i]);
+        if (list->transfer_batch.batch[i].dst.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+                old_count == barriers.image_barrier_count)
+        {
+            /* No outgoing barriers were required. */
+            if (list->transfer_batch.tracked_copy_texture_count < ARRAY_SIZE(list->transfer_batch.tracked_copy_textures))
+            {
+                VkOffset3D offset;
+                VkExtent3D extent;
+
+                if (list->transfer_batch.batch_type == VKD3D_BATCH_TYPE_COPY_IMAGE)
+                {
+                    offset = list->transfer_batch.batch[i].copy.image.dstOffset;
+                    extent = list->transfer_batch.batch[i].copy.image.extent;
+                }
+                else
+                {
+                    offset = list->transfer_batch.batch[i].copy.buffer_image.imageOffset;
+                    extent = list->transfer_batch.batch[i].copy.buffer_image.imageExtent;
+                }
+
+                d3d12_command_list_register_pending_transfer_image_write(list,
+                        impl_from_ID3D12Resource(list->transfer_batch.batch[i].dst.pResource)->res.vk_image,
+                        list->transfer_batch.batch[i].dst.SubresourceIndex,
+                        offset, extent, VK_PIPELINE_STAGE_2_COPY_BIT);
+            }
+            else
+            {
+                /* If we don't have room to track it for whatever reason, decay on batch completion.
+                 * Shouldn't really happen. */
+                has_waw_skip = true;
+            }
+        }
+    }
+
+    if (has_waw_skip)
+    {
+        /* Should not happen unless there are special copy fallbacks.
+         * Either all resources should immediately flush the transfer if no barriers are needed,
+         * or all resources should have proper barriers. */
+        barriers.vk_memory_barrier.srcStageMask |= list->transfer_batch.vk_stages | VK_PIPELINE_STAGE_2_COPY_BIT;
+        barriers.vk_memory_barrier.dstStageMask |= list->transfer_batch.vk_stages | VK_PIPELINE_STAGE_2_COPY_BIT;
+        barriers.vk_memory_barrier.srcAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barriers.vk_memory_barrier.dstAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        d3d12_command_list_debug_mark_label(list, "Transfer WAW (lost tracking)", 0.8f, 1.0f, 0.8f, 1.0f);
+        d3d12_command_list_reset_transfer_waw_tracking(list);
+    }
+
+    d3d12_command_list_barrier_batch_end(list, &barriers);
+    d3d12_command_list_debug_mark_end_region(list);
+    list->transfer_batch.batch_len = 0;
+}
+
+static void d3d12_command_list_end_transfer_batch(struct d3d12_command_list *list, bool resolve_shader_resource_barrier)
+{
     if (list->transfer_batch.batch_type != VKD3D_BATCH_TYPE_NONE ||
         (resolve_shader_resource_barrier && list->transfer_batch.read_after_write_hazard_stages))
         d3d12_command_list_check_end_of_command_list_cleanup(list);
@@ -11754,68 +11825,7 @@ static void d3d12_command_list_end_transfer_batch(struct d3d12_command_list *lis
         case VKD3D_BATCH_TYPE_COPY_BUFFER_TO_IMAGE:
         case VKD3D_BATCH_TYPE_COPY_IMAGE_TO_BUFFER:
         case VKD3D_BATCH_TYPE_COPY_IMAGE:
-            d3d12_command_list_end_current_render_pass(list, false);
-            d3d12_command_list_debug_mark_begin_region(list, "CopyBatch");
-            d3d12_command_list_barrier_batch_init(&barriers);
-            for (i = 0; i < list->transfer_batch.batch_len; i++)
-                d3d12_command_list_before_copy_texture_region(list, &barriers, &list->transfer_batch.batch[i]);
-            d3d12_command_list_barrier_batch_end(list, &barriers);
-            d3d12_command_list_barrier_batch_init(&barriers);
-
-            for (i = 0; i < list->transfer_batch.batch_len; i++)
-            {
-                old_count = barriers.image_barrier_count;
-                d3d12_command_list_copy_texture_region(list, &barriers, &list->transfer_batch.batch[i]);
-                if (list->transfer_batch.batch[i].dst.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
-                        old_count == barriers.image_barrier_count)
-                {
-                    /* No outgoing barriers were required. */
-                    if (list->transfer_batch.tracked_copy_texture_count < ARRAY_SIZE(list->transfer_batch.tracked_copy_textures))
-                    {
-                        VkOffset3D offset;
-                        VkExtent3D extent;
-
-                        if (list->transfer_batch.batch_type == VKD3D_BATCH_TYPE_COPY_IMAGE)
-                        {
-                            offset = list->transfer_batch.batch[i].copy.image.dstOffset;
-                            extent = list->transfer_batch.batch[i].copy.image.extent;
-                        }
-                        else
-                        {
-                            offset = list->transfer_batch.batch[i].copy.buffer_image.imageOffset;
-                            extent = list->transfer_batch.batch[i].copy.buffer_image.imageExtent;
-                        }
-
-                        d3d12_command_list_register_pending_transfer_image_write(list,
-                                impl_from_ID3D12Resource(list->transfer_batch.batch[i].dst.pResource)->res.vk_image,
-                                list->transfer_batch.batch[i].dst.SubresourceIndex,
-                                offset, extent, VK_PIPELINE_STAGE_2_COPY_BIT);
-                    }
-                    else
-                    {
-                        /* If we don't have room to track it for whatever reason, decay on batch completion.
-                         * Shouldn't really happen. */
-                        has_waw_skip = true;
-                    }
-                }
-            }
-
-            if (has_waw_skip)
-            {
-                /* Should not happen unless there are special copy fallbacks.
-                 * Either all resources should immediately flush the transfer if no barriers are needed,
-                 * or all resources should have proper barriers. */
-                barriers.vk_memory_barrier.srcStageMask |= list->transfer_batch.vk_stages | VK_PIPELINE_STAGE_2_COPY_BIT;
-                barriers.vk_memory_barrier.dstStageMask |= list->transfer_batch.vk_stages | VK_PIPELINE_STAGE_2_COPY_BIT;
-                barriers.vk_memory_barrier.srcAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                barriers.vk_memory_barrier.dstAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                d3d12_command_list_debug_mark_label(list, "Transfer WAW (lost tracking)", 0.8f, 1.0f, 0.8f, 1.0f);
-                d3d12_command_list_reset_transfer_waw_tracking(list);
-            }
-
-            d3d12_command_list_barrier_batch_end(list, &barriers);
-            d3d12_command_list_debug_mark_end_region(list);
-            list->transfer_batch.batch_len = 0;
+            d3d12_command_list_end_transfer_batch_copies(list);
             break;
         default:
             break;

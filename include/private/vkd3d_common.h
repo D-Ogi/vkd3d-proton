@@ -68,6 +68,14 @@ static inline size_t align(size_t addr, size_t alignment)
 # define VKD3D_UNUSED
 #endif  /* __GNUC__ */
 
+#ifdef _MSC_VER
+# define VKD3D_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__)
+# define VKD3D_NOINLINE __attribute__((noinline))
+#else
+# define VKD3D_NOINLINE
+#endif
+
 #if __has_attribute(__counted_by__)
 # define vkd3d_counted_by(member) __attribute__((__counted_by__(member)))
 #else
