@@ -2,36 +2,45 @@
 
 This fork of [HansKristian-Work/vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) carries the
 vkd3d-proton engine of [amdgpu-wddm](https://github.com/D-Ogi/amdgpu-wddm), a Windows WDDM driver stack for the
-AMD BC-250. The plan there is a native Direct3D 12 user-mode driver with vkd3d-proton as its engine, so that
-applications use the standard D3D12 runtime of Windows; that driver is being built and no D3D12 device has been
-demonstrated through the system Windows runtime yet.
+AMD BC-250. There, vkd3d-proton is not a set of application-local DLLs: it is the engine behind a native
+Direct3D 12 user-mode driver, so that applications use the standard D3D12 runtime and DXGI of Windows.
+
+## Registered on unit A (2026-10-03)
+
+| Binary | SHA-256 | Branch | Commit | Registered since |
+|---|---|---|---|---|
+| `amdgpu_wddm_vkd3d.dll`, the D3D12 engine | D79FEC49 | `amdgpu-wddm/registered-2026-10-02` (also on `amdgpu-wddm/draw-path`) | `c3710ac1` on `bed41016` | 2026-10-02 |
+
+That engine, behind the project's D3D12 user-mode driver, runs The Witcher 3 in its DirectX 12 edition with ray
+tracing on the lab machine, started from Steam, through the system D3D12 runtime: a device at feature level
+12_1, tiled resources tier 3, hardware ray tracing, and Present to the desktop. The frame rates, the trial
+numbers and the open defects are in the main repository, not here; the numbers are modest and the stack is a
+prototype, but the path is native.
+
+The `dxil-spirv` submodule points at [D-Ogi/dxil-spirv](https://github.com/D-Ogi/dxil-spirv), pinned on the
+registered commit to `bc773cf2` of its `amdgpu-wddm/dxbc-udiv-type` branch.
+
+## Branches
 
 | Branch | What it is |
 |---|---|
 | `master` | upstream's `master`; no project commits land here |
-| `amdgpu-wddm/ddi-engine` | upstream vkd3d-proton plus `libs/ddi/` and two small libvkd3d changes |
-| `amdgpu-wddm/ddi-engine-inline-wip` | draft: an inline queue mode for engine ABI 1.1, not frozen |
+| `amdgpu-wddm/registered-2026-10-02` | the exact commit the registered engine was built from; it does not move |
+| `amdgpu-wddm/ddi-engine` | upstream vkd3d-proton plus `libs/ddi/` and two small libvkd3d changes; engine ABI 1.0 |
+| `amdgpu-wddm/ddi-engine-1.3-rtcfg` | ABI 1.3 with the ray-tracing configuration, and the dxil-spirv fork as the submodule source |
+| `amdgpu-wddm/quiet-stdio-2026-10-02` | nothing on stdio unless `AMDGPU_WDDM_LOG` or `VKD3D_DEBUG` asks; the base of the registered engine |
+| `amdgpu-wddm/draw-path` | the per-draw path and the barrier counters, continuing past the registered commit |
+| `amdgpu-wddm/engine-slowstart-2026-09-30` | the driver cache and the pipeline log written off the caller's thread |
+| `amdgpu-wddm/ddi-engine-inline-wip` | draft: an inline queue mode, never frozen, never measured |
 
-Both project branches fork from upstream commit `472989aabdcf3e343e16d13c402feae3815008aa` (2026-09-25).
+`-Denable_ddi_engine=true` (the project branches only) builds the engine `amdgpu_wddm_vkd3d.dll` and
+`amdgpu_wddm_vkd3d_engine_test.exe`; commits before `a582668d` name them `bc250vkd3d.dll` and
+`bc250vkd3d_engine_test.exe`.
 
-- `amdgpu-wddm/ddi-engine` (head `a582668d`) has five commits: `VKD3D_CONFIG` defaults set by an embedding
-  module, the engine DLL, the static C runtime for it, swapchain extensions only with `VK_KHR_swapchain`, and
-  the rename of the DLL.
-- `-Denable_ddi_engine=true` (this branch only) builds the engine `amdgpu_wddm_vkd3d.dll` and
-  `amdgpu_wddm_vkd3d_engine_test.exe`; commits before `a582668d` name them `bc250vkd3d.dll` and
-  `bc250vkd3d_engine_test.exe`.
-- Engine ABI 1.0 is frozen: capability queries and engine bring-up off the runtime.
-- `amdgpu-wddm/ddi-engine-inline-wip` (head `439a96cd`) adds 14 commits on top: the inline queue mode planned
-  for ABI 1.1 (see "Gaps" in the design note below). Its header says revision r2-draft, ABI 1.1, not frozen.
-  Nothing on it has been measured on the BC-250.
-
-Tested on the BC-250 (facts in the main repository's
-[docs/facts.md](https://github.com/D-Ogi/amdgpu-wddm/blob/main/docs/facts.md)): the frozen ABI 1.0 engine from
-`5712e8c5`, under its pre-rename file name and with the hosted RADV driver loaded directly, passes independent
-devices, a GPU copy with readback and DXIL compute, and reports FL11_1 (M757); the same engine test passes with
-a ray-tracing candidate RADV (M759). A local, unpublished ABI 1.2 build (source `7bfcd7f0`, renamed DLL) answered adapter capability queries on hosted RADV without creating a device: FL11_1, tiled resources tier 0, binding tier 3, RT tier 1.1 (M769); the published ABI 1.0 and 1.1 branches did not perform that run. FL12_1, rendering through the D3D12 runtime and ray tracing in the engine
-are not established. Scope, ABI and gaps:
-[d3d12-ddi-engine.md](https://github.com/D-Ogi/amdgpu-wddm/blob/main/docs/design/d3d12-ddi-engine.md).
+Only the registered commit above has been deployed. Every other branch builds and passes its host tests; that
+is not the same as having run on the hardware. Scope, ABI and gaps:
+[d3d12-ddi-engine.md](https://github.com/D-Ogi/amdgpu-wddm/blob/main/docs/design/d3d12-ddi-engine.md); facts and
+evidence: [docs/facts.md](https://github.com/D-Ogi/amdgpu-wddm/blob/main/docs/facts.md).
 
 License: vkd3d-proton is under the GNU LGPL version 2.1 or later ([COPYING](https://github.com/D-Ogi/vkd3d-proton/blob/master/COPYING),
 [LICENSE](https://github.com/D-Ogi/vkd3d-proton/blob/master/LICENSE)) and stays a separately loaded DLL. The files
