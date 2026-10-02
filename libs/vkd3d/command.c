@@ -8569,6 +8569,52 @@ static bool d3d12_command_list_update_raygen_state(struct d3d12_command_list *li
     return true;
 }
 
+/* amdgpu-wddm fork (draw-path2): with VK_KHR_device_address_commands a list binds its vertex and index buffers by
+ * device address (vkCmdBindVertexBuffers3KHR, vkCmdBindIndexBuffer3KHR) instead of by VkBuffer. The set calls still
+ * resolve each view through the VA map, so a VA that names no resource binds null as before, and the address is
+ * the resolved buffer's address plus the bound offset, the address the VkBuffer bind gives. The ICD then reads
+ * nothing of the buffer object: RADV's VkBuffer binds look up each radv_buffer for its BO and address (lab session
+ * 298, Witcher 3: 0.1 ms per frame of the main thread). A null buffer binds a null range with stride 0, as RADV's
+ * VkBuffer bind turns it into. */
+static inline bool d3d12_device_binds_buffers_by_address(const struct d3d12_device *device)
+{
+    return device->device_info.device_address_commands_features.deviceAddressCommands;
+}
+
+static VKD3D_NOINLINE void d3d12_command_list_bind_vertex_buffers_by_address(struct d3d12_command_list *list,
+        uint32_t first, uint32_t count)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    const struct vkd3d_dynamic_state *dyn_state = &list->dynamic_state;
+    VkBindVertexBuffer3InfoKHR infos[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    VkBindVertexBuffer3InfoKHR *info;
+    uint32_t i, slot;
+
+    for (i = 0; i < count; i++)
+    {
+        slot = first + i;
+        info = &infos[i];
+        info->sType = VK_STRUCTURE_TYPE_BIND_VERTEX_BUFFER_3_INFO_KHR;
+        info->pNext = NULL;
+        info->setStride = VK_TRUE;
+        info->addressFlags = 0;
+        if (dyn_state->vertex_buffers[slot])
+        {
+            info->addressRange.address = dyn_state->vertex_buffer_vas[slot] + dyn_state->vertex_offsets[slot];
+            info->addressRange.size = dyn_state->vertex_sizes[slot];
+            info->addressRange.stride = dyn_state->vertex_strides[slot];
+        }
+        else
+        {
+            info->addressRange.address = 0;
+            info->addressRange.size = 0;
+            info->addressRange.stride = 0;
+        }
+    }
+
+    VK_CALL(vkCmdBindVertexBuffers3KHR(list->cmd.vk_command_buffer, first, count, infos));
+}
+
 static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *list)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -8764,12 +8810,19 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
                 }
             }
 
-            VK_CALL(vkCmdBindVertexBuffers2(list->cmd.vk_command_buffer,
-                    range.offset, range.count,
-                    dyn_state->vertex_buffers + range.offset,
-                    dyn_state->vertex_offsets + range.offset,
-                    dyn_state->vertex_sizes + range.offset,
-                    dyn_state->vertex_strides + range.offset));
+            if (d3d12_device_binds_buffers_by_address(list->device))
+            {
+                d3d12_command_list_bind_vertex_buffers_by_address(list, range.offset, range.count);
+            }
+            else
+            {
+                VK_CALL(vkCmdBindVertexBuffers2(list->cmd.vk_command_buffer,
+                        range.offset, range.count,
+                        dyn_state->vertex_buffers + range.offset,
+                        dyn_state->vertex_offsets + range.offset,
+                        dyn_state->vertex_sizes + range.offset,
+                        dyn_state->vertex_strides + range.offset));
+            }
         }
     }
 
@@ -9440,7 +9493,28 @@ static bool d3d12_command_list_update_index_buffer(struct d3d12_command_list *li
 
     if (list->index_buffer.is_dirty)
     {
-        if (list->index_buffer.buffer)
+        if (d3d12_device_binds_buffers_by_address(list->device))
+        {
+            VkBindIndexBuffer3InfoKHR info;
+
+            info.sType = VK_STRUCTURE_TYPE_BIND_INDEX_BUFFER_3_INFO_KHR;
+            info.pNext = NULL;
+            info.addressFlags = 0;
+            if (list->index_buffer.buffer)
+            {
+                info.addressRange.address = list->index_buffer.buffer_va + list->index_buffer.offset;
+                info.addressRange.size = list->index_buffer.size;
+                info.indexType = list->index_buffer.vk_type;
+            }
+            else
+            {
+                info.addressRange.address = 0;
+                info.addressRange.size = 0;
+                info.indexType = VK_INDEX_TYPE_UINT16;
+            }
+            VK_CALL(vkCmdBindIndexBuffer3KHR(list->cmd.vk_command_buffer, &info));
+        }
+        else if (list->index_buffer.buffer)
         {
             VK_CALL(vkCmdBindIndexBuffer2KHR(list->cmd.vk_command_buffer, list->index_buffer.buffer,
                     list->index_buffer.offset, list->index_buffer.size, list->index_buffer.vk_type));
@@ -15312,6 +15386,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
         if (resource)
         {
             list->index_buffer.buffer = resource->vk_buffer;
+            list->index_buffer.buffer_va = resource->va;
             list->index_buffer.offset = view->BufferLocation - resource->va;
             list->index_buffer.size = view->SizeInBytes;
             list->index_buffer.view = *view;
@@ -15376,6 +15451,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
     for (i = 0; i < view_count; ++i)
     {
         const uint32_t slot_bit = 1u << (start_slot + i);
+        VkDeviceAddress buffer_va = 0;
         bool invalid_va = false;
         VkBuffer buffer;
         VkDeviceSize offset;
@@ -15391,6 +15467,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
             if ((resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, views[i].BufferLocation)))
             {
                 buffer = resource->vk_buffer;
+                buffer_va = resource->va;
                 offset = views[i].BufferLocation - resource->va;
                 stride = views[i].StrideInBytes;
                 size = views[i].SizeInBytes;
@@ -15434,6 +15511,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
         invalidate |= dyn_state->vertex_strides[start_slot + i] != stride;
         dyn_state->vertex_strides[start_slot + i] = stride;
         dyn_state->vertex_buffers[start_slot + i] = buffer;
+        dyn_state->vertex_buffer_vas[start_slot + i] = buffer_va;
         dyn_state->vertex_offsets[start_slot + i] = offset;
         dyn_state->vertex_sizes[start_slot + i] = size;
         vbo_invalidate_mask |= 1u << (start_slot + i);

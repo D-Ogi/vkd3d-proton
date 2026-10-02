@@ -3014,6 +3014,9 @@ struct vkd3d_dynamic_state
     VkDeviceSize vertex_offsets[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
     VkDeviceSize vertex_sizes[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
     VkDeviceSize vertex_strides[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    /* amdgpu-wddm fork: the device address of each slot's buffer, valid where vertex_buffers is not null, for the
+     * binds by address (d3d12_command_list_bind_vertex_buffers_by_address, draw-path2). */
+    VkDeviceAddress vertex_buffer_vas[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
 
     /* amdgpu-wddm fork: the view each slot above was resolved from, where its bit in vertex_view_mask is set, while
      * the VA map's generation is vertex_view_generation. IASetVertexBuffers skips a slot set to that view again,
@@ -3477,6 +3480,8 @@ struct vkd3d_query_ranges
 struct vkd3d_index_buffer
 {
     VkBuffer buffer;
+    /* amdgpu-wddm fork: the device address of buffer where it is not null, for the bind by address (draw-path2). */
+    VkDeviceAddress buffer_va;
     VkDeviceSize offset;
     VkDeviceSize size;
     DXGI_FORMAT dxgi_format;
