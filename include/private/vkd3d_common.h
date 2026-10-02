@@ -76,6 +76,15 @@ static inline size_t align(size_t addr, size_t alignment)
 # define VKD3D_NOINLINE
 #endif
 
+/* A hint to bring the cache line at p into the CPU caches; it never faults, whatever p is. */
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+# define vkd3d_prefetch(p) _mm_prefetch((const char *)(p), _MM_HINT_T0)
+#elif defined(__GNUC__)
+# define vkd3d_prefetch(p) __builtin_prefetch(p)
+#else
+# define vkd3d_prefetch(p) ((void)(p))
+#endif
+
 #if __has_attribute(__counted_by__)
 # define vkd3d_counted_by(member) __attribute__((__counted_by__(member)))
 #else
