@@ -6185,14 +6185,24 @@ static inline void d3d12_device_copy_descriptors(struct d3d12_device *device,
  * copy of embedded_64_16_packed on RADV). They took d3d12_device_copy_descriptors, a call to d3d12_desc_copy and a
  * memcpy call per run: 0.68 ms per 20 ms frame of the game's main thread. A run of CopyDescriptors is by definition
  * a CopyDescriptorsSimple of that many descriptors; the ranges are walked as d3d12_device_copy_descriptors walks
- * them. RTV and DSV copies keep the generic path (the simple variants send them there anyway). */
-static void d3d12_device_copy_descriptor_runs(d3d12_device_iface *iface, struct d3d12_device *device,
+ * them. RTV and DSV copies keep the generic path (the simple variants send them there anyway).
+ *
+ * Each layout variant has a CopyDescriptors of its own (VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT) whose walk calls
+ * that variant's CopyDescriptorsSimple directly, and the variants are forced inline, so the copy sits in the loop:
+ * with a call through the vtable per run, the walk took 0.29 ms of the main thread's frame in the CPU profile of
+ * Witcher 3 on unit A (lab session 298) and the copies 0.18 ms. Loading the source descriptors of the next runs
+ * ahead (prefetch) gained nothing in a model of the walk on the development PC, cold or warm: the loads of
+ * successive runs are independent and already overlap. */
+typedef void (STDMETHODCALLTYPE *PFN_d3d12_device_copy_descriptors_simple)(d3d12_device_iface *iface,
+        UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
+        const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset, D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type);
+
+static FORCEINLINE void d3d12_device_copy_descriptor_runs(d3d12_device_iface *iface, struct d3d12_device *device,
         UINT dst_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_range_offsets, const UINT *dst_range_sizes,
         UINT src_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *src_range_offsets, const UINT *src_range_sizes,
-        D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
+        D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type, PFN_d3d12_device_copy_descriptors_simple copy_simple)
 {
     unsigned int dst_range_idx = 0, dst_idx = 0, src_range_idx = 0, src_idx = 0;
-    const struct ID3D12Device15Vtbl *vtbl = iface->lpVtbl;
     unsigned int dst_range_size, src_range_size, copy_count;
     D3D12_CPU_DESCRIPTOR_HANDLE dst, src;
     unsigned int increment;
@@ -6208,7 +6218,7 @@ static void d3d12_device_copy_descriptor_runs(d3d12_device_iface *iface, struct 
         dst = d3d12_advance_cpu_descriptor_handle(dst_range_offsets[dst_range_idx], increment, dst_idx);
         src = d3d12_advance_cpu_descriptor_handle(src_range_offsets[src_range_idx], increment, src_idx);
         if (copy_count)
-            vtbl->CopyDescriptorsSimple(iface, copy_count, dst, src, descriptor_heap_type);
+            copy_simple(iface, copy_count, dst, src, descriptor_heap_type);
 
         dst_idx += copy_count;
         src_idx += copy_count;
@@ -6225,6 +6235,8 @@ static void d3d12_device_copy_descriptor_runs(d3d12_device_iface *iface, struct 
     }
 }
 
+#ifdef VKD3D_ENABLE_PROFILING
+/* The CopyDescriptors of a profiled device (device_profiled.h), whose CopyDescriptorsSimple is not a variant's. */
 static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors(d3d12_device_iface *iface,
         UINT dst_descriptor_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_offsets,
         const UINT *dst_descriptor_range_sizes,
@@ -6246,7 +6258,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors(d3d12_device_iface *i
         d3d12_device_copy_descriptor_runs(iface, impl_from_ID3D12Device(iface),
                 dst_descriptor_range_count, dst_descriptor_range_offsets, dst_descriptor_range_sizes,
                 src_descriptor_range_count, src_descriptor_range_offsets, src_descriptor_range_sizes,
-                descriptor_heap_type);
+                descriptor_heap_type, iface->lpVtbl->CopyDescriptorsSimple);
         return;
     }
 
@@ -6257,8 +6269,9 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors(d3d12_device_iface *i
             src_descriptor_range_sizes,
             descriptor_heap_type);
 }
+#endif
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_descriptor_buffer_16_16_4(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_descriptor_buffer_16_16_4(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6363,7 +6376,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_descriptor_buff
     }
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_descriptor_buffer_64_64_32(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_descriptor_buffer_64_64_32(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6467,7 +6480,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_descriptor_buff
     }
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_64_16_packed(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_64_16_packed(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6560,7 +6573,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_64_16_
     }
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_32_16_planar(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_32_16_planar(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6617,7 +6630,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_32_16_
     }
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_32_32_planar(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_32_32_planar(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6657,7 +6670,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_32_32_
     }
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_128_32_planar(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_128_32_planar(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6703,7 +6716,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_128_32
     }
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_generic(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_generic(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6739,7 +6752,7 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_generi
     }
 }
 
-static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_default(d3d12_device_iface *iface,
+static FORCEINLINE void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_default(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
         D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
@@ -6769,6 +6782,40 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_default(d3d12_d
                 descriptor_heap_type);
     }
 }
+
+/* amdgpu-wddm fork: the CopyDescriptors of a layout variant, see d3d12_device_copy_descriptor_runs. */
+#define VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(variant) \
+static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors_##variant(d3d12_device_iface *iface, \
+        UINT dst_descriptor_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_offsets, \
+        const UINT *dst_descriptor_range_sizes, \
+        UINT src_descriptor_range_count, const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_offsets, \
+        const UINT *src_descriptor_range_sizes, \
+        D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type) \
+{ \
+    if (VKD3D_EXPECT_TRUE(descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || \
+            descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)) \
+    { \
+        d3d12_device_copy_descriptor_runs(iface, impl_from_ID3D12Device(iface), \
+                dst_descriptor_range_count, dst_descriptor_range_offsets, dst_descriptor_range_sizes, \
+                src_descriptor_range_count, src_descriptor_range_offsets, src_descriptor_range_sizes, \
+                descriptor_heap_type, d3d12_device_CopyDescriptorsSimple_##variant); \
+        return; \
+    } \
+\
+    d3d12_device_copy_descriptors(impl_from_ID3D12Device(iface), \
+            dst_descriptor_range_count, dst_descriptor_range_offsets, dst_descriptor_range_sizes, \
+            src_descriptor_range_count, src_descriptor_range_offsets, src_descriptor_range_sizes, \
+            descriptor_heap_type); \
+}
+
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(default)
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(embedded_64_16_packed)
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(embedded_32_16_planar)
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(embedded_32_32_planar)
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(embedded_128_32_planar)
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(embedded_generic)
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(descriptor_buffer_16_16_4)
+VKD3D_DECLARE_COPY_DESCRIPTORS_VARIANT(descriptor_buffer_64_64_32)
 
 static D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE d3d12_device_GetResourceAllocationInfo1(d3d12_device_iface *iface,
         D3D12_RESOURCE_ALLOCATION_INFO *info, UINT visible_mask, UINT count, const D3D12_RESOURCE_DESC *resource_descs,
@@ -8977,7 +9024,7 @@ CONST_VTBL struct ID3D12Device15Vtbl d3d12_device_vtbl_##name = \
     d3d12_device_CreateRenderTargetView, \
     d3d12_device_CreateDepthStencilView, \
     d3d12_device_CreateSampler_##create_desc, \
-    d3d12_device_CopyDescriptors, \
+    d3d12_device_CopyDescriptors_##copy_desc_variant, \
     d3d12_device_CopyDescriptorsSimple_##copy_desc_variant, \
     d3d12_device_GetResourceAllocationInfo, \
     d3d12_device_GetCustomHeapProperties, \
@@ -10613,7 +10660,8 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
      * (which is still very fast, but every nanosecond counts in these functions). */
 
     /* Don't bother modifying CopyDescriptors path, its main overhead is chasing other pointers anyway,
-     * and that code path handles embedded mutable descriptors. */
+     * and that code path handles embedded mutable descriptors.
+     * (amdgpu-wddm fork: each variant has a CopyDescriptors of its own, see d3d12_device_copy_descriptor_runs.) */
 
     if (d3d12_device_use_descriptor_heap(device))
     {
