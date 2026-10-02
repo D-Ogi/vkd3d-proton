@@ -7299,6 +7299,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
 
     list->index_buffer.buffer = VK_NULL_HANDLE;
     list->index_buffer.is_dirty = true;
+    list->index_buffer.view_valid = false;
 
     list->current_pipeline = VK_NULL_HANDLE;
     list->command_buffer_pipeline = VK_NULL_HANDLE;
@@ -8729,6 +8730,7 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
 
                     /* This modifies global state, but if app hits this, it's already buggy. */
                     dyn_state->vertex_offsets[i + range.offset] &= ~(VkDeviceSize)stride_align_masks[i + range.offset];
+                    dyn_state->vertex_view_mask &= ~(1u << (i + range.offset));
                 }
 
                 if (dyn_state->vertex_strides[i + range.offset] & stride_align_masks[i + range.offset])
@@ -8742,6 +8744,7 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
                     dyn_state->vertex_strides[i + range.offset] =
                             (dyn_state->vertex_strides[i + range.offset] + stride_align_masks[i + range.offset]) &
                             ~(VkDeviceSize)stride_align_masks[i + range.offset];
+                    dyn_state->vertex_view_mask &= ~(1u << (i + range.offset));
                 }
             }
 
@@ -15207,18 +15210,50 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetGraphicsRootUnorderedAccessV
             root_parameter_index, address);
 }
 
+/* amdgpu-wddm fork (draw-path2): a vertex or index buffer set again to the view it was last resolved from keeps its
+ * resolved state without resolving the VA again, while the VA map has removed nothing that the VA could have named
+ * (vkd3d_va_map_generation). Breadcrumbs record the resource of every set, so they take the full path. */
+static inline bool d3d12_command_list_buffer_view_keys_usable(void)
+{
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+    return !VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS);
+#else
+    return true;
+#endif
+}
+
+static inline bool vkd3d_vertex_buffer_view_equal(const D3D12_VERTEX_BUFFER_VIEW *a, const D3D12_VERTEX_BUFFER_VIEW *b)
+{
+    return !((a->BufferLocation ^ b->BufferLocation) | (a->SizeInBytes ^ b->SizeInBytes) |
+            (a->StrideInBytes ^ b->StrideInBytes));
+}
+
+static inline bool vkd3d_index_buffer_view_equal(const D3D12_INDEX_BUFFER_VIEW *a, const D3D12_INDEX_BUFFER_VIEW *b)
+{
+    return !((a->BufferLocation ^ b->BufferLocation) | (a->SizeInBytes ^ b->SizeInBytes) |
+            ((uint32_t)a->Format ^ (uint32_t)b->Format));
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_list_iface *iface,
         const D3D12_INDEX_BUFFER_VIEW *view)
 {
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     const struct vkd3d_unique_resource *resource = NULL;
     enum VkIndexType index_type;
+    uint32_t generation;
 
     VkDeviceSize old_offset, old_size;
     VkIndexType old_type;
     VkBuffer old_buffer;
 
     TRACE("iface %p, view %p.\n", iface, view);
+
+    generation = vkd3d_va_map_generation(&list->device->memory_allocator.va_map);
+    if (view && list->index_buffer.view_valid && list->index_buffer.view_generation == generation &&
+            vkd3d_index_buffer_view_equal(view, &list->index_buffer.view) &&
+            d3d12_command_list_buffer_view_keys_usable())
+        return;
+    list->index_buffer.view_valid = false;
 
     /* amdgpu-wddm fork: only a change rebinds. Games set the same index buffer again before most draws, and every
      * vkCmdBindIndexBuffer2KHR names the buffer's BO to the ICD's command stream again (draw-path2). Until the next
@@ -15263,6 +15298,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
             list->index_buffer.buffer = resource->vk_buffer;
             list->index_buffer.offset = view->BufferLocation - resource->va;
             list->index_buffer.size = view->SizeInBytes;
+            list->index_buffer.view = *view;
+            list->index_buffer.view_generation = generation;
+            list->index_buffer.view_valid = true;
         }
         else
         {
@@ -15294,7 +15332,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
     const struct vkd3d_unique_resource *resource = NULL;
     uint32_t vbo_invalidate_mask = 0;
     bool invalidate = false;
+    uint32_t generation;
     unsigned int i;
+    bool keys;
 
     TRACE("iface %p, start_slot %u, view_count %u, views %p.\n", iface, start_slot, view_count, views);
 
@@ -15309,13 +15349,26 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
     if (!views)
         return;
 
+    generation = vkd3d_va_map_generation(&list->device->memory_allocator.va_map);
+    if (dyn_state->vertex_view_generation != generation)
+    {
+        dyn_state->vertex_view_mask = 0;
+        dyn_state->vertex_view_generation = generation;
+    }
+    keys = d3d12_command_list_buffer_view_keys_usable();
+
     for (i = 0; i < view_count; ++i)
     {
+        const uint32_t slot_bit = 1u << (start_slot + i);
         bool invalid_va = false;
         VkBuffer buffer;
         VkDeviceSize offset;
         VkDeviceSize size;
         uint32_t stride;
+
+        if (keys && (dyn_state->vertex_view_mask & slot_bit) &&
+                vkd3d_vertex_buffer_view_equal(&views[i], &dyn_state->vertex_views[start_slot + i]))
+            continue;
 
         if (views[i].BufferLocation)
         {
@@ -15341,6 +15394,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
             offset = 0;
             size = 0;
             stride = VKD3D_NULL_BUFFER_SIZE;
+            dyn_state->vertex_view_mask &= ~slot_bit;
+        }
+        else
+        {
+            dyn_state->vertex_views[start_slot + i] = views[i];
+            dyn_state->vertex_view_mask |= slot_bit;
         }
 
         VKD3D_BREADCRUMB_AUX32(start_slot + i);
@@ -18239,6 +18298,7 @@ static void d3d12_command_list_clear_signature_state(
                 /* Null IBO */
                 list->index_buffer.buffer = VK_NULL_HANDLE;
                 list->index_buffer.is_dirty = true;
+                list->index_buffer.view_valid = false;
                 break;
 
             case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
@@ -18249,6 +18309,7 @@ static void d3d12_command_list_clear_signature_state(
                 list->dynamic_state.vertex_strides[slot] = 0;
                 list->dynamic_state.vertex_offsets[slot] = 0;
                 list->dynamic_state.vertex_sizes[slot] = 0;
+                list->dynamic_state.vertex_view_mask &= ~(1u << slot);
                 break;
             }
 

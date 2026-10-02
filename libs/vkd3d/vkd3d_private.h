@@ -405,7 +405,16 @@ struct vkd3d_va_map
     struct vkd3d_descriptor_heap_mapping *sampler_mappings;
     size_t sampler_mappings_count;
     size_t sampler_mappings_size;
+
+    /* amdgpu-wddm fork: counts removals. A VA resolved while it stays unchanged still names the same resource,
+     * which is what lets a command list keep the vertex and index buffer views it resolved (draw-path2). */
+    uint32_t generation;
 };
+
+static inline uint32_t vkd3d_va_map_generation(struct vkd3d_va_map *va_map)
+{
+    return vkd3d_atomic_uint32_load_explicit(&va_map->generation, vkd3d_memory_order_relaxed);
+}
 
 const char *vkd3d_get_rtas_kind_string(enum vkd3d_rtas_kind rtas_kind);
 void vkd3d_va_map_insert(struct vkd3d_va_map *va_map, struct vkd3d_unique_resource *resource);
@@ -3006,6 +3015,13 @@ struct vkd3d_dynamic_state
     VkDeviceSize vertex_sizes[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
     VkDeviceSize vertex_strides[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
 
+    /* amdgpu-wddm fork: the view each slot above was resolved from, where its bit in vertex_view_mask is set, while
+     * the VA map's generation is vertex_view_generation. IASetVertexBuffers skips a slot set to that view again,
+     * without resolving its VA (draw-path2). Whatever else writes a slot clears its bit. */
+    D3D12_VERTEX_BUFFER_VIEW vertex_views[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+    uint32_t vertex_view_mask;
+    uint32_t vertex_view_generation;
+
     D3D12_PRIMITIVE_TOPOLOGY primitive_topology;
     VkPrimitiveTopology vk_primitive_topology;
 
@@ -3466,6 +3482,10 @@ struct vkd3d_index_buffer
     DXGI_FORMAT dxgi_format;
     VkIndexType vk_type;
     bool is_dirty;
+    /* amdgpu-wddm fork: as the vertex buffer views of vkd3d_dynamic_state, for the fields above (draw-path2). */
+    bool view_valid;
+    uint32_t view_generation;
+    D3D12_INDEX_BUFFER_VIEW view;
 };
 
 struct vkd3d_dgc_batch_draw

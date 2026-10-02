@@ -179,6 +179,9 @@ void vkd3d_va_map_remove(struct vkd3d_va_map *va_map, const struct vkd3d_unique_
     struct vkd3d_va_block *block;
     size_t index;
 
+    /* amdgpu-wddm fork: a VA of this resource may name another one from now on. */
+    vkd3d_atomic_uint32_increment(&va_map->generation, vkd3d_memory_order_relaxed);
+
     if (resource->size >= VKD3D_VA_BLOCK_SIZE)
     {
         min_va = resource->va;
