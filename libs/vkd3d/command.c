@@ -52,6 +52,7 @@ struct d3d12_command_list_barrier_batch
     VkImageMemoryBarrier2 vk_image_barriers[MAX_BATCHED_IMAGE_BARRIERS];
     VkMemoryBarrier2 vk_memory_barrier;
     uint32_t image_barrier_count;
+    uint32_t recorded; /* vkCmdPipelineBarrier2 calls, for BC250_DRAW_STATS */
 };
 
 static void d3d12_command_list_barrier_batch_init(struct d3d12_command_list_barrier_batch *batch);
@@ -95,6 +96,262 @@ static void d3d12_command_list_clear_rtas_batch(struct d3d12_command_list *list)
 static void d3d12_command_list_flush_query_resolves(struct d3d12_command_list *list);
 
 static void d3d12_command_allocator_ensure_compute_fallback(struct d3d12_command_allocator *allocator);
+
+/* amdgpu-wddm fork: BC250_DRAW_STATS=1, from the environment or else from the ICD's knob file
+ * C:\BC250\tmp\amdgpu_wddm_radv.cfg (which also reaches a game that Steam starts), counts how the process's D3D12
+ * barriers become Vulkan ones, next to what the ICD counts of the Vulkan barriers (its draw: and sync: lines): at
+ * the first ExecuteCommandLists 10 s after the last line and at a device's end, if anything changed, a "barriers:"
+ * line in C:\BC250\tmp\amdgpu_wddm_radv-deferred-<pid>-vkd3d.log (else the same name in %TEMP%), named so that a pull
+ * of the ICD's deferred logs takes it along. Off, a counted site pays one branch. The counters
+ * (VKD3D_BARRIER_STATS), totals since the process began:
+ * - ecl_calls, ecl_lists: ExecuteCommandLists calls and the lists they submit; ecl_init_transitions those calls that
+ *   need the initial layout transitions of a command buffer of their own; lists: lists closed.
+ * - rb_calls: ResourceBarrier calls; rb_copy_deferred those folded into the transfer batch (COPY_DEST <-> shader
+ *   resource only), rb_read_held those held while a render pass is active; rb_vk_barriers the
+ *   vkCmdPipelineBarrier2 calls ResourceBarrier records; vk_batches every barrier batch recorded (ResourceBarrier,
+ *   copies and the other users of the batch).
+ * - tr_*: transition barriers: tr_total, of them tr_texture and tr_buffer (a buffer one is a memory barrier),
+ *   tr_layout the texture ones that change the image layout; by states: from a render target, depth write,
+ *   unordered access or copy destination to read-only states (tr_rt_read, tr_ds_read, tr_uav_read, tr_copy_read)
+ *   and back (tr_read_rt, tr_read_ds, tr_read_uav, tr_read_copy), read-only to read-only (tr_read_read), from or
+ *   to COMMON (tr_common), anything else (tr_other). Read-only: the GENERIC_READ states and DEPTH_READ.
+ * - uav: UAV barriers (a memory barrier for unordered access writes, transfer writes included for the clears),
+ *   uav_null of them without a resource; alias: aliasing barriers.
+ * - held_flushes: barriers recorded for held transitions after a pass ends; force_pre, force_post: the barriers
+ *   before and after a dispatch that a shader's meta flags or a pending UAV clear ask for; pass_pre: those before
+ *   a render pass begins; clear_uav_syncs: of these, those a pending ClearUnorderedAccessView* caused. */
+static const char *const vkd3d_barrier_stat_names[VKD3D_BARRIER_STAT_COUNT] =
+{
+#define VKD3D_BARRIER_STAT_NAME(name) #name,
+    VKD3D_BARRIER_STATS(VKD3D_BARRIER_STAT_NAME)
+#undef VKD3D_BARRIER_STAT_NAME
+};
+
+static struct
+{
+    int state; /* -1 unknown, 0 off, 1 on: a benign race, every thread resolves the same value */
+    pthread_mutex_t mutex;
+    uint64_t totals[VKD3D_BARRIER_STAT_COUNT];
+    uint64_t snapshot[VKD3D_BARRIER_STAT_COUNT];
+    uint64_t start_ns, next_ns;
+    unsigned int lines;
+    bool log_opened;
+#ifdef _WIN32
+    HANDLE log;
+#endif
+} vkd3d_barrier_stats = {-1, PTHREAD_MUTEX_INITIALIZER};
+
+#define VKD3D_BARRIER_STATS_INTERVAL_NS (10ull * 1000000000ull)
+
+static bool vkd3d_barrier_stats_knob(void)
+{
+    char value[16];
+#ifdef _WIN32
+    char line[256];
+    FILE *file;
+    bool on;
+#endif
+
+    if (vkd3d_get_env_var("BC250_DRAW_STATS", value, sizeof(value)))
+        return !strcmp(value, "1");
+#ifdef _WIN32
+    if (!(file = fopen("C:\\BC250\\tmp\\amdgpu_wddm_radv.cfg", "r")))
+        return false;
+    on = false;
+    while (fgets(line, sizeof(line), file))
+    {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!strncmp(line, "BC250_DRAW_STATS=", strlen("BC250_DRAW_STATS=")))
+            on = !strcmp(line + strlen("BC250_DRAW_STATS="), "1");
+    }
+    fclose(file);
+    return on;
+#else
+    return false;
+#endif
+}
+
+static VKD3D_NOINLINE bool vkd3d_barrier_stats_resolve(void)
+{
+    int state = vkd3d_barrier_stats_knob() ? 1 : 0;
+
+    if (state)
+    {
+        pthread_mutex_lock(&vkd3d_barrier_stats.mutex);
+        if (!vkd3d_barrier_stats.start_ns)
+        {
+            vkd3d_barrier_stats.start_ns = vkd3d_get_current_time_ns();
+            vkd3d_barrier_stats.next_ns = vkd3d_barrier_stats.start_ns + VKD3D_BARRIER_STATS_INTERVAL_NS;
+        }
+        pthread_mutex_unlock(&vkd3d_barrier_stats.mutex);
+    }
+    vkd3d_atomic_uint32_store_explicit((uint32_t *)&vkd3d_barrier_stats.state, state, vkd3d_memory_order_release);
+    return state;
+}
+
+static inline bool vkd3d_barrier_stats_on(void)
+{
+    int state = vkd3d_barrier_stats.state;
+    return VKD3D_EXPECT_FALSE(state) && (state > 0 || vkd3d_barrier_stats_resolve());
+}
+
+#define VKD3D_BARRIER_STAT(list, name) \
+    do { if (vkd3d_barrier_stats_on()) (list)->barrier_stats[VKD3D_BARRIER_STAT_##name]++; } while (0)
+
+/* Called with the mutex held. */
+static void vkd3d_barrier_stats_write_locked(uint64_t now)
+{
+    char counts[2048], text[2400];
+    size_t len = 0;
+    unsigned int i;
+    int n;
+
+    if (!memcmp(vkd3d_barrier_stats.totals, vkd3d_barrier_stats.snapshot, sizeof(vkd3d_barrier_stats.totals)))
+        return;
+    memcpy(vkd3d_barrier_stats.snapshot, vkd3d_barrier_stats.totals, sizeof(vkd3d_barrier_stats.totals));
+
+    counts[0] = '\0';
+    for (i = 0; i < VKD3D_BARRIER_STAT_COUNT && len < sizeof(counts); i++)
+    {
+        if ((n = snprintf(counts + len, sizeof(counts) - len, " %s=%"PRIu64,
+                vkd3d_barrier_stat_names[i], vkd3d_barrier_stats.totals[i])) < 0)
+            break;
+        len += n;
+    }
+
+#ifdef _WIN32
+    {
+        SYSTEMTIME utc;
+        LARGE_INTEGER qpc;
+        DWORD written;
+        char path[MAX_PATH + 64];
+
+        if (!vkd3d_barrier_stats.log_opened)
+        {
+            vkd3d_barrier_stats.log_opened = true;
+            snprintf(path, sizeof(path), "C:\\BC250\\tmp\\amdgpu_wddm_radv-deferred-%lu-vkd3d.log",
+                    (unsigned long)GetCurrentProcessId());
+            vkd3d_barrier_stats.log = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (vkd3d_barrier_stats.log == INVALID_HANDLE_VALUE && (n = GetTempPathA(MAX_PATH, path)) && n < MAX_PATH)
+            {
+                snprintf(path + n, sizeof(path) - n, "amdgpu_wddm_radv-deferred-%lu-vkd3d.log",
+                        (unsigned long)GetCurrentProcessId());
+                vkd3d_barrier_stats.log = CreateFileA(path, FILE_APPEND_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            }
+        }
+        if (vkd3d_barrier_stats.log == INVALID_HANDLE_VALUE)
+            return;
+
+        GetSystemTime(&utc);
+        QueryPerformanceCounter(&qpc);
+        n = snprintf(text, sizeof(text), "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ qpc=%lld tid=%lu engine stats: periodic #%u "
+                "t=%"PRIu64"s barriers:%s\n", utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond,
+                utc.wMilliseconds, (long long)qpc.QuadPart, (unsigned long)GetCurrentThreadId(),
+                ++vkd3d_barrier_stats.lines, (now - vkd3d_barrier_stats.start_ns) / 1000000000ull, counts);
+        if (n < 0)
+            return;
+        if (n >= (int)sizeof(text))
+        {
+            n = sizeof(text) - 1;
+            text[n - 1] = '\n';
+        }
+        WriteFile(vkd3d_barrier_stats.log, text, n, &written, NULL);
+    }
+#else
+    (void)text;
+    (void)now;
+#endif
+}
+
+/* Adds a closed list's counters to the totals. */
+static void vkd3d_barrier_stats_add_list(struct d3d12_command_list *list)
+{
+    unsigned int i;
+
+    list->barrier_stats[VKD3D_BARRIER_STAT_lists]++;
+    pthread_mutex_lock(&vkd3d_barrier_stats.mutex);
+    for (i = 0; i < VKD3D_BARRIER_STAT_COUNT; i++)
+        vkd3d_barrier_stats.totals[i] += list->barrier_stats[i];
+    pthread_mutex_unlock(&vkd3d_barrier_stats.mutex);
+    memset(list->barrier_stats, 0, sizeof(list->barrier_stats));
+}
+
+/* Counts an ExecuteCommandLists call and writes the line once the period is over. */
+static void vkd3d_barrier_stats_add_submission(unsigned int list_count, bool init_transitions)
+{
+    uint64_t now = vkd3d_get_current_time_ns();
+
+    pthread_mutex_lock(&vkd3d_barrier_stats.mutex);
+    vkd3d_barrier_stats.totals[VKD3D_BARRIER_STAT_ecl_calls]++;
+    vkd3d_barrier_stats.totals[VKD3D_BARRIER_STAT_ecl_lists] += list_count;
+    vkd3d_barrier_stats.totals[VKD3D_BARRIER_STAT_ecl_init_transitions] += init_transitions;
+    if (now >= vkd3d_barrier_stats.next_ns)
+    {
+        vkd3d_barrier_stats.next_ns = now + VKD3D_BARRIER_STATS_INTERVAL_NS;
+        vkd3d_barrier_stats_write_locked(now);
+    }
+    pthread_mutex_unlock(&vkd3d_barrier_stats.mutex);
+}
+
+void vkd3d_barrier_stats_final(void)
+{
+    if (vkd3d_barrier_stats.state <= 0)
+        return;
+    pthread_mutex_lock(&vkd3d_barrier_stats.mutex);
+    vkd3d_barrier_stats_write_locked(vkd3d_get_current_time_ns());
+    pthread_mutex_unlock(&vkd3d_barrier_stats.mutex);
+}
+
+static bool vkd3d_resource_states_read_only(D3D12_RESOURCE_STATES states)
+{
+    return states && !(states & ~(D3D12_RESOURCE_STATE_GENERIC_READ | D3D12_RESOURCE_STATE_DEPTH_READ));
+}
+
+static void vkd3d_barrier_stats_transition(struct d3d12_command_list *list, const struct d3d12_resource *resource,
+        const D3D12_RESOURCE_TRANSITION_BARRIER *transition, VkImageLayout old_layout, VkImageLayout new_layout)
+{
+    D3D12_RESOURCE_STATES before = transition->StateBefore, after = transition->StateAfter;
+    uint32_t *counts = list->barrier_stats;
+    bool read_before, read_after;
+
+    counts[VKD3D_BARRIER_STAT_tr_total]++;
+    if (d3d12_resource_is_texture(resource))
+    {
+        counts[VKD3D_BARRIER_STAT_tr_texture]++;
+        counts[VKD3D_BARRIER_STAT_tr_layout] += old_layout != new_layout;
+    }
+    else
+    {
+        counts[VKD3D_BARRIER_STAT_tr_buffer]++;
+    }
+
+    read_before = vkd3d_resource_states_read_only(before);
+    read_after = vkd3d_resource_states_read_only(after);
+    if (before == D3D12_RESOURCE_STATE_COMMON || after == D3D12_RESOURCE_STATE_COMMON)
+        counts[VKD3D_BARRIER_STAT_tr_common]++;
+    else if (read_before && read_after)
+        counts[VKD3D_BARRIER_STAT_tr_read_read]++;
+    else if (read_after && before == D3D12_RESOURCE_STATE_RENDER_TARGET)
+        counts[VKD3D_BARRIER_STAT_tr_rt_read]++;
+    else if (read_after && before == D3D12_RESOURCE_STATE_DEPTH_WRITE)
+        counts[VKD3D_BARRIER_STAT_tr_ds_read]++;
+    else if (read_after && before == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        counts[VKD3D_BARRIER_STAT_tr_uav_read]++;
+    else if (read_after && before == D3D12_RESOURCE_STATE_COPY_DEST)
+        counts[VKD3D_BARRIER_STAT_tr_copy_read]++;
+    else if (read_before && after == D3D12_RESOURCE_STATE_RENDER_TARGET)
+        counts[VKD3D_BARRIER_STAT_tr_read_rt]++;
+    else if (read_before && after == D3D12_RESOURCE_STATE_DEPTH_WRITE)
+        counts[VKD3D_BARRIER_STAT_tr_read_ds]++;
+    else if (read_before && after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        counts[VKD3D_BARRIER_STAT_tr_read_uav]++;
+    else if (read_before && after == D3D12_RESOURCE_STATE_COPY_DEST)
+        counts[VKD3D_BARRIER_STAT_tr_read_copy]++;
+    else
+        counts[VKD3D_BARRIER_STAT_tr_other]++;
+}
 
 static HRESULT vkd3d_create_binary_semaphore(struct d3d12_device *device, VkSemaphore *vk_semaphore)
 {
@@ -6329,6 +6586,7 @@ static VKD3D_NOINLINE void d3d12_command_list_flush_deferred_read_barriers(struc
     dep_info.imageMemoryBarrierCount = list->deferred_read_barrier_count;
     dep_info.pImageMemoryBarriers = list->deferred_read_barriers;
     VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+    VKD3D_BARRIER_STAT(list, held_flushes);
 
     list->deferred_read_barrier_count = 0;
 }
@@ -7101,6 +7359,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
 
     list->is_recording = false;
     vkd3d_queue_timeline_trace_close_command_list(&list->device->queue_timeline_trace, list->timeline_cookie);
+    if (vkd3d_barrier_stats_on())
+        vkd3d_barrier_stats_add_list(list);
 
     if (!list->is_valid)
     {
@@ -8954,12 +9214,14 @@ static void d3d12_command_list_check_render_pass_barrier(struct d3d12_command_li
                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
             vk_barrier->dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
             list->cmd.clear_uav_pending = false;
+            VKD3D_BARRIER_STAT(list, clear_uav_syncs);
         }
 
         dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         dep_info.pMemoryBarriers = vk_barriers;
 
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+        VKD3D_BARRIER_STAT(list, pass_pre);
         VKD3D_BREADCRUMB_TAG("ForceRenderPassBarrier");
         VKD3D_BREADCRUMB_COMMAND(BARRIER);
         d3d12_command_list_debug_mark_label(list, "ForceRenderPassBarrier", 1.0f, 1.0f, 0.0f, 1.0f);
@@ -9659,12 +9921,15 @@ static void d3d12_command_list_check_pre_compute_barrier(
             vk_barrier.dstStageMask |= vk_dst_stage;
             vk_barrier.dstAccessMask |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
         }
+        if (list->cmd.clear_uav_pending)
+            VKD3D_BARRIER_STAT(list, clear_uav_syncs);
 
         dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         dep_info.memoryBarrierCount = 1;
         dep_info.pMemoryBarriers = &vk_barrier;
 
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+        VKD3D_BARRIER_STAT(list, force_pre);
         VKD3D_BREADCRUMB_TAG("ForcePreBarrier");
         VKD3D_BREADCRUMB_COMMAND(BARRIER);
         d3d12_command_list_debug_mark_label(list, "ForcePreBarrier", 1.0f, 1.0f, 0.0f, 1.0f);
@@ -9713,6 +9978,7 @@ static void d3d12_command_list_check_compute_barrier(struct d3d12_command_list *
         dep_info.pMemoryBarriers = &vk_barrier;
 
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+        VKD3D_BARRIER_STAT(list, force_post);
         VKD3D_BREADCRUMB_TAG("ForceBarrier");
         VKD3D_BREADCRUMB_COMMAND(BARRIER);
         d3d12_command_list_debug_mark_label(list, "ForcePostBarrier", 1.0f, 1.0f, 0.0f, 1.0f);
@@ -13830,6 +14096,7 @@ static void vk_image_memory_barrier_for_transition(
 static void d3d12_command_list_barrier_batch_init(struct d3d12_command_list_barrier_batch *batch)
 {
     batch->image_barrier_count = 0;
+    batch->recorded = 0;
 
     memset(&batch->vk_memory_barrier, 0, sizeof(batch->vk_memory_barrier));
     batch->vk_memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -13871,6 +14138,8 @@ static void d3d12_command_list_barrier_batch_end(struct d3d12_command_list *list
         d3d12_command_list_check_end_of_command_list_cleanup(list);
 
         VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+        batch->recorded++;
+        VKD3D_BARRIER_STAT(list, vk_batches);
 
         batch->vk_memory_barrier.srcStageMask = 0;
         batch->vk_memory_barrier.srcAccessMask = 0;
@@ -14491,15 +14760,22 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
     TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
 
     d3d12_command_list_prefetch_barrier_resources(barrier_count, barriers);
+    VKD3D_BARRIER_STAT(list, rb_calls);
 
     /* Ignore enhanced barriers. They are much harder to reason about due to the transient nature of Vulkan-style
      * barriers. This is more or less just a workaround too for terribly written games,
      * so keep it as simple as it can be for now. */
     if (d3d12_command_list_check_resource_barrier_trivial_copy_resource(list, barrier_count, barriers))
+    {
+        VKD3D_BARRIER_STAT(list, rb_copy_deferred);
         return;
+    }
 
     if (d3d12_command_list_defer_read_barriers(list, barrier_count, barriers))
+    {
+        VKD3D_BARRIER_STAT(list, rb_read_held);
         return;
+    }
 
     d3d12_command_list_flush_dgc_batch(list);
     d3d12_command_list_end_current_render_pass(list, false);
@@ -14658,9 +14934,13 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                         &transition_dst_access);
 
                 if (d3d12_resource_is_texture(preserve_resource))
+                    new_layout = vk_image_layout_from_d3d12_resource_state(list, preserve_resource, transition->StateAfter);
+                if (vkd3d_barrier_stats_on())
+                    vkd3d_barrier_stats_transition(list, preserve_resource, transition, old_layout, new_layout);
+
+                if (d3d12_resource_is_texture(preserve_resource))
                 {
                     VkImageMemoryBarrier2 vk_transition;
-                    new_layout = vk_image_layout_from_d3d12_resource_state(list, preserve_resource, transition->StateAfter);
                     vk_image_memory_barrier_for_transition(&vk_transition,
                             preserve_resource,
                             transition->Subresource, old_layout, new_layout,
@@ -14724,6 +15004,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
 
                 list->cmd.clear_uav_pending = false;
 
+                VKD3D_BARRIER_STAT(list, uav);
+                if (!preserve_resource)
+                    VKD3D_BARRIER_STAT(list, uav_null);
+
                 d3d12_command_list_debug_mark_label(list, "UAV", 1.0f, 1.0f, 0.0f, 1.0f);
 
                 TRACE("UAV barrier (resource %p).\n", preserve_resource);
@@ -14741,6 +15025,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                 TRACE("Aliasing barrier (before %p, after %p).\n", alias->pResourceBefore, alias->pResourceAfter);
                 before = impl_from_ID3D12Resource(alias->pResourceBefore);
                 after = impl_from_ID3D12Resource(alias->pResourceAfter);
+                VKD3D_BARRIER_STAT(list, alias);
 
                 VKD3D_BREADCRUMB_TAG("Aliasing Barrier");
 
@@ -14801,6 +15086,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
     }
 
     d3d12_command_list_barrier_batch_end(list, &batch);
+    if (vkd3d_barrier_stats_on())
+        list->barrier_stats[VKD3D_BARRIER_STAT_rb_vk_barriers] += batch.recorded;
 
     /* Vulkan doesn't support split barriers. */
     if (have_split_barriers)
@@ -24793,6 +25080,9 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
         buffer->sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
         buffer->commandBuffer = command_queue->vkd3d_queue->barrier_command_buffer;
     }
+
+    if (vkd3d_barrier_stats_on())
+        vkd3d_barrier_stats_add_submission(command_list_count, num_transitions != 0);
 
     if (command_list_count == 1 && num_transitions != 0)
     {

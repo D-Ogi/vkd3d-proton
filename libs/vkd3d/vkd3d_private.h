@@ -3462,6 +3462,25 @@ struct vkd3d_timestamp_profiler_submitted_work;
 /* Read-only texture transitions held while a render pass is active (d3d12_command_list_defer_read_barriers). */
 #define VKD3D_MAX_DEFERRED_READ_BARRIER_COUNT 16u
 
+/* amdgpu-wddm fork: the barrier counters of BC250_DRAW_STATS (command.c, vkd3d_barrier_stats_on). */
+#define VKD3D_BARRIER_STATS(X) \
+    X(ecl_calls) X(ecl_lists) X(ecl_init_transitions) X(lists) X(rb_calls) X(rb_copy_deferred) X(rb_read_held) \
+    X(rb_vk_barriers) X(vk_batches) X(tr_total) X(tr_texture) X(tr_buffer) X(tr_layout) X(tr_rt_read) \
+    X(tr_read_rt) X(tr_ds_read) X(tr_read_ds) X(tr_uav_read) X(tr_read_uav) X(tr_copy_read) X(tr_read_copy) \
+    X(tr_read_read) X(tr_common) X(tr_other) X(uav) X(uav_null) X(alias) X(held_flushes) X(force_pre) \
+    X(force_post) X(pass_pre) X(clear_uav_syncs)
+
+enum vkd3d_barrier_stat
+{
+#define VKD3D_BARRIER_STAT_ENUM(name) VKD3D_BARRIER_STAT_##name,
+    VKD3D_BARRIER_STATS(VKD3D_BARRIER_STAT_ENUM)
+#undef VKD3D_BARRIER_STAT_ENUM
+    VKD3D_BARRIER_STAT_COUNT
+};
+
+/* Writes the barrier counters if they changed since the last line (a device's end). */
+void vkd3d_barrier_stats_final(void);
+
 struct vkd3d_deferred_clear
 {
     struct d3d12_resource *resource;
@@ -3655,6 +3674,9 @@ struct d3d12_command_list
     struct d3d_destruction_notifier destruction_notifier;
 
     VkImageMemoryBarrier2 deferred_read_barriers[VKD3D_MAX_DEFERRED_READ_BARRIER_COUNT];
+
+    /* BC250_DRAW_STATS: this recording's barrier counters, added to the process's totals and cleared at Close. */
+    uint32_t barrier_stats[VKD3D_BARRIER_STAT_COUNT];
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     unsigned int breadcrumb_context_index;

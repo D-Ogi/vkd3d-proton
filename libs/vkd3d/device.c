@@ -4075,6 +4075,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     size_t i, j;
 
     d3d_destruction_notifier_free(&device->destruction_notifier);
+    vkd3d_barrier_stats_final();
 
     /* Inline queue mode: release what the clear tracker still holds while the allocator lives. */
     if (device->inline_queues)
