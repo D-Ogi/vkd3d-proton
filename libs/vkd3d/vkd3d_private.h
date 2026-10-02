@@ -3665,7 +3665,18 @@ void d3d12_command_list_invalidate_root_parameters(struct d3d12_command_list *li
         struct vkd3d_pipeline_bindings *sibling_push_domain);
 void d3d12_command_list_invalidate_descriptor_heap(struct d3d12_command_list *list);
 void d3d12_command_list_update_global_descriptor_heap(struct d3d12_command_list *list);
-void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list);
+void d3d12_command_list_flush_dgc_batch_draws(struct d3d12_command_list *list);
+
+/* Draws, barriers and copies flush the DGC batch, which is nearly always empty. The flush holds copies of the
+ * bindings and dynamic state on its stack, more than a page: the empty check stays inline so that those calls do
+ * not set up that frame (bc250: flush_dgc_batch's own time and its __chkstk were 0.03 ms of the main thread's
+ * frame in the CPU profile of Witcher 3, lab session 291). */
+static inline void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list)
+{
+    if (list->dgc_batch.draws_count)
+        d3d12_command_list_flush_dgc_batch_draws(list);
+}
+
 void d3d12_command_list_meta_push_data(struct d3d12_command_list *list,
         VkCommandBuffer vk_command_buffer,
         VkPipelineLayout vk_pipeline_layout, VkShaderStageFlags stages,

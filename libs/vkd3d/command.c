@@ -18731,7 +18731,7 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
     }
 }
 
-void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list)
+VKD3D_NOINLINE void d3d12_command_list_flush_dgc_batch_draws(struct d3d12_command_list *list)
 {
     struct vkd3d_pipeline_bindings graphics_bindings;
     const struct vkd3d_vk_device_procs *vk_procs;
