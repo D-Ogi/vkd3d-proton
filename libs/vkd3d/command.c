@@ -2935,6 +2935,24 @@ static void d3d12_command_allocator_free_command_pool(
     VK_CALL(vkDestroyCommandPool(device->vk_device, pool->vk_command_pool, NULL));
 }
 
+/* amdgpu-wddm fork (draw-path2): a query pool goes back to the device with the number of queries it handed out in
+ * next_index, so that d3d12_device_get_query_pool() resets only those. Of a type's pools, the active one hands out
+ * from its next_index on; the others were used up. */
+static void d3d12_command_allocator_return_query_pools(struct d3d12_command_allocator *allocator)
+{
+    const struct vkd3d_query_pool *active;
+    struct vkd3d_query_pool pool;
+    size_t i;
+
+    for (i = 0; i < allocator->query_pool_count; i++)
+    {
+        pool = allocator->query_pools[i];
+        active = &allocator->active_query_pools[pool.type_index];
+        pool.next_index = active->vk_query_pool == pool.vk_query_pool ? active->next_index : pool.query_count;
+        d3d12_device_return_query_pool(allocator->device, &pool);
+    }
+}
+
 static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator)
 {
     unsigned int i, j;
@@ -3007,8 +3025,7 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
             vkd3d_free(allocator->scratch_pools[i].scratch_buffers);
         }
 
-        for (i = 0; i < allocator->query_pool_count; i++)
-            d3d12_device_return_query_pool(device, &allocator->query_pools[i]);
+        d3d12_command_allocator_return_query_pools(allocator);
 
         vkd3d_free(allocator->query_pools);
 
@@ -3172,8 +3189,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
 #endif
 
     /* Return query pools to the device */
-    for (i = 0; i < allocator->query_pool_count; i++)
-        d3d12_device_return_query_pool(device, &allocator->query_pools[i]);
+    d3d12_command_allocator_return_query_pools(allocator);
 
     allocator->query_pool_count = 0;
     memset(&allocator->active_query_pools, 0, sizeof(allocator->active_query_pools));

@@ -3823,6 +3823,7 @@ static void d3d12_device_destroy_query_pool(struct d3d12_device *device, const s
 HRESULT d3d12_device_get_query_pool(struct d3d12_device *device, uint32_t type_index, struct vkd3d_query_pool *pool)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    uint32_t used;
     size_t i;
 
     pthread_mutex_lock(&device->mutex);
@@ -3832,12 +3833,17 @@ HRESULT d3d12_device_get_query_pool(struct d3d12_device *device, uint32_t type_i
         if (device->query_pools[i].type_index == type_index)
         {
             *pool = device->query_pools[i];
+            /* amdgpu-wddm fork (draw-path2): a pool comes back with the number of queries it handed out
+             * (d3d12_command_allocator_return_query_pools); the rest are still reset from the pool's last reset.
+             * A host reset writes every query's slots, 4096 occlusion queries' worth for a pool used for a few. */
+            used = min(pool->next_index, pool->query_count);
             pool->next_index = 0;
             if (--device->query_pool_count != i)
                 device->query_pools[i] = device->query_pools[device->query_pool_count];
             pthread_mutex_unlock(&device->mutex);
 
-            VK_CALL(vkResetQueryPool(device->vk_device, pool->vk_query_pool, 0, pool->query_count));
+            if (used)
+                VK_CALL(vkResetQueryPool(device->vk_device, pool->vk_query_pool, 0, used));
             return S_OK;
         }
     }
