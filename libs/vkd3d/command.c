@@ -15204,13 +15204,25 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
     const struct vkd3d_unique_resource *resource = NULL;
     enum VkIndexType index_type;
 
+    VkDeviceSize old_offset, old_size;
+    VkIndexType old_type;
+    VkBuffer old_buffer;
+
     TRACE("iface %p, view %p.\n", iface, view);
 
-    list->index_buffer.is_dirty = true;
+    /* amdgpu-wddm fork: only a change rebinds. Games set the same index buffer again before most draws, and every
+     * vkCmdBindIndexBuffer2KHR names the buffer's BO to the ICD's command stream again (draw-path2). Until the next
+     * draw binds it, is_dirty stays set; every path that loses the bound state sets it as before. */
+    old_buffer = list->index_buffer.buffer;
+    old_offset = list->index_buffer.offset;
+    old_size = list->index_buffer.size;
+    old_type = list->index_buffer.vk_type;
 
     if (!view || view->SizeInBytes == 0)
     {
         list->index_buffer.buffer = VK_NULL_HANDLE;
+        if (old_buffer != VK_NULL_HANDLE)
+            list->index_buffer.is_dirty = true;
         VKD3D_BREADCRUMB_AUX32(0);
         VKD3D_BREADCRUMB_COMMAND_STATE(IBO);
         return;
@@ -15251,6 +15263,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
     else
         list->index_buffer.buffer = VK_NULL_HANDLE;
 
+    /* A null buffer binds as null whatever its offset, size and type (d3d12_command_list_update_index_buffer). */
+    if (list->index_buffer.buffer != old_buffer || (list->index_buffer.buffer != VK_NULL_HANDLE &&
+            (list->index_buffer.offset != old_offset || list->index_buffer.size != old_size ||
+            list->index_buffer.vk_type != old_type)))
+        list->index_buffer.is_dirty = true;
+
     VKD3D_BREADCRUMB_AUX32(index_type == VK_INDEX_TYPE_UINT32 ? 32 : 16);
     VKD3D_BREADCRUMB_AUX64(view->BufferLocation);
     VKD3D_BREADCRUMB_AUX64(view->SizeInBytes);
@@ -15264,7 +15282,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     struct vkd3d_dynamic_state *dyn_state = &list->dynamic_state;
     const struct vkd3d_unique_resource *resource = NULL;
-    uint32_t vbo_invalidate_mask;
+    uint32_t vbo_invalidate_mask = 0;
     bool invalidate = false;
     unsigned int i;
 
@@ -15322,16 +15340,24 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
         VKD3D_BREADCRUMB_COOKIE(resource ? resource->cookie.index : 0);
         VKD3D_BREADCRUMB_COMMAND_STATE(VBO);
 
+        /* amdgpu-wddm fork: only a changed slot rebinds, as with the index buffer (draw-path2). A slot left clean
+         * here is either still dirty from before or bound with exactly these values. */
+        if (dyn_state->vertex_buffers[start_slot + i] == buffer && dyn_state->vertex_offsets[start_slot + i] == offset &&
+                dyn_state->vertex_sizes[start_slot + i] == size && dyn_state->vertex_strides[start_slot + i] == stride)
+            continue;
+
         invalidate |= dyn_state->vertex_strides[start_slot + i] != stride;
         dyn_state->vertex_strides[start_slot + i] = stride;
         dyn_state->vertex_buffers[start_slot + i] = buffer;
         dyn_state->vertex_offsets[start_slot + i] = offset;
         dyn_state->vertex_sizes[start_slot + i] = size;
+        vbo_invalidate_mask |= 1u << (start_slot + i);
     }
 
-    dyn_state->dirty_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
+    if (!vbo_invalidate_mask)
+        return;
 
-    vbo_invalidate_mask = ((1u << view_count) - 1u) << start_slot;
+    dyn_state->dirty_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
     dyn_state->dirty_vbos |= vbo_invalidate_mask;
 
     if (invalidate)
