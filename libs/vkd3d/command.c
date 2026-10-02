@@ -6315,6 +6315,24 @@ static void d3d12_command_list_end_rendering(struct d3d12_command_list *list)
     list->rendering_info.state_flags &= ~VKD3D_RENDERING_NEW_INSTANCE_ON_END_RENDERING;
 }
 
+/* The read-only transitions that ResourceBarrier held while the render pass was active
+ * (d3d12_command_list_defer_read_barriers), in one barrier once the pass has ended. */
+static VKD3D_NOINLINE void d3d12_command_list_flush_deferred_read_barriers(struct d3d12_command_list *list)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkDependencyInfo dep_info;
+
+    d3d12_command_list_check_end_of_command_list_cleanup(list);
+
+    memset(&dep_info, 0, sizeof(dep_info));
+    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_info.imageMemoryBarrierCount = list->deferred_read_barrier_count;
+    dep_info.pImageMemoryBarriers = list->deferred_read_barriers;
+    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+
+    list->deferred_read_barrier_count = 0;
+}
+
 void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -6354,6 +6372,9 @@ void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list,
         list->rendering_info.state_flags &= ~VKD3D_RENDERING_SUSPENDED;
 
     list->rendering_info.state_flags &= ~VKD3D_RENDERING_ACTIVE;
+
+    if (list->deferred_read_barrier_count)
+        d3d12_command_list_flush_deferred_read_barriers(list);
 
     if (list->xfb_buffer_count)
     {
@@ -7383,6 +7404,7 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
     list->dsv_resource_tracking_count = 0;
     list->deferred_clear_count = 0;
     list->deferred_discard_count = 0;
+    list->deferred_read_barrier_count = 0;
     list->subresource_tracking_count = 0;
     list->transfer_batch.tracked_copy_buffer_count = 0;
     list->transfer_batch.tracked_copy_texture_count = 0;
@@ -14353,6 +14375,108 @@ static void d3d12_command_list_prefetch_barrier_resources(UINT barrier_count, co
     }
 }
 
+/* amdgpu-wddm fork: ResourceBarrier ends the render pass before it looks at its barriers, so a game that moves a
+ * texture between read-only states between two draws pays for a pass end, a barrier and a pass begin with all of its
+ * state re-emitted (bc250: in the CPU profile of Witcher 3, lab session 298, real pass ends and begins were about
+ * 0.3 ms of the main thread's frame). Such a transition keeps the image layout and only orders the reads before it
+ * against the reads after it; whatever writes the texture later needs a barrier of its own, which takes the full path
+ * and ends the pass first, and the dependency chains through the held barrier. So while a pass is active, a call
+ * made only of such transitions is held on the list and emitted after the pass ends
+ * (d3d12_command_list_flush_deferred_read_barriers). Textures only: a buffer transition can flush RTAS work. */
+#define VKD3D_DEFERRABLE_READ_STATES (D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | \
+        D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | \
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE)
+
+static bool d3d12_command_list_is_deferrable_read_barrier(const D3D12_RESOURCE_BARRIER *barrier)
+{
+    const D3D12_RESOURCE_TRANSITION_BARRIER *transition = &barrier->Transition;
+    const struct d3d12_resource *resource;
+
+    if (barrier->Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || barrier->Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE)
+        return false;
+    if (!transition->StateBefore || (transition->StateBefore & ~VKD3D_DEFERRABLE_READ_STATES) ||
+            !transition->StateAfter || (transition->StateAfter & ~VKD3D_DEFERRABLE_READ_STATES))
+        return false;
+    if (!(resource = impl_from_ID3D12Resource(transition->pResource)) || !d3d12_resource_is_texture(resource))
+        return false;
+
+    /* Depth-stencil layouts and textures with a linear staging copy follow rules of their own. GENERAL layout (unified
+     * layouts, simultaneous access) is fine: no write is promoted out of an explicit read-only state either. */
+    return !(resource->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY) &&
+            !(resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+}
+
+static bool d3d12_command_list_defer_read_barriers(struct d3d12_command_list *list,
+        UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
+{
+    VkPipelineStageFlags2 src_stages, dst_stages;
+    VkAccessFlags2 src_access, dst_access;
+    const D3D12_RESOURCE_TRANSITION_BARRIER *transition;
+    VkImageMemoryBarrier2 *vk_barrier, *held;
+    struct d3d12_resource *resource;
+    unsigned int i, j, count;
+
+    /* What ResourceBarrier would do before its barriers must be nothing but the pass end: no batched indirect draws
+     * or copies, resume already blocked (any draw does that), no tiler suspend-resume, no debug markers. */
+    if (!(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE) || list->is_inside_render_pass ||
+            list->type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+            barrier_count > VKD3D_MAX_DEFERRED_READ_BARRIER_COUNT - list->deferred_read_barrier_count ||
+            list->dgc_batch.draws_count || list->transfer_batch.batch_type != VKD3D_BATCH_TYPE_NONE ||
+            !list->cmd.suspend_resume.block_resume || list->device->workarounds.tiler_suspend_resume ||
+            VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS) || VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS))
+        return false;
+
+    /* All or nothing: a call with any other barrier takes the full path, which emits the held ones first. */
+    for (i = 0; i < barrier_count; ++i)
+    {
+        if (!d3d12_command_list_is_deferrable_read_barrier(&barriers[i]))
+            return false;
+    }
+
+    count = list->deferred_read_barrier_count;
+    for (i = 0; i < barrier_count; ++i)
+    {
+        transition = &barriers[i].Transition;
+        resource = impl_from_ID3D12Resource(transition->pResource);
+
+        src_stages = dst_stages = 0;
+        src_access = dst_access = 0;
+        vk_access_and_stage_flags_from_d3d12_resource_state(list, resource, transition->StateBefore,
+                list->vk_queue_flags, &src_stages, &src_access);
+        vk_access_and_stage_flags_from_d3d12_resource_state(list, resource, transition->StateAfter,
+                list->vk_queue_flags, &dst_stages, &dst_access);
+
+        /* Every deferrable state is a GENERIC_READ one, which vk_image_layout_from_d3d12_resource_state maps to the
+         * common layout (GENERAL for a GENERAL_LAYOUT texture, whose common layout it is): no layout transition. */
+        vk_barrier = &list->deferred_read_barriers[count];
+        vk_image_memory_barrier_for_transition(vk_barrier, resource, transition->Subresource,
+                resource->common_layout, resource->common_layout,
+                src_stages, src_access, dst_stages, dst_access, 0);
+
+        /* A later transition of the same subresources joins the held one, as in the barrier batch. */
+        for (j = 0; j < count; ++j)
+        {
+            held = &list->deferred_read_barriers[j];
+            if (held->image == vk_barrier->image &&
+                    !memcmp(&held->subresourceRange, &vk_barrier->subresourceRange, sizeof(held->subresourceRange)))
+            {
+                held->srcStageMask |= vk_barrier->srcStageMask;
+                held->srcAccessMask |= vk_barrier->srcAccessMask;
+                held->dstStageMask |= vk_barrier->dstStageMask;
+                held->dstAccessMask |= vk_barrier->dstAccessMask;
+                break;
+            }
+        }
+        if (j == count)
+            ++count;
+
+        d3d12_command_list_track_resource_usage(list, resource, true);
+    }
+
+    list->deferred_read_barrier_count = count;
+    return true;
+}
+
 static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_list_iface *iface,
         UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers)
 {
@@ -14369,6 +14493,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
      * barriers. This is more or less just a workaround too for terribly written games,
      * so keep it as simple as it can be for now. */
     if (d3d12_command_list_check_resource_barrier_trivial_copy_resource(list, barrier_count, barriers))
+        return;
+
+    if (d3d12_command_list_defer_read_barriers(list, barrier_count, barriers))
         return;
 
     d3d12_command_list_flush_dgc_batch(list);

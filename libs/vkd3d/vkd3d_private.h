@@ -3455,6 +3455,8 @@ struct d3d12_command_list_sequence
 struct vkd3d_timestamp_profiler_submitted_work;
 
 #define VKD3D_MAX_DEFERRED_CLEAR_COUNT 16u
+/* Read-only texture transitions held while a render pass is active (d3d12_command_list_defer_read_barriers). */
+#define VKD3D_MAX_DEFERRED_READ_BARRIER_COUNT 16u
 
 struct vkd3d_deferred_clear
 {
@@ -3548,6 +3550,7 @@ struct d3d12_command_list
     unsigned int deferred_clear_count;
     struct vkd3d_deferred_discard deferred_discards[VKD3D_MAX_DEFERRED_CLEAR_COUNT];
     unsigned int deferred_discard_count;
+    unsigned int deferred_read_barrier_count;
 
     struct d3d12_rtv_resolve *rtv_resolves;
     size_t rtv_resolve_size;
@@ -3646,6 +3649,8 @@ struct d3d12_command_list
 
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
+
+    VkImageMemoryBarrier2 deferred_read_barriers[VKD3D_MAX_DEFERRED_READ_BARRIER_COUNT];
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     unsigned int breadcrumb_context_index;
