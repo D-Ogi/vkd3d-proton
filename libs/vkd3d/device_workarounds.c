@@ -109,9 +109,15 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "DXMD.exe", VKD3D_CONFIG_FLAG_STATIC(FORCE_INITIAL_TRANSITION) },
     /* Dead Space (2023) (1693980) */
     { VKD3D_STRING_COMPARE_EXACT, "Dead Space.exe", VKD3D_CONFIG_FLAG_STATIC(FORCE_DEDICATED_IMAGE_ALLOCATION) },
-    /* Witcher 3 (2023) (292030). Misses ALLOW_REBUILD when querying for RTAS sizes. */
+    /* Witcher 3 (2023) (292030). Misses ALLOW_REBUILD when querying for RTAS sizes.
+     * C25: DISABLE_SIMULTANEOUS_UAV_COMPRESSION is deliberately not set here. On BC-250 it costs DCC
+     * on 5409 of 5446 colour attachments (lab session 325, surf counters: sf_no_compr = sf_no_uav =
+     * 5409, DCC on 0), because resource.c disables compression for every SIMULTANEOUS_ACCESS + UAV
+     * image. The flag exists for an SSR-on-High game bug where DCC metadata clears race with UAV
+     * writes, so this build is only valid while an A/B screenshot pair at an SSR-heavy viewpoint shows
+     * no reflection corruption. Experiment build, not a default. */
     { VKD3D_STRING_COMPARE_EXACT, "witcher3.exe", VKD3D_CONFIG_FLAG_INIT_STATIC(
-            .DISABLE_SIMULTANEOUS_UAV_COMPRESSION = 1, .RTAS_ALLOW_BLAS_REBUILD_SIZES = 1) },
+            .RTAS_ALLOW_BLAS_REBUILD_SIZES = 1) },
     /* Age of Wonders 4 (1669000). Extremely stuttery performance with ReBAR. */
     { VKD3D_STRING_COMPARE_EXACT, "AOW4.exe", VKD3D_CONFIG_FLAG_STATIC(NO_UPLOAD_HVV) },
     /* Red Dead Redemption (2668510). Inconsistent performance with ReBAR at cutscenes of the game. */
