@@ -1912,6 +1912,7 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
     void **scratch_allocs = NULL;
     const VkPipelineShaderStageCreateInfo *probe_stages;
     struct vkd3d_driver_cache_probe probe;
+    struct vkd3d_compile_slot slot;
     uint32_t probe_stage_count;
     bool creating_library;
     bool rtpso_has_omm;
@@ -2605,10 +2606,14 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
     /* amdgpu-wddm fork: the device's persisted driver cache (VK_NULL_HANDLE when there is none). */
     probe_stage_count = pipeline_create_info.stageCount;
     probe_stages = pipeline_create_info.pStages;
+    /* amdgpu-wddm fork: admit only a few driver compiles at once (struct vkd3d_pipeline_compile_limiter). Ray
+     * tracing pipelines are few and heavy, so this one takes a slot without a cache probe first. */
+    vkd3d_compile_slot_begin(&slot, object->device, false);
     vkd3d_driver_cache_probe_begin(&object->device->disk_cache, &probe, &pipeline_create_info);
     vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
             object->device->disk_cache.vk_pipeline_cache, 1, &pipeline_create_info, NULL,
             creating_library ? &variant->pipeline_library : &variant->pipeline));
+    vkd3d_compile_slot_end(&slot);
     vkd3d_driver_cache_probe_end(&object->device->disk_cache, &probe, creating_library ? "rt-lib" : "rt",
             object->device->disk_cache.vk_pipeline_cache, vr, pipeline_create_info.groupCount,
             NULL, probe_stage_count, probe_stages);
@@ -2627,9 +2632,11 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
         library_info.pLibraries = &variant->pipeline_library;
 
         /* Self-link the pipeline library. */
+        vkd3d_compile_slot_begin(&slot, object->device, false);
         vkd3d_driver_cache_probe_begin(&object->device->disk_cache, &probe, &pipeline_create_info);
         vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
                 object->device->disk_cache.vk_pipeline_cache, 1, &pipeline_create_info, NULL, &variant->pipeline));
+        vkd3d_compile_slot_end(&slot);
         vkd3d_driver_cache_probe_end(&object->device->disk_cache, &probe, "rt-selflink",
                 object->device->disk_cache.vk_pipeline_cache, vr, 0, NULL, probe_stage_count, probe_stages);
     }

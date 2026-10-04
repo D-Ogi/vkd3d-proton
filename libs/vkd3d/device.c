@@ -4110,6 +4110,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS))
         vkd3d_breadcrumb_tracer_cleanup(&device->breadcrumb_tracer, device);
 #endif
+    vkd3d_pipeline_compile_limiter_cleanup(&device->compile_limiter);
     vkd3d_pipeline_library_flush_disk_cache(&device->disk_cache);
     vkd3d_sampler_state_cleanup(&device->sampler_state, device);
     vkd3d_view_map_destroy(&device->sampler_map.map, device);
@@ -10934,6 +10935,9 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     /* Make sure all extensions and shader interface keys are computed. */
     if (FAILED(hr = vkd3d_pipeline_library_init_disk_cache(&device->disk_cache, device)))
         goto out_cleanup_descriptor_qa_global_info;
+
+    /* amdgpu-wddm fork: after the disk cache, whose pipeline log the limiter reports through. */
+    vkd3d_pipeline_compile_limiter_init(&device->compile_limiter, device);
 
     d3d12_device_replace_vtable(device);
 

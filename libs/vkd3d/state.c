@@ -3297,6 +3297,44 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
         return S_OK;
 }
 
+/* amdgpu-wddm fork: one vkCreate*Pipelines call for vkd3d_compile_pipeline (the compile limiter), which may make
+ * it twice: a cache lookup first, then the compile. */
+struct vkd3d_pipeline_create_call
+{
+    struct d3d12_device *device;
+    VkPipelineCache vk_cache;
+    const VkGraphicsPipelineCreateInfo *graphics_info;
+    const VkComputePipelineCreateInfo *compute_info;
+    VkPipeline *vk_pipeline;
+};
+
+static VkResult vkd3d_pipeline_create_call(void *ctx)
+{
+    const struct vkd3d_pipeline_create_call *c = ctx;
+    const struct vkd3d_vk_device_procs *vk_procs = &c->device->vk_procs;
+
+    if (c->graphics_info)
+        return VK_CALL(vkCreateGraphicsPipelines(c->device->vk_device, c->vk_cache, 1, c->graphics_info, NULL,
+                c->vk_pipeline));
+    return VK_CALL(vkCreateComputePipelines(c->device->vk_device, c->vk_cache, 1, c->compute_info, NULL,
+            c->vk_pipeline));
+}
+
+static VkResult vkd3d_create_graphics_pipeline_limited(struct d3d12_device *device, VkPipelineCache vk_cache,
+        const VkGraphicsPipelineCreateInfo *info, VkPipelineCreateFlags2CreateInfo *flags2, bool draw_time,
+        VkPipeline *vk_pipeline)
+{
+    struct vkd3d_pipeline_create_call c = {device, vk_cache, info, NULL, vk_pipeline};
+    return vkd3d_compile_pipeline(device, flags2, draw_time, vkd3d_pipeline_create_call, &c);
+}
+
+static VkResult vkd3d_create_compute_pipeline_limited(struct d3d12_device *device, VkPipelineCache vk_cache,
+        const VkComputePipelineCreateInfo *info, VkPipelineCreateFlags2CreateInfo *flags2, VkPipeline *vk_pipeline)
+{
+    struct vkd3d_pipeline_create_call c = {device, vk_cache, NULL, info, vk_pipeline};
+    return vkd3d_compile_pipeline(device, flags2, false, vkd3d_pipeline_create_call, &c);
+}
+
 static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, struct d3d12_device *device,
         VkShaderStageFlagBits stage, const D3D12_SHADER_BYTECODE *code,
         struct vkd3d_shader_code *spirv_code, struct vkd3d_shader_code_debug *spirv_code_debug)
@@ -3318,6 +3356,10 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
     if (!spirv_code->code)
     {
         TRACE("Calling vkd3d_shader_compile_dxbc.\n");
+
+        /* amdgpu-wddm fork: a real conversion; inside a pipeline state creation it takes the creation's compile
+         * slot (struct vkd3d_pipeline_compile_limiter). */
+        vkd3d_compile_scope_need();
 
         d3d12_pipeline_state_init_shader_interface(state, device, stage, &shader_interface);
         shader_interface.flags |= vkd3d_descriptor_debug_get_shader_interface_flags(
@@ -3605,12 +3647,13 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     else if (d3d12_device_uses_descriptor_buffers(device))
         flags2.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
-    if (flags2.flags)
-        vk_prepend_struct(&pipeline_info, &flags2);
+    /* amdgpu-wddm fork: always chained, so the compile limiter can make a cache lookup first. */
+    vk_prepend_struct(&pipeline_info, &flags2);
 
+    /* amdgpu-wddm fork: only a real compile takes a slot (struct vkd3d_pipeline_compile_limiter). */
     vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_info);
-    vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
-            vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+    vr = vkd3d_create_compute_pipeline_limited(device, vk_cache, &pipeline_info, &flags2,
+            &state->compute.vk_pipeline);
     vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, "comp", vk_cache, vr,
             vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), NULL, 1, &pipeline_info.stage);
 
@@ -3670,8 +3713,8 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
 
         vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_info);
-        vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
-                vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+        vr = vkd3d_create_compute_pipeline_limited(device, vk_cache, &pipeline_info, &flags2,
+                &state->compute.vk_pipeline);
         vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, "comp-fallback", vk_cache, vr,
                 vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), NULL, 1, &pipeline_info.stage);
 
@@ -6399,6 +6442,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     const struct d3d12_cached_pipeline_state *desc_cached_pso;
     struct d3d12_cached_pipeline_state cached_pso;
     struct d3d12_pipeline_state *object;
+    struct vkd3d_compile_scope scope;
     HRESULT hr;
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
@@ -6509,6 +6553,10 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 
     if (SUCCEEDED(hr))
     {
+        /* amdgpu-wddm fork: one compile slot for the whole creation, taken at its first real compile work (a DXIL
+         * to SPIR-V conversion or a driver compile) and none for cache hits (struct
+         * vkd3d_pipeline_compile_limiter). */
+        vkd3d_compile_scope_begin(&scope, device);
         switch (bind_point)
         {
             case VK_PIPELINE_BIND_POINT_COMPUTE:
@@ -6530,6 +6578,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
                 ERR("Invalid pipeline type %u.\n", bind_point);
                 hr = E_INVALIDARG;
         }
+        vkd3d_compile_scope_end(&scope);
     }
 
     if (FAILED(hr))
@@ -6824,12 +6873,13 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     else if (d3d12_device_uses_descriptor_buffers(state->device))
         flags2.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
-    if (flags2.flags)
-        vk_prepend_struct(&create_info, &flags2);
+    /* amdgpu-wddm fork: always chained, so the compile limiter can make a cache lookup first. */
+    vk_prepend_struct(&create_info, &flags2);
 
+    /* amdgpu-wddm fork: only a real compile takes a slot; a link at draw time (key) is exempt from the thermal
+     * band (struct vkd3d_pipeline_compile_limiter). */
     vkd3d_driver_cache_probe_begin(&state->device->disk_cache, &probe, &create_info);
-    vr = VK_CALL(vkCreateGraphicsPipelines(state->device->vk_device,
-            vk_cache, 1, &create_info, NULL, vk_pipeline));
+    vr = vkd3d_create_graphics_pipeline_limited(state->device, vk_cache, &create_info, &flags2, !!key, vk_pipeline);
     vkd3d_driver_cache_probe_end(&state->device->disk_cache, &probe, key ? "link-fast" : "link-lto", vk_cache, vr,
             vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key, 0, NULL);
 
@@ -7047,12 +7097,14 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     else if (d3d12_device_uses_descriptor_buffers(device))
         flags2.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
-    if (flags2.flags)
-        vk_prepend_struct(&pipeline_desc, &flags2);
+    /* amdgpu-wddm fork: always chained, so the compile limiter can make a cache lookup first. */
+    vk_prepend_struct(&pipeline_desc, &flags2);
 
     probe_path = library_flags ? "gfx-lib" : key ? "gfx-variant" : "gfx";
+    /* amdgpu-wddm fork: only a real compile takes a slot; a variant at draw time (key) is exempt from the thermal
+     * band (struct vkd3d_pipeline_compile_limiter). */
     vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_desc);
-    vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+    vr = vkd3d_create_graphics_pipeline_limited(device, vk_cache, &pipeline_desc, &flags2, !!key, &vk_pipeline);
     vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, probe_path, vk_cache, vr,
             vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key,
             pipeline_desc.stageCount, pipeline_desc.pStages);
@@ -7106,7 +7158,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
 
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
         vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_desc);
-        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+        vr = vkd3d_create_graphics_pipeline_limited(device, vk_cache, &pipeline_desc, &flags2, !!key, &vk_pipeline);
         vkd3d_driver_cache_probe_end(&device->disk_cache, &probe, library_flags ? "gfx-lib-fallback" :
                 key ? "gfx-variant-fallback" : "gfx-fallback", vk_cache, vr,
                 vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key,

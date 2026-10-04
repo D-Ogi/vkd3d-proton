@@ -2633,9 +2633,14 @@ struct vkd3d_pipeline_library_disk_cache
      * VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS, after VKD3D_DRIVER_CACHE_SAVE_PIPELINES created ones), by a submitting
      * thread once no pipeline was created for VKD3D_DRIVER_CACHE_IDLE_NS, and by the device's final Release, and
      * only when the cache grew past driver_saved_size (the data loaded or last queued for saving).
-     * VK_NULL_HANDLE otherwise. A save takes the data on that thread and leaves the file to a job
-     * (vkd3d_driver_cache_queue_job in cache.c), so no engine caller waits for the disk. */
+     * VK_NULL_HANDLE otherwise. Those threads only decide that a save is due: the data is taken by
+     * driver_save_work, a work item of the process thread pool that the final Release waits for, and the file is
+     * written by a job (vkd3d_driver_cache_queue_job in cache.c), so no engine caller copies the cache or waits for
+     * the disk. Without the work item (creation failed) the deciding thread takes the data. */
     VkPipelineCache vk_pipeline_cache;
+#ifdef _WIN32
+    PTP_WORK driver_save_work;
+#endif
     char driver_path[VKD3D_PATH_MAX];
     size_t driver_saved_size;
     uint32_t driver_new_pipelines;
@@ -2777,6 +2782,117 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
         const struct vkd3d_driver_cache_probe *probe, const char *path, VkPipelineCache vk_cache, VkResult vr,
         uint64_t pso_hash, const struct vkd3d_pipeline_key *key,
         uint32_t stage_count, const VkPipelineShaderStageCreateInfo *stages);
+
+/* amdgpu-wddm fork: a bound on how many pipeline compiles run at once.
+ *
+ * The CPU and the GPU of this part share one die and one Tctl sensor. A scene load in Rise of the Tomb Raider
+ * compiles thousands of pipelines on about ten of the application's threads; the die then rose from 73 to 86 C in
+ * four seconds with the GPU at 6-10 % busy, and the lab runner stopped the benchmark at its 87 C limit (lab
+ * sessions 370 and 371; the CPU profile of that load is in scratch\m15\etw\372\cpu-B-rottr.txt, where the compile
+ * threads spend about 70 % of their samples in the ICD). The compiles are the heat, and no clock policy can see
+ * them, so the engine admits only a few of them at a time.
+ *
+ * Only real compile work takes a slot. Every driver call is first made as a cache lookup
+ * (FAIL_ON_PIPELINE_COMPILE_REQUIRED, vkd3d_compile_pipeline) without a slot; only when the driver answers
+ * VK_PIPELINE_COMPILE_REQUIRED is the call made again under a slot. A cache hit, also for a pipeline library or a
+ * PSO loaded from the application's pipeline library, never waits: with every creation under a slot, a scene
+ * change that needed tens of cached PSOs waited for them one by one, and the game showed a black screen meanwhile
+ * (lab sessions 380, 382, 383).
+ *
+ * A graphics or compute pipeline state creation (d3d12_pipeline_state_create) opens a compile scope. The scope
+ * takes a slot at its first real work, the DXIL to SPIR-V conversion of a stage (with only the driver calls
+ * bounded, the conversion ran on every application thread at once, lab session 378) or a driver compile, and
+ * holds it to the end of the creation; the work after that takes no second slot. Without a scope (a variant
+ * created at draw time, ray tracing pipelines) a driver compile holds a slot across the call alone. Waiters are
+ * admitted in arrival order (tickets), so no creation waits behind later ones.
+ *
+ * Default: 2 slots. AMDGPU_WDDM_VKD3D_COMPILE_THREADS overrides it; 0 removes the bound.
+ *
+ * Thermal band. With 2 slots the game's own ~2.7 CPUs and the compiles still took Tctl from 84.6 to 87.8 C in a
+ * load burst (lab session 379), so the bound also follows the die temperature the KMD reports
+ * (vkd3d_kmd_read_temperature), read at most every 250 ms: from 80 C one slot, below 80 C all of them. Never
+ * fewer than one: a pause in compiles does not cool a die the GPU keeps hot, and it starved the game of pipelines
+ * (380). A variant compiled at draw time blocks the thread that records commands, so it is exempt from the band:
+ * it needs only a free slot of the fixed bound and does not queue behind the creations. A failed reading counts
+ * as cool. AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0 turns the band off. The constants are in cache.c. */
+struct vkd3d_pipeline_compile_limiter
+{
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    uint32_t slots;
+    uint32_t in_flight;
+    /* Tickets: next_ticket is the next caller's, next_admit the oldest caller's not yet admitted. */
+    uint64_t next_ticket;
+    uint64_t next_admit;
+    /* Callers exempt from the band (draw-time variants) waiting for a slot outside the ticket order. */
+    uint32_t exempt_waiting;
+    bool active;
+    /* Counters, under lock and always kept; logged at the device's end, and every
+     * VKD3D_COMPILE_LIMITER_LOG_WAITS waits when the PSO log is on (AMDGPU_WDDM_VKD3D_PSO_LOG). */
+    bool log;
+    uint64_t admitted;
+    uint64_t exempt_admitted;
+    uint64_t waits;
+    uint64_t logged_waits;
+    uint64_t wait_ns;
+    uint32_t max_waiting;
+    /* Driver calls answered from a cache without a slot, and those that compiled. */
+    uint64_t cache_hits;
+    uint64_t compiles;
+
+    /* Thermal band, under lock. */
+    bool thermal;
+    LUID adapter_luid;
+    uint64_t read_ns;
+    int32_t temperature_mc;
+    bool temperature_valid;
+    bool one_slot;
+    uint64_t one_slot_begin_ns;
+    /* Counters: band entries, time in the one-slot band, admissions the band delayed, failed readings, and the
+     * hottest reading. */
+    uint64_t thermal_bands;
+    uint64_t thermal_band_ns;
+    uint64_t thermal_waits;
+    uint64_t thermal_read_failures;
+    int32_t thermal_max_mc;
+};
+
+struct vkd3d_compile_slot
+{
+    struct vkd3d_pipeline_compile_limiter *limiter;
+    bool held;
+    bool exempt;
+};
+
+/* A pipeline state creation's compile scope: at most one slot, taken at the first real compile work. */
+struct vkd3d_compile_scope
+{
+    struct vkd3d_compile_slot slot;
+    struct d3d12_device *device;
+    bool active;
+};
+
+void vkd3d_pipeline_compile_limiter_init(struct vkd3d_pipeline_compile_limiter *limiter,
+        struct d3d12_device *device);
+void vkd3d_pipeline_compile_limiter_cleanup(struct vkd3d_pipeline_compile_limiter *limiter);
+/* Takes a slot, waiting in arrival order. exempt: the thermal band does not apply and the caller does not queue
+ * behind the others (a variant at draw time). Inside a compile scope on this thread, takes the scope's slot
+ * instead (if it does not hold it yet) and the call itself holds nothing. */
+void vkd3d_compile_slot_begin(struct vkd3d_compile_slot *slot, struct d3d12_device *device, bool exempt);
+void vkd3d_compile_slot_end(struct vkd3d_compile_slot *slot);
+void vkd3d_compile_scope_begin(struct vkd3d_compile_scope *scope, struct d3d12_device *device);
+void vkd3d_compile_scope_end(struct vkd3d_compile_scope *scope);
+/* Real compile work (DXIL to SPIR-V) starts on this thread: inside a compile scope, take its slot if not yet
+ * held. Outside a scope, nothing. */
+void vkd3d_compile_scope_need(void);
+/* One driver pipeline creation under the limiter. call(ctx) makes the vkCreate*Pipelines call; flags2 must be
+ * chained into its create info. Unless the caller set FAIL_ON_PIPELINE_COMPILE_REQUIRED itself (then it is one
+ * call without a slot, and the caller handles VK_PIPELINE_COMPILE_REQUIRED), the call is made first with that flag
+ * and without a slot, and again under a slot only if the driver must compile. flags2 is as given on return. */
+VkResult vkd3d_compile_pipeline(struct d3d12_device *device, VkPipelineCreateFlags2CreateInfo *flags2, bool exempt,
+        VkResult (*call)(void *ctx), void *ctx);
+/* The die temperature in millidegrees from the BC-250 KMD (d3dkmt.c); false when it cannot be read. */
+bool vkd3d_kmd_read_temperature(LUID adapter_luid, int32_t *temperature_mc);
 
 struct vkd3d_buffer
 {
@@ -6054,6 +6170,7 @@ struct d3d12_device
     struct vkd3d_sampler_state sampler_state;
     struct vkd3d_shader_debug_ring debug_ring;
     struct vkd3d_pipeline_library_disk_cache disk_cache;
+    struct vkd3d_pipeline_compile_limiter compile_limiter;
     struct vkd3d_global_descriptor_buffer global_descriptor_buffer;
     struct vkd3d_address_binding_tracker address_binding_tracker;
     rwlock_t vertex_input_lock;

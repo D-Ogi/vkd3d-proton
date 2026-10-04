@@ -416,6 +416,82 @@ HRESULT d3d12_device_open_resource_descriptor(struct d3d12_device *device, HANDL
     return E_INVALIDARG;
 }
 
+/* amdgpu-wddm fork: the die temperature for the compile limiter, from the BC-250 KMD's DPM snapshot
+ * (BC250_ESCAPE_RUN_DPM, operation READ; driver/kmd/bc250kmd_escape.h and DpmRequest in driver/kmd/dpm.c of
+ * amdgpu-wddm, KMD 0.7.175 and later). The KMD publishes the snapshot every 25 ms tick of its clock governor; the
+ * escape copies it under a spin lock, touches no hardware, and is open to every caller. It must be sent with
+ * NoAdapterSynchronization alone in its flags. These definitions mirror that header; the ABI is 1 and the
+ * structure is 160 bytes. */
+#define VKD3D_BC250_ESCAPE_MAGIC 0x30353242u /* "B250" */
+#define VKD3D_BC250_ESCAPE_RUN_DPM 23u
+#define VKD3D_BC250_ESCAPE_STATUS_DONE 0u
+#define VKD3D_BC250_ESCAPE_STATUS_UNKNOWN_COMMAND 1u
+#define VKD3D_BC250_DPM_ABI 1u
+#define VKD3D_BC250_DPM_OP_READ 0u
+#define VKD3D_BC250_DPM_FLAG_TEMPERATURE 128u /* TemperatureMc is the last tick's reading */
+#define VKD3D_D3DKMT_ESCAPE_DRIVERPRIVATE ((D3DKMT_ESCAPETYPE)0)
+#define VKD3D_D3DDDI_ESCAPE_NO_ADAPTER_SYNCHRONIZATION 0x8u
+
+struct vkd3d_bc250_escape_dpm
+{
+    uint32_t magic, command, status, version;
+    uint32_t nt_status, abi_version, op, flags;
+    uint32_t mode, requested, reason, throttle;
+    uint32_t max_mhz, cap_mhz, target_mhz, want_mhz;
+    uint32_t current_mhz, current_mv, observed_mhz, observed_vid;
+    int32_t temperature_mc;
+    uint32_t busy_permille, busy_avg_permille;
+    uint32_t raises, lowers, thermal_events, errors, resyncs;
+    uint64_t ticks;
+    uint64_t busy_time_100ns;
+    uint64_t uptime_ms;
+    uint64_t generation;
+    uint64_t expected_generation;
+    uint32_t submit_busy_permille;
+    uint32_t sdma_busy_permille;
+};
+STATIC_ASSERT(sizeof(struct vkd3d_bc250_escape_dpm) == 160);
+STATIC_ASSERT(offsetof(struct vkd3d_bc250_escape_dpm, temperature_mc) == 80);
+
+/* Opens and closes its own adapter handle on every call, so no handle outlives a driver update; the caller reads
+ * at most four times a second. False when the adapter does not open, the KMD does not know the command (another
+ * driver, or a KMD before 0.7.175), or the tick's temperature reading failed. */
+bool vkd3d_kmd_read_temperature(LUID adapter_luid, int32_t *temperature_mc)
+{
+    D3DKMT_OPENADAPTERFROMLUID open_adapter = {0};
+    D3DKMT_CLOSEADAPTER close_adapter = {0};
+    struct vkd3d_bc250_escape_dpm dpm;
+    D3DKMT_ESCAPE escape = {0};
+    NTSTATUS status;
+
+    open_adapter.AdapterLuid = adapter_luid;
+    if (D3DKMTOpenAdapterFromLuid(&open_adapter) != STATUS_SUCCESS)
+        return false;
+
+    memset(&dpm, 0, sizeof(dpm));
+    dpm.magic = VKD3D_BC250_ESCAPE_MAGIC;
+    dpm.command = VKD3D_BC250_ESCAPE_RUN_DPM;
+    dpm.status = VKD3D_BC250_ESCAPE_STATUS_UNKNOWN_COMMAND;
+    dpm.abi_version = VKD3D_BC250_DPM_ABI;
+    dpm.op = VKD3D_BC250_DPM_OP_READ;
+    escape.hAdapter = open_adapter.hAdapter;
+    escape.Type = VKD3D_D3DKMT_ESCAPE_DRIVERPRIVATE;
+    escape.Flags.Value = VKD3D_D3DDDI_ESCAPE_NO_ADAPTER_SYNCHRONIZATION;
+    escape.pPrivateDriverData = &dpm;
+    escape.PrivateDriverDataSize = sizeof(dpm);
+    status = D3DKMTEscape(&escape);
+
+    close_adapter.hAdapter = open_adapter.hAdapter;
+    D3DKMTCloseAdapter(&close_adapter);
+
+    if (status != STATUS_SUCCESS || dpm.status != VKD3D_BC250_ESCAPE_STATUS_DONE || dpm.nt_status ||
+            dpm.magic != VKD3D_BC250_ESCAPE_MAGIC || dpm.command != VKD3D_BC250_ESCAPE_RUN_DPM ||
+            dpm.abi_version != VKD3D_BC250_DPM_ABI || !(dpm.flags & VKD3D_BC250_DPM_FLAG_TEMPERATURE))
+        return false;
+    *temperature_mc = dpm.temperature_mc;
+    return true;
+}
+
 #else /* _WIN32 */
 
 void d3d12_device_open_kmt(struct d3d12_device *device)
@@ -444,6 +520,11 @@ void d3d12_resource_open_export_kmt(struct d3d12_resource *resource, struct d3d1
 
 void d3d12_resource_close_export_kmt(struct d3d12_resource *resource, struct d3d12_device *device)
 {
+}
+
+bool vkd3d_kmd_read_temperature(LUID adapter_luid, int32_t *temperature_mc)
+{
+    return false;
 }
 
 #endif /* _WIN32 */

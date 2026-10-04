@@ -39,7 +39,7 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_
  * process would find none of them; SPIR-V at least saves the DXIL and DXBC translation on every later start.
  * For the driver's compilation, the device creates every pipeline with one VkPipelineCache and persists it next to
  * the archive (vkd3d-proton.<program>.cache.driver): loaded at CreateDevice, saved by a pipeline-creating thread at
- * most every 30 s after 64 new pipelines, by a submitting thread once no pipeline was created for 2 s, and at the
+ * most every 2 s after 64 new pipelines, by a submitting thread once no pipeline was created for 2 s, and at the
  * device's final Release. Those engine callers' threads only take the data (vkGetPipelineCacheData); a work item
  * of the process thread pool writes the file, and the opt-in pipeline log, holding a reference to this module
  * until it is done, so no caller, final Release or FreeLibrary waits for the disk, and the device still starts no

@@ -3258,7 +3258,7 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_
 #define VKD3D_DRIVER_CACHE_VERSION 1
 #define VKD3D_DRIVER_CACHE_MAX_SIZE (512u << 20)
 #define VKD3D_DRIVER_CACHE_SAVE_PIPELINES 64
-#define VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS (30ull * 1000000000ull)
+#define VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS (2ull * 1000000000ull)
 #define VKD3D_DRIVER_CACHE_IDLE_NS (2ull * 1000000000ull)
 /* The pipeline log's pending lines are queued for writing once this much is pending, or on a submission once the
  * oldest of them is this old. */
@@ -3629,8 +3629,8 @@ static void vkd3d_driver_cache_log(struct vkd3d_pipeline_library_disk_cache *cac
 
 /* Takes the whole VkPipelineCache on the calling thread, when it grew since it was loaded or last queued for
  * saving (the cache only grows), and queues its write (vkd3d_driver_cache_run_save). A write that then fails is
- * tried again only once the cache grows further. */
-static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
+ * tried again only once the cache grows further. Returns whether a job was queued. */
+static bool vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_driver_cache_job *job;
@@ -3641,9 +3641,9 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
     begin_ns = vkd3d_get_current_time_ns();
     if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, NULL))) ||
             size <= max(cache->driver_saved_size, sizeof(VkPipelineCacheHeaderVersionOne)))
-        return;
+        return false;
     if (!(job = vkd3d_calloc(1, sizeof(*job))))
-        return;
+        return false;
     if (size > VKD3D_DRIVER_CACHE_MAX_SIZE)
     {
         /* Start over next time rather than keep a cache that can no longer be saved. */
@@ -3676,11 +3676,16 @@ static void vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
         job->log_save = true;
     }
     vkd3d_driver_cache_queue_job(job);
-    return;
+    return true;
 
 fail:
     vkd3d_driver_cache_free_job(job);
+    return false;
 }
+
+#ifdef _WIN32
+static void CALLBACK vkd3d_driver_cache_save_work(PTP_CALLBACK_INSTANCE instance, void *context, PTP_WORK work);
+#endif
 
 static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *cache, struct d3d12_device *device)
 {
@@ -3720,6 +3725,11 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
 
     cache->driver_saved_size = size;
     cache->driver_last_save_ns = vkd3d_get_current_time_ns();
+#ifdef _WIN32
+    /* Without it, saves take their snapshot on the thread that finds them due. */
+    if (!(cache->driver_save_work = CreateThreadpoolWork(vkd3d_driver_cache_save_work, cache, NULL)))
+        WARN("No thread pool work for driver cache saves, error %lu.\n", GetLastError());
+#endif
     INFO("Driver cache %s: %zu bytes loaded in %.3f ms.\n", cache->driver_path, size,
             1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
 
@@ -3735,7 +3745,8 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
     vkd3d_driver_cache_log(cache, line);
 }
 
-/* Saves from the calling thread: the snapshot there, the file by a job. During a burst (idle_ns 0) only when at
+/* Decides on the calling thread whether a save is due; the snapshot is taken by the device's work item
+ * (vkd3d_driver_cache_save_work, or on the calling thread when there is none) and the file written by a job. During a burst (idle_ns 0) only when at
  * least VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS passed since the last save, so a long burst is not slowed by a snapshot
  * every few pipelines. After a burst as soon as no pipeline was created for idle_ns, however recent the last save:
  * a game killed by its harness loses only what it created in its last idle_ns. (A game in a lab trial created 18
@@ -3743,6 +3754,25 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
  * the next run compiled them again.) One saver at a time; the others go on. While a save of any device of the
  * process is still queued, the next one waits for a later call, so a slow disk never piles up copies of the
  * cache in memory. */
+/* One save by the holder of driver_saving, which it releases. */
+static void vkd3d_driver_cache_save_now(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    /* Only a save that queued data restarts the interval: a check that found only cache hits must not hold
+     * back the save of the burst that follows it. */
+    if (vkd3d_driver_cache_save(cache, cache->library->device))
+        cache->driver_last_save_ns = vkd3d_get_current_time_ns();
+    vkd3d_atomic_uint32_store_explicit(&cache->driver_saving, 0, vkd3d_memory_order_release);
+}
+
+#ifdef _WIN32
+static void CALLBACK vkd3d_driver_cache_save_work(PTP_CALLBACK_INSTANCE instance, void *context, PTP_WORK work)
+{
+    /* The device's final Release waits for this callback (vkd3d_driver_cache_cleanup) before it destroys the
+     * VkPipelineCache, so the device and this module outlive it. */
+    vkd3d_driver_cache_save_now(context);
+}
+#endif
+
 static void vkd3d_driver_cache_try_save(struct vkd3d_pipeline_library_disk_cache *cache, uint64_t idle_ns)
 {
     uint64_t now_ns;
@@ -3758,13 +3788,22 @@ static void vkd3d_driver_cache_try_save(struct vkd3d_pipeline_library_disk_cache
                 vkd3d_memory_order_relaxed) >= idle_ns;
     else
         due = now_ns - cache->driver_last_save_ns >= VKD3D_DRIVER_CACHE_SAVE_INTERVAL_NS;
-    if (due)
+    if (!due)
     {
-        vkd3d_atomic_uint32_store_explicit(&cache->driver_new_pipelines, 0, vkd3d_memory_order_relaxed);
-        vkd3d_driver_cache_save(cache, cache->library->device);
-        cache->driver_last_save_ns = vkd3d_get_current_time_ns();
+        vkd3d_atomic_uint32_store_explicit(&cache->driver_saving, 0, vkd3d_memory_order_release);
+        return;
     }
-    vkd3d_atomic_uint32_store_explicit(&cache->driver_saving, 0, vkd3d_memory_order_release);
+    vkd3d_atomic_uint32_store_explicit(&cache->driver_new_pipelines, 0, vkd3d_memory_order_relaxed);
+#ifdef _WIN32
+    /* The snapshot (vkGetPipelineCacheData, which copies the whole cache under the driver's cache lock) runs in the
+     * device's work item, not on this creating or submitting thread. driver_saving stays set until it is done. */
+    if (cache->driver_save_work)
+    {
+        SubmitThreadpoolWork(cache->driver_save_work);
+        return;
+    }
+#endif
+    vkd3d_driver_cache_save_now(cache);
 }
 
 void vkd3d_pipeline_library_driver_cache_notify(struct vkd3d_pipeline_library_disk_cache *cache)
@@ -3933,6 +3972,323 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
     vkd3d_driver_cache_log(cache, line);
 }
 
+/* amdgpu-wddm fork: the bound on concurrent pipeline compiles. See struct
+ * vkd3d_pipeline_compile_limiter in vkd3d_private.h for why it exists. */
+
+#define VKD3D_COMPILE_LIMITER_DEFAULT_SLOTS 2
+/* One line per this many waits, so a burst leaves a trace without a line per pipeline. */
+#define VKD3D_COMPILE_LIMITER_LOG_WAITS 256
+
+/* The thermal band, in millidegrees C of the KMD's die reading (the lab runner stops a game at 87 C): from
+ * ONE_SLOT one slot, below it all slots. */
+#define VKD3D_COMPILE_THERMAL_ONE_SLOT_MC 80000
+/* A reading is reused for this long; waiters the band delays look again this often. */
+#define VKD3D_COMPILE_THERMAL_READ_MS 250
+
+/* The compile scope this thread is in, if any (vkd3d_compile_scope_begin). */
+static VKD3D_THREAD_LOCAL struct vkd3d_compile_scope *vkd3d_compile_scope_thread;
+
+void vkd3d_pipeline_compile_limiter_init(struct vkd3d_pipeline_compile_limiter *limiter,
+        struct d3d12_device *device)
+{
+    uint32_t slots;
+
+    memset(limiter, 0, sizeof(*limiter));
+    slots = vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_COMPILE_THREADS", VKD3D_COMPILE_LIMITER_DEFAULT_SLOTS);
+    if (!slots)
+    {
+        INFO("Pipeline compile limiter off (AMDGPU_WDDM_VKD3D_COMPILE_THREADS=0).\n");
+        return;
+    }
+    if (pthread_mutex_init(&limiter->lock, NULL))
+    {
+        ERR("Failed to initialise the compile limiter lock; compiles stay unbounded.\n");
+        return;
+    }
+    if (pthread_cond_init(&limiter->cond, NULL))
+    {
+        ERR("Failed to initialise the compile limiter condition; compiles stay unbounded.\n");
+        pthread_mutex_destroy(&limiter->lock);
+        return;
+    }
+    limiter->slots = slots;
+    limiter->log = device->disk_cache.driver_log;
+    limiter->thermal = !!vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_COMPILE_THERMAL", 1);
+    limiter->adapter_luid = device->adapter_luid;
+    limiter->thermal_max_mc = INT32_MIN;
+    limiter->active = true;
+    INFO("Pipeline compile limiter: %u concurrent compiles, cache hits without a slot, thermal band %s.\n", slots,
+            limiter->thermal ? "on" : "off (AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0)");
+}
+
+void vkd3d_pipeline_compile_limiter_cleanup(struct vkd3d_pipeline_compile_limiter *limiter)
+{
+    uint64_t band_ns;
+
+    if (!limiter->active)
+        return;
+    INFO("Pipeline compile limiter: %"PRIu64" admitted (%"PRIu64" draw-time), %"PRIu64" waited, %"PRIu64" ms waited, "
+            "at most %u waiting; driver calls: %"PRIu64" cache hits without a slot, %"PRIu64" compiles.\n",
+            limiter->admitted, limiter->exempt_admitted, limiter->waits, limiter->wait_ns / 1000000,
+            limiter->max_waiting, limiter->cache_hits, limiter->compiles);
+    if (limiter->thermal)
+    {
+        band_ns = limiter->thermal_band_ns;
+        if (limiter->one_slot)
+            band_ns += vkd3d_get_current_time_ns() - limiter->one_slot_begin_ns;
+        INFO("Pipeline compile limiter thermal: %"PRIu64" one-slot bands, %"PRIu64" ms in them, %"PRIu64" admissions "
+                "delayed, %"PRIu64" failed readings, hottest %d mC.\n", limiter->thermal_bands, band_ns / 1000000,
+                limiter->thermal_waits, limiter->thermal_read_failures,
+                limiter->thermal_max_mc == INT32_MIN ? 0 : limiter->thermal_max_mc);
+    }
+    limiter->active = false;
+    pthread_cond_destroy(&limiter->cond);
+    pthread_mutex_destroy(&limiter->lock);
+}
+
+/* Under the lock. How many compiles the temperature allows now, never fewer than one; reads the KMD when the last
+ * reading is VKD3D_COMPILE_THERMAL_READ_MS old. A failed reading counts as cool. */
+static uint32_t vkd3d_compile_limiter_thermal_slots(struct vkd3d_pipeline_compile_limiter *limiter, uint64_t now_ns)
+{
+    bool one_slot;
+    int32_t mc = 0;
+
+    if (!limiter->thermal)
+        return limiter->slots;
+    if (!limiter->read_ns || now_ns - limiter->read_ns >= VKD3D_COMPILE_THERMAL_READ_MS * 1000000ull)
+    {
+        limiter->read_ns = now_ns;
+        limiter->temperature_valid = vkd3d_kmd_read_temperature(limiter->adapter_luid, &mc);
+        if (limiter->temperature_valid)
+        {
+            limiter->temperature_mc = mc;
+            if (mc > limiter->thermal_max_mc)
+                limiter->thermal_max_mc = mc;
+        }
+        else
+            limiter->thermal_read_failures++;
+
+        one_slot = limiter->temperature_valid && mc >= VKD3D_COMPILE_THERMAL_ONE_SLOT_MC;
+        if (one_slot && !limiter->one_slot)
+        {
+            limiter->one_slot_begin_ns = now_ns;
+            limiter->thermal_bands++;
+            if (limiter->log)
+                INFO("Pipeline compile limiter: thermal band 1 slot at %d mC.\n", mc);
+        }
+        else if (!one_slot && limiter->one_slot)
+        {
+            limiter->thermal_band_ns += now_ns - limiter->one_slot_begin_ns;
+            if (limiter->log)
+                INFO("Pipeline compile limiter: thermal band %u slots after %"PRIu64" ms (%s).\n", limiter->slots,
+                        (now_ns - limiter->one_slot_begin_ns) / 1000000,
+                        limiter->temperature_valid ? "cooler" : "reading failed");
+        }
+        limiter->one_slot = one_slot;
+    }
+    return limiter->one_slot ? 1 : limiter->slots;
+}
+
+/* Under the lock: may this caller go now? An exempt caller needs only a free slot of the fixed bound. Otherwise
+ * only the oldest ticket can go, within the fixed bound and the thermal band. */
+static bool vkd3d_compile_limiter_may_admit(struct vkd3d_pipeline_compile_limiter *limiter, bool exempt,
+        uint64_t ticket, bool *thermal_delayed)
+{
+    if (limiter->in_flight >= limiter->slots)
+        return false;
+    if (exempt)
+        return true;
+    if (ticket != limiter->next_admit)
+        return false;
+    if (limiter->in_flight < vkd3d_compile_limiter_thermal_slots(limiter, vkd3d_get_current_time_ns()))
+        return true;
+    *thermal_delayed = true;
+    return false;
+}
+
+static void vkd3d_compile_limiter_wait(struct vkd3d_pipeline_compile_limiter *limiter)
+{
+    /* With the band a waiter must look again without being woken: the die cools on its own. */
+    if (!limiter->thermal)
+    {
+        pthread_cond_wait(&limiter->cond, &limiter->lock);
+        return;
+    }
+#ifdef _WIN32
+    SleepConditionVariableSRW(&limiter->cond.cond, &limiter->lock.lock, VKD3D_COMPILE_THERMAL_READ_MS, 0);
+#else
+    {
+        struct timespec ts;
+
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += VKD3D_COMPILE_THERMAL_READ_MS * 1000000l;
+        ts.tv_sec += ts.tv_nsec / 1000000000l;
+        ts.tv_nsec %= 1000000000l;
+        pthread_cond_timedwait(&limiter->cond, &limiter->lock, &ts);
+    }
+#endif
+}
+
+static void vkd3d_compile_limiter_acquire(struct vkd3d_compile_slot *slot,
+        struct vkd3d_pipeline_compile_limiter *limiter, bool exempt)
+{
+    uint64_t begin_ns, ticket = 0, waits = 0, wait_ns = 0;
+    bool thermal_delayed = false;
+    uint32_t waiting;
+
+    slot->limiter = limiter;
+    slot->held = false;
+    slot->exempt = exempt;
+    if (!limiter->active)
+        return;
+
+    begin_ns = vkd3d_get_current_time_ns();
+    pthread_mutex_lock(&limiter->lock);
+    /* Tickets admit the callers in the order they came: a thread that waits is never passed by a later one. */
+    if (!exempt)
+        ticket = limiter->next_ticket++;
+    if (!vkd3d_compile_limiter_may_admit(limiter, exempt, ticket, &thermal_delayed))
+    {
+        if (exempt)
+            limiter->exempt_waiting++;
+        waiting = (uint32_t)(limiter->next_ticket - limiter->next_admit) + limiter->exempt_waiting;
+        if (waiting > limiter->max_waiting)
+            limiter->max_waiting = waiting;
+        do
+            vkd3d_compile_limiter_wait(limiter);
+        while (!vkd3d_compile_limiter_may_admit(limiter, exempt, ticket, &thermal_delayed));
+        if (exempt)
+            limiter->exempt_waiting--;
+        limiter->waits++;
+        limiter->wait_ns += vkd3d_get_current_time_ns() - begin_ns;
+        if (limiter->log && limiter->waits - limiter->logged_waits >= VKD3D_COMPILE_LIMITER_LOG_WAITS)
+        {
+            limiter->logged_waits = limiter->waits;
+            waits = limiter->waits;
+            wait_ns = limiter->wait_ns;
+        }
+    }
+    if (thermal_delayed)
+        limiter->thermal_waits++;
+    if (exempt)
+        limiter->exempt_admitted++;
+    else
+        limiter->next_admit++;
+    limiter->in_flight++;
+    limiter->admitted++;
+    /* The next ticket may now be admitted too, if a slot is free. */
+    if (limiter->next_ticket != limiter->next_admit)
+        pthread_cond_broadcast(&limiter->cond);
+    pthread_mutex_unlock(&limiter->lock);
+    slot->held = true;
+    if (waits)
+        INFO("Pipeline compile limiter: %"PRIu64" waits, %"PRIu64" ms waited in total.\n",
+                waits, wait_ns / 1000000);
+}
+
+static void vkd3d_compile_limiter_release(struct vkd3d_compile_slot *slot)
+{
+    struct vkd3d_pipeline_compile_limiter *limiter = slot->limiter;
+
+    if (!slot->held)
+        return;
+    slot->held = false;
+    pthread_mutex_lock(&limiter->lock);
+    limiter->in_flight--;
+    /* Every waiter checks whether it may go; only the oldest ticket, or an exempt caller, can. */
+    if (limiter->next_ticket != limiter->next_admit || limiter->exempt_waiting)
+        pthread_cond_broadcast(&limiter->cond);
+    pthread_mutex_unlock(&limiter->lock);
+}
+
+void vkd3d_compile_slot_begin(struct vkd3d_compile_slot *slot, struct d3d12_device *device, bool exempt)
+{
+    struct vkd3d_compile_scope *scope = vkd3d_compile_scope_thread;
+
+    if (scope)
+    {
+        /* The scope holds the slot to the end of the creation; this call holds nothing. */
+        if (!scope->slot.held)
+            vkd3d_compile_limiter_acquire(&scope->slot, &scope->device->compile_limiter, false);
+        slot->limiter = scope->slot.limiter;
+        slot->held = false;
+        slot->exempt = false;
+        return;
+    }
+    vkd3d_compile_limiter_acquire(slot, &device->compile_limiter, exempt);
+}
+
+void vkd3d_compile_slot_end(struct vkd3d_compile_slot *slot)
+{
+    vkd3d_compile_limiter_release(slot);
+}
+
+void vkd3d_compile_scope_begin(struct vkd3d_compile_scope *scope, struct d3d12_device *device)
+{
+    scope->device = device;
+    scope->slot.limiter = &device->compile_limiter;
+    scope->slot.held = false;
+    scope->slot.exempt = false;
+    /* A creation inside a creation on the same thread stays in the outer scope. */
+    scope->active = !vkd3d_compile_scope_thread;
+    if (scope->active)
+        vkd3d_compile_scope_thread = scope;
+}
+
+void vkd3d_compile_scope_end(struct vkd3d_compile_scope *scope)
+{
+    if (!scope->active)
+        return;
+    vkd3d_compile_scope_thread = NULL;
+    scope->active = false;
+    vkd3d_compile_limiter_release(&scope->slot);
+}
+
+void vkd3d_compile_scope_need(void)
+{
+    struct vkd3d_compile_scope *scope = vkd3d_compile_scope_thread;
+
+    if (scope && !scope->slot.held)
+        vkd3d_compile_limiter_acquire(&scope->slot, &scope->device->compile_limiter, false);
+}
+
+VkResult vkd3d_compile_pipeline(struct d3d12_device *device, VkPipelineCreateFlags2CreateInfo *flags2, bool exempt,
+        VkResult (*call)(void *ctx), void *ctx)
+{
+    struct vkd3d_pipeline_compile_limiter *limiter = &device->compile_limiter;
+    struct vkd3d_compile_slot slot;
+    VkResult vr;
+
+    /* The caller probes itself (an application's shader identifier): one call, no slot. */
+    if (flags2->flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
+        return call(ctx);
+    if (!limiter->active)
+        return call(ctx);
+
+    /* A cache lookup first, without a slot. */
+    flags2->flags |= VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    vr = call(ctx);
+    flags2->flags &= ~VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    if (vr != VK_PIPELINE_COMPILE_REQUIRED)
+    {
+        if (vr == VK_SUCCESS)
+        {
+            pthread_mutex_lock(&limiter->lock);
+            limiter->cache_hits++;
+            pthread_mutex_unlock(&limiter->lock);
+        }
+        return vr;
+    }
+
+    vkd3d_compile_slot_begin(&slot, device, exempt);
+    vr = call(ctx);
+    vkd3d_compile_slot_end(&slot);
+    pthread_mutex_lock(&limiter->lock);
+    limiter->compiles++;
+    pthread_mutex_unlock(&limiter->lock);
+    return vr;
+}
+
 /* The device's final Release: no pipeline creation is in flight. It queues the last save and log lines and waits
  * for neither, nor for any job still queued; the jobs own their data. */
 static void vkd3d_driver_cache_cleanup(struct vkd3d_pipeline_library_disk_cache *cache)
@@ -3944,6 +4300,15 @@ static void vkd3d_driver_cache_cleanup(struct vkd3d_pipeline_library_disk_cache 
         return;
     device = cache->library->device;
     vk_procs = &device->vk_procs;
+#ifdef _WIN32
+    if (cache->driver_save_work)
+    {
+        /* A snapshot in flight finishes first; it uses the VkPipelineCache destroyed below. */
+        WaitForThreadpoolWorkCallbacks(cache->driver_save_work, FALSE);
+        CloseThreadpoolWork(cache->driver_save_work);
+        cache->driver_save_work = NULL;
+    }
+#endif
     if (cache->driver_new_pipelines)
         vkd3d_driver_cache_save(cache, device);
     VK_CALL(vkDestroyPipelineCache(device->vk_device, cache->vk_pipeline_cache, NULL));
