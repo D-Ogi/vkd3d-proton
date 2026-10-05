@@ -655,7 +655,7 @@ static void vkd3d_wait_for_gpu_timeline_semaphore(struct vkd3d_fence_worker *wor
         if (vr != VK_SUCCESS)
         {
             ERR("Failed to wait for Vulkan timeline semaphore, vr %d.\n", vr);
-            VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST || vr == VK_TIMEOUT);
+            VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST || vr == VK_TIMEOUT, vr);
             vkd3d_waiting_fence_complete_submissions(device, worker, fence, false);
             return;
         }
@@ -663,6 +663,10 @@ static void vkd3d_wait_for_gpu_timeline_semaphore(struct vkd3d_fence_worker *wor
         /* This is a good time to kick the debug threads into action. */
         vkd3d_shader_debug_ring_kick(&device->debug_ring, device, false);
         vkd3d_descriptor_debug_kick_qa_check(device->descriptor_qa_global_info);
+
+        /* Some page faults may not trigger a real fault. Just poll. */
+        if (device->device_info.fault_features.deviceFaultReportMasked)
+            d3d12_device_poll_device_faults(device, 0);
     }
 
     vkd3d_waiting_fence_complete_submissions(device, worker, fence, true);
@@ -1473,7 +1477,7 @@ HRESULT d3d12_device_inline_wait_semaphores(struct d3d12_device *device, uint32_
     else
     {
         ERR("Inline queue mode: failed to wait for %s, vr %d.\n", what, vr);
-        VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST);
+        VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST, vr);
         if (d3d12_device_removed_reason(device) == S_OK)
             d3d12_device_mark_as_removed(device, hresult_from_vk_result(vr), "Inline wait for %s failed", what);
     }
@@ -25352,7 +25356,7 @@ static void d3d12_command_queue_wait_shared(struct d3d12_command_queue *command_
     wait_info.semaphoreCount = 1;
     wait_info.pValues = &value;
     vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, UINT64_MAX));
-    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST);
+    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST, vr);
 }
 
 static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *command_queue,
@@ -25414,7 +25418,7 @@ static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *comman
         return;
     }
 
-    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(command_queue->device, vr == VK_ERROR_DEVICE_LOST);
+    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(command_queue->device, vr == VK_ERROR_DEVICE_LOST, vr);
 
     memset(&fence_info, 0, sizeof(fence_info));
     fence_info.vk_semaphore = vkd3d_queue->submission_timeline;
@@ -25553,7 +25557,7 @@ static bool d3d12_command_queue_transition_pool_wait(struct d3d12_command_queue_
     wait_info.semaphoreCount = 1;
     wait_info.pValues = &value;
     vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, ~(uint64_t)0));
-    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST);
+    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST, vr);
     return vr == VK_SUCCESS;
 }
 
@@ -26144,7 +26148,7 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         if (is_first)
             d3d12_command_queue_finalize_waits(command_queue, vr);
 
-        VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(command_queue->device, vr == VK_ERROR_DEVICE_LOST);
+        VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(command_queue->device, vr == VK_ERROR_DEVICE_LOST, vr);
 
         if (vr != VK_SUCCESS)
             break;
@@ -26644,7 +26648,7 @@ static void d3d12_command_queue_flush_bind_sparse(struct d3d12_command_queue *co
     }
 
     vkd3d_queue_release(queue);
-    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(command_queue->device, vr == VK_ERROR_DEVICE_LOST);
+    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(command_queue->device, vr == VK_ERROR_DEVICE_LOST, vr);
 
     vkd3d_queue_timeline_trace_complete_execute(&command_queue->device->queue_timeline_trace, &command_queue->fence_worker, cookie);
 
@@ -27481,7 +27485,7 @@ void vkd3d_release_vk_queue(ID3D12CommandQueue *queue)
     submit_info.pSignalSemaphoreInfos = &semaphore_info;
 
     vr = VK_CALL(vkQueueSubmit2(d3d12_queue->vkd3d_queue->vk_queue, 1, &submit_info, VK_NULL_HANDLE));
-    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(d3d12_queue->device, vr == VK_ERROR_DEVICE_LOST);
+    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(d3d12_queue->device, vr == VK_ERROR_DEVICE_LOST, vr);
 
     d3d12_queue->last_submission_timeline_value = semaphore_info.value;
 
