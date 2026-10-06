@@ -144,7 +144,7 @@ typedef struct _PROCESS_BASIC_INFORMATION {
 # include <winternl.h>
 #endif
 
-typedef NTSTATUS (* NTAPI PFN_NtQueryInformationProcess)(
+typedef NTSTATUS (NTAPI *PFN_NtQueryInformationProcess)(
     HANDLE ProcessHandle, PROCESSINFOCLASS ProcessInformationClass,
     PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength);
 
