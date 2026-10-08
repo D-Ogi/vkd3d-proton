@@ -10788,6 +10788,33 @@ static void d3d12_device_reserve_internal_sparse_queue(struct d3d12_device *devi
     }
 }
 
+/* amdgpu-wddm fork: the driver's per-application Anisotropy setting. The D3D12 shell sets VKD3D_SAMPLER_ANISOTROPY
+ * for the duration of device creation only; any value other than 1, 2, 4, 8 or 16 leaves the samplers as the
+ * application describes them. */
+static void d3d12_device_init_sampler_anisotropy(struct d3d12_device *device)
+{
+    char env[16];
+    unsigned long value;
+    char *end;
+
+    device->sampler_anisotropy = 0;
+
+    if (!vkd3d_get_env_var("VKD3D_SAMPLER_ANISOTROPY", env, sizeof(env)) || !env[0])
+        return;
+
+    value = strtoul(env, &end, 10);
+
+    if (*end || (value != 1 && value != 2 && value != 4 && value != 8 && value != 16))
+    {
+        INFO("Ignoring VKD3D_SAMPLER_ANISOTROPY=%s: not 1, 2, 4, 8 or 16.\n", env);
+        return;
+    }
+
+    device->sampler_anisotropy = value;
+    INFO("Sampler anisotropy forced to %u for samplers with a linear minification filter.\n",
+            device->sampler_anisotropy);
+}
+
 static HRESULT d3d12_device_init(struct d3d12_device *device,
         struct vkd3d_instance *instance, const struct vkd3d_device_create_info *create_info)
 {
@@ -10818,6 +10845,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
             vkd3d_memory_order_relaxed);
 
     device->vk_device = VK_NULL_HANDLE;
+
+    d3d12_device_init_sampler_anisotropy(device);
 
     /* Inline queue mode: decided before the queues are selected (vkd3d_select_queues). */
     if (create_info->inline_queue_callbacks)

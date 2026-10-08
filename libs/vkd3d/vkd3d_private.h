@@ -6244,6 +6244,11 @@ struct d3d12_device
     size_t inline_command_queue_size;
     /* Set when a bounded wait failed (d3d12_device_inline_wait_semaphores); later waits only poll. */
     uint32_t inline_wait_failed;
+
+    /* amdgpu-wddm fork: VKD3D_SAMPLER_ANISOTROPY at device creation, 0 when unset. The driver's per-application
+     * Anisotropy setting (1, 2, 4, 8 or 16) for every sampler with a linear minification filter, as DXVK's
+     * d3d11.samplerAnisotropy does (d3d12_apply_sampler_anisotropy). */
+    uint32_t sampler_anisotropy;
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,

@@ -8737,6 +8737,29 @@ static VkBorderColor vk_border_color_from_d3d12(struct d3d12_device *device, con
     return uint_border ? VK_BORDER_COLOR_INT_CUSTOM_EXT : VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
 }
 
+/* amdgpu-wddm fork: the driver's per-application Anisotropy setting (d3d12_device.sampler_anisotropy). As DXVK's
+ * d3d11.samplerAnisotropy: every sampler with a linear minification filter takes the forced value, 1 turns
+ * anisotropic filtering off. Unnormalized coordinates cannot be combined with anisotropy in Vulkan. */
+static void d3d12_apply_sampler_anisotropy(struct d3d12_device *device, VkSamplerCreateInfo *sampler_desc)
+{
+    float limit;
+
+    if (!device->sampler_anisotropy || sampler_desc->minFilter != VK_FILTER_LINEAR ||
+            sampler_desc->unnormalizedCoordinates)
+        return;
+
+    if (device->sampler_anisotropy == 1 || !device->device_info.features2.features.samplerAnisotropy)
+    {
+        sampler_desc->anisotropyEnable = VK_FALSE;
+        sampler_desc->maxAnisotropy = 1.0f;
+        return;
+    }
+
+    limit = device->device_info.properties2.properties.limits.maxSamplerAnisotropy;
+    sampler_desc->anisotropyEnable = VK_TRUE;
+    sampler_desc->maxAnisotropy = min((float)device->sampler_anisotropy, max(1.0f, limit));
+}
+
 void d3d12_setup_static_sampler_info(struct d3d12_device *device,
         const D3D12_STATIC_SAMPLER_DESC1 *desc,
         struct d3d12_root_signature_static_sampler_vk_desc *vk_desc)
@@ -8770,6 +8793,8 @@ void d3d12_setup_static_sampler_info(struct d3d12_device *device,
 
     if (sampler_desc->anisotropyEnable)
         sampler_desc->maxAnisotropy = min(16.0f, sampler_desc->maxAnisotropy);
+
+    d3d12_apply_sampler_anisotropy(device, sampler_desc);
 
     if (d3d12_sampler_needs_border_color(desc->AddressU, desc->AddressV, desc->AddressW))
         sampler_desc->borderColor = vk_static_border_color_from_d3d12(desc->BorderColor);
@@ -8856,6 +8881,8 @@ static void d3d12_setup_sampler_info(struct d3d12_device *device,
 
     if (info->sampler_desc.anisotropyEnable)
         info->sampler_desc.maxAnisotropy = min(16.0f, info->sampler_desc.maxAnisotropy);
+
+    d3d12_apply_sampler_anisotropy(device, &info->sampler_desc);
 
     if (d3d12_sampler_needs_border_color(desc->AddressU, desc->AddressV, desc->AddressW))
         info->sampler_desc.borderColor = vk_border_color_from_d3d12(device, desc->UintBorderColor, desc->Flags);
