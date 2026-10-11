@@ -1397,6 +1397,14 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
                 return VKD3D_ERROR_NOT_IMPLEMENTED;
             }
 
+            if (compiler_args->multiview.draw_loop)
+            {
+                struct dxil_spv_option_view_instancing_draw_loop loop = {{ DXIL_SPV_OPTION_VIEW_INSTANCING_DRAW_LOOP }};
+                loop.base_spec_id = VKD3D_SHADER_VIEW_DRAW_LOOP_BASE_SPEC_CONSTANT;
+                if (dxil_spv_converter_add_option(converter, &loop.base) != DXIL_SPV_SUCCESS)
+                    return VKD3D_ERROR_NOT_IMPLEMENTED;
+            }
+
             /* Set a dummy meta descriptor so that dxil-spirv doesn't assert. */
             dxil_spv_converter_set_meta_descriptor(converter, DXIL_SPV_META_DESCRIPTOR_DYNAMIC_VIEW_INSTANCING_OFFSETS,
                     DXIL_SPV_META_DESCRIPTOR_KIND_UBO_CONTAINING_CONSTANT, 0, 0);
@@ -1623,7 +1631,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         /* For now, we cannot support view instancing with fallback paths, but that's not a dxil-spirv issue,
          * but rather a vkd3d-proton issue. */
         dxil_spv_bool compatible = DXIL_SPV_FALSE;
-        if (compiler_args && compiler_args->multiview.enable &&
+        if (compiler_args && compiler_args->multiview.enable && !compiler_args->multiview.draw_loop &&
             (dxil_spv_converter_is_multiview_compatible(converter, &compatible) != DXIL_SPV_SUCCESS ||
             compatible == DXIL_SPV_FALSE))
         {

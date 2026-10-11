@@ -164,7 +164,8 @@ enum vkd3d_shader_parameter_spec_constant_mapping
 {
     /* Lower values are reserved for other instrumentation. */
     VKD3D_SHADER_VIEW_INDEX_TO_VIEW_ID_SPEC_CONSTANT = 1000,
-    VKD3D_SHADER_VIEW_ID_TO_VIEWPORT_SPEC_CONSTANT = 1001
+    VKD3D_SHADER_VIEW_ID_TO_VIEWPORT_SPEC_CONSTANT = 1001,
+    VKD3D_SHADER_VIEW_DRAW_LOOP_BASE_SPEC_CONSTANT = 1010
 };
 
 enum vkd3d_shader_parameter_data_type
@@ -641,6 +642,7 @@ struct vkd3d_shader_compile_arguments
     {
         bool enable;
         bool last_pre_rasterization;
+        bool draw_loop;
     } multiview;
 };
 

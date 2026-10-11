@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Józef Kucia for CodeWeavers
+ * Copyright 2016 JĂłzef Kucia for CodeWeavers
  * Copyright 2016 Henri Verbeet for CodeWeavers
  *
  * This library is free software; you can redistribute it and/or
@@ -2793,6 +2793,8 @@ static void d3d12_pipeline_state_destroy_graphics(struct d3d12_pipeline_state *s
     struct vkd3d_compiled_pipeline *current, *e;
 
     d3d12_pipeline_state_destroy_shader_modules(state, device);
+    if (graphics->multiview.fallback)
+        ID3D12PipelineState_Release(&graphics->multiview.fallback->ID3D12PipelineState_iface);
 
     LIST_FOR_EACH_ENTRY_SAFE(current, e, &graphics->compiled_fallback_pipelines, struct vkd3d_compiled_pipeline, entry)
     {
@@ -3162,10 +3164,11 @@ static void d3d12_pipeline_state_init_compile_arguments(struct d3d12_pipeline_st
         compile_arguments->output_swizzle_count = state->graphics.rt_count;
     }
 
-    if (stage != VK_SHADER_STAGE_COMPUTE_BIT && state->graphics.multiview.view_mask)
+    if (stage != VK_SHADER_STAGE_COMPUTE_BIT && state->graphics.multiview.count)
     {
         VkShaderStageFlags active_pre_raster = state->graphics.stage_flags & ~VK_SHADER_STAGE_FRAGMENT_BIT;
-        compile_arguments->multiview.enable = state->graphics.multiview.view_mask != 0;
+        compile_arguments->multiview.enable = true;
+        compile_arguments->multiview.draw_loop = state->graphics.multiview.draw_loop;
         /* Only last pre-raster stage needs to "support" multiview properly.
          * Other stages can query ViewID. */
         compile_arguments->multiview.last_pre_rasterization =
@@ -4633,31 +4636,13 @@ void vkd3d_vertex_input_pipeline_free(struct hash_map_entry *entry, void *userda
     VK_CALL(vkDestroyPipeline(device->vk_device, pipeline->vk_pipeline, NULL));
 }
 
-static uint32_t vkd3d_view_mask_to_multiview_mask(
-        struct d3d12_graphics_pipeline_state *graphics, uint32_t view_mask)
-{
-    /* Convert D3D12 view mask to the remapped Vulkan multiview mask. */
-    uint32_t base_mask = graphics->multiview.view_mask;
-    uint32_t mask = 0;
 
-    while (base_mask)
-    {
-        unsigned int vk_index = vkd3d_bitmask_iter32(&base_mask);
-        unsigned int view_id;
-
-        view_id = (graphics->multiview.spec_data_index_to_id_mapping >> (2 * vk_index)) & 3;
-        if (view_mask & (1u << view_id))
-            mask |= 1u << vk_index;
-    }
-
-    return mask;
-}
 
 void vkd3d_fragment_output_pipeline_desc_init(struct vkd3d_fragment_output_pipeline_desc *desc,
         struct d3d12_pipeline_state *state, const struct vkd3d_format *dsv_format,
         uint32_t dynamic_view_mask, uint32_t dynamic_state_flags)
 {
-    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    const struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
     unsigned int i;
 
     memset(desc, 0, sizeof(*desc));
@@ -4793,6 +4778,7 @@ void vkd3d_fragment_output_pipeline_free(struct hash_map_entry *entry, void *use
 }
 
 bool vkd3d_debug_control_has_out_of_spec_test_behavior(VKD3D_DEBUG_CONTROL_OUT_OF_SPEC_BEHAVIOR behavior);
+
 
 static bool d3d12_graphics_pipeline_needs_dynamic_rasterization_samples(const struct d3d12_graphics_pipeline_state *graphics)
 {
@@ -5401,70 +5387,79 @@ static bool d3d12_graphics_pipeline_state_needs_noop_fs(
             device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV;
 }
 
+/* Inspect every graphics output, because the converter also sees outputs in
+ * non-final stages. A parse failure takes the general path; shader validation
+ * still rejects malformed bytecode later. */
+static bool d3d12_view_instancing_has_shader_location(const struct d3d12_pipeline_state_desc *desc)
+{
+    const D3D12_SHADER_BYTECODE *shaders[] = { &desc->vs, &desc->hs, &desc->ds, &desc->gs, &desc->ms };
+    struct vkd3d_shader_signature signature;
+    struct vkd3d_shader_code code;
+    unsigned int i, j;
+    bool found;
+    for (i = 0; i < ARRAY_SIZE(shaders); i++)
+    {
+        if (!shaders[i]->BytecodeLength)
+            continue;
+        memset(&code, 0, sizeof(code));
+        code.code = shaders[i]->pShaderBytecode;
+        code.size = shaders[i]->BytecodeLength;
+        memset(&signature, 0, sizeof(signature));
+        if (vkd3d_shader_parse_output_signature(&code, &signature) < 0)
+            return true;
+        found = false;
+        for (j = 0; j < signature.element_count; j++)
+            found |= signature.elements[j].sysval_semantic == VKD3D_SV_RENDER_TARGET_ARRAY_INDEX ||
+                    signature.elements[j].sysval_semantic == VKD3D_SV_VIEWPORT_ARRAY_INDEX;
+        vkd3d_shader_free_shader_signature(&signature);
+        if (found)
+            return true;
+    }
+    return false;
+}
+
 static bool d3d12_pipeline_state_validate_view_instancing(struct d3d12_device *device,
         struct d3d12_graphics_pipeline_state *graphics, const struct d3d12_pipeline_state_desc *desc)
 {
-    /* Need to map ViewIndex (32-bit) back to 2-bit ViewID (max view instancing in D3D12 is 4). */
-    uint32_t limit = min(device->device_info.vulkan_1_1_properties.maxMultiviewViewCount, 32 / 2);
+    uint32_t limit = min(device->device_info.vulkan_1_1_properties.maxMultiviewViewCount, 16);
+    const D3D12_VIEW_INSTANCING_DESC *vi = &desc->view_instancing_desc;
     unsigned int i;
+    bool loop;
 
-    if (desc->view_instancing_desc.Flags & D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING)
-        FIXME_ONCE("View instance masking is supported in a naive way. Will fallback compile as required.\n");
-    graphics->multiview.dynamic_mask =
-            !!(desc->view_instancing_desc.Flags & D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING);
-
-    if (desc->gs.BytecodeLength && !device->device_info.vulkan_1_1_features.multiviewGeometryShader)
-    {
-        FIXME_ONCE("Multiview + geometry shader is used, but device does not support it.\n");
+    if (vi->ViewInstanceCount > D3D12_MAX_VIEW_INSTANCE_COUNT ||
+            (vi->ViewInstanceCount && !vi->pViewInstanceLocations) ||
+            (vi->Flags & ~D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING))
         return false;
-    }
 
-    if (desc->ds.BytecodeLength && !device->device_info.vulkan_1_1_features.multiviewTessellationShader)
+    graphics->multiview.count = vi->ViewInstanceCount;
+    graphics->multiview.default_mask = (1u << vi->ViewInstanceCount) - 1u;
+    graphics->multiview.dynamic_mask = !!(vi->Flags & D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING);
+    loop = desc->force_view_draw_loop || d3d12_view_instancing_has_shader_location(desc) ||
+            !device->device_info.vulkan_1_1_features.multiview ||
+            (desc->gs.BytecodeLength && !device->device_info.vulkan_1_1_features.multiviewGeometryShader) ||
+            (desc->ds.BytecodeLength && !device->device_info.vulkan_1_1_features.multiviewTessellationShader) ||
+            (desc->ms.BytecodeLength && !device->device_info.mesh_shader_features.multiviewMeshShader);
+
+    for (i = 0; i < vi->ViewInstanceCount; i++)
     {
-        FIXME_ONCE("Multiview + tessellation is used, but device does not support it.\n");
-        return false;
-    }
-
-    for (i = 0; i < desc->view_instancing_desc.ViewInstanceCount; i++)
-    {
-        const D3D12_VIEW_INSTANCE_LOCATION *loc = &desc->view_instancing_desc.pViewInstanceLocations[i];
-
-        if (loc->RenderTargetArrayIndex >= limit)
+        const D3D12_VIEW_INSTANCE_LOCATION *loc = &vi->pViewInstanceLocations[i];
+        graphics->multiview.locations[i] = *loc;
+        /* Retain the whole u32 domain for the draw path. Never truncate a layer
+         * to the Vulkan mask or a viewport to the packed fast-path byte. */
+        if (loc->RenderTargetArrayIndex >= limit || loc->ViewportArrayIndex >= 16)
         {
-            /* Only way this can work is exporting gl_Layer ourselves.
-             * This should never happen, but we could implement this by passing down a separate u32 and
-             * force draw instancing. */
-            FIXME("RenderTargetArrayIndex %u is out of range for supported min(16, multiviewCount) %u.\n",
-                    loc->RenderTargetArrayIndex, limit);
-            return false;
+            loop = true;
+            continue;
         }
-
         if (graphics->multiview.view_mask & (1u << loc->RenderTargetArrayIndex))
-        {
-            /* Technically it's valid to instance multiple times to the same array layer,
-             * and just using different viewport indices to achieve the same effect.
-             * However, there is no good way to express this in plain Vulkan multiview,
-             * so we are kind of forced to implement draw instancing here. */
-            FIXME("The same RenderTargetArrayIndex %u is used for multiple ViewIDs. This is unsupported.\n",
-                    loc->RenderTargetArrayIndex);
-            return false;
-        }
-
+            loop = true;
         graphics->multiview.view_mask |= 1u << loc->RenderTargetArrayIndex;
-
-        /* We get the final layer in Vulkan constants, and we have to map that backwards to ViewID. */
-        graphics->multiview.spec_data_index_to_id_mapping |= i << (loc->RenderTargetArrayIndex * 2);
-
-        /* This is trivial to achieve in dxil-spirv. */
+        graphics->multiview.spec_data_index_to_id_mapping |= i << (2 * loc->RenderTargetArrayIndex);
         graphics->multiview.spec_data_viewport_mapping |= loc->ViewportArrayIndex << (8 * i);
-
-        /* There is still a potential hazard we don't handle which happens if last pre-raster stage is exporting
-         * SV_RenderTargetArrayIndex. We are forced into draw instancing in this case, which we don't support,
-         * but we need to defer this to compile time to check if we're compatible. */
     }
-
-    graphics->multiview.default_mask = (1u << desc->view_instancing_desc.ViewInstanceCount) - 1u;
-
+    graphics->multiview.draw_loop = loop;
+    if (loop)
+        graphics->multiview.view_mask = 0;
     return true;
 }
 
@@ -5573,14 +5568,15 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
             goto fail;
         }
 
-        if (device->d3d12_caps.options3.ViewInstancingTier == D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED)
+        if (desc->view_instancing_desc.ViewInstanceCount > 1 &&
+                device->d3d12_caps.options3.ViewInstancingTier == D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED)
         {
             ERR("View instancing not supported.\n");
             hr = E_INVALIDARG;
             goto fail;
         }
 
-        /* We don't support every case yet, but the obvious fast paths should work. */
+        /* Every location is representable; use multiview only for its exact subset. */
         if (!d3d12_pipeline_state_validate_view_instancing(device, graphics, desc))
         {
             FIXME("Unsupported view instancing configuration used.\n");
@@ -6213,7 +6209,7 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
      * We cannot modify the viewMask of pre-raster if output viewMask has a mismatch.
      * Just fallback to stall-ful compile if we have to. */
     has_gpl = state->device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary &&
-            !graphics->multiview.dynamic_mask;
+            !graphics->multiview.dynamic_mask && !graphics->multiview.draw_loop;
 
     library_flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
             VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
@@ -6309,7 +6305,7 @@ static HRESULT d3d12_pipeline_state_finish_graphics(struct d3d12_pipeline_state 
         state->pso_is_fully_dynamic = false;
 
     /* If we have dynamic view mask, we may have to compile variants. */
-    if (graphics->multiview.dynamic_mask)
+    if (graphics->multiview.dynamic_mask || graphics->multiview.draw_loop)
         state->pso_is_fully_dynamic = false;
 
     if (!state->pso_is_fully_dynamic)
@@ -6644,6 +6640,20 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     /* amdgpu-wddm fork: may save the persisted driver cache on this thread. */
     vkd3d_pipeline_library_driver_cache_notify(&device->disk_cache);
 
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && object->graphics.multiview.count &&
+            !object->graphics.multiview.draw_loop)
+    {
+        struct d3d12_pipeline_state_desc fallback = *desc;
+        fallback.force_view_draw_loop = true;
+        memset(&fallback.cached_pso, 0, sizeof(fallback.cached_pso));
+        if (FAILED(hr = d3d12_pipeline_state_create(device, bind_point, &fallback,
+                &object->graphics.multiview.fallback)))
+        {
+            ID3D12PipelineState_Release(&object->ID3D12PipelineState_iface);
+            return hr;
+        }
+    }
+
     TRACE("Created pipeline state %p.\n", object);
 
 #ifdef VKD3D_ENABLE_PROFILING
@@ -6909,6 +6919,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     VkPipelineCreationFeedbackEXT feedbacks[VKD3D_MAX_SHADER_STAGES];
     struct vkd3d_fragment_output_pipeline_desc fragment_output_desc;
     VkPipelineShaderStageCreateInfo stages[VKD3D_MAX_SHADER_STAGES];
+    struct vkd3d_shader_spec_info loop_specs[VKD3D_MAX_SHADER_STAGES];
     VkGraphicsPipelineLibraryCreateInfoEXT library_create_info;
     struct vkd3d_vertex_input_pipeline_desc vertex_input_desc;
     VkPipelineTessellationStateCreateInfo tessellation_info;
@@ -7066,6 +7077,48 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         }
 
         rwlock_unlock_read(&state->lock);
+    }
+
+    if (graphics->multiview.draw_loop)
+    {
+        uint32_t view = key ? key->view_id : 0;
+        uint32_t j, n;
+        if (pipeline_desc.pStages != stages)
+            memcpy(stages, graphics->stages, graphics->stage_count * sizeof(*stages));
+        for (i = 0; i < graphics->stage_count; i++)
+        {
+            const VkSpecializationInfo *old = stages[i].pSpecializationInfo;
+            struct vkd3d_shader_spec_info *info = &loop_specs[i];
+            memset(info, 0, sizeof(*info));
+            n = old ? old->mapEntryCount : 0;
+            if (n > VKD3D_SHADER_SPEC_INFO_MAP_ENTRIES - 5 || (old && old->dataSize > 8 * sizeof(uint32_t)))
+            {
+                vk_pipeline = VK_NULL_HANDLE;
+                goto err;
+            }
+            if (old)
+            {
+                memcpy(info->generic_u32, old->pData, old->dataSize);
+                memcpy(info->map_entries, old->pMapEntries, n * sizeof(*info->map_entries));
+            }
+            for (j = 0; j < 5; j++)
+            {
+                info->map_entries[n+j].constantID = VKD3D_SHADER_VIEW_DRAW_LOOP_BASE_SPEC_CONSTANT + j;
+                info->map_entries[n+j].offset = (8+j) * sizeof(uint32_t);
+                info->map_entries[n+j].size = sizeof(uint32_t);
+            }
+            info->generic_u32[8] = view;
+            info->generic_u32[9] = graphics->multiview.locations[view].RenderTargetArrayIndex;
+            info->generic_u32[10] = graphics->multiview.locations[view].ViewportArrayIndex;
+            info->generic_u32[11] = key ? key->view_layer_count : 2048;
+            info->generic_u32[12] = key ? key->view_viewport_count : 16;
+            info->spec_info.pData = info->generic_u32;
+            info->spec_info.dataSize = sizeof(info->generic_u32);
+            info->spec_info.pMapEntries = info->map_entries;
+            info->spec_info.mapEntryCount = n + 5;
+            stages[i].pSpecializationInfo = &info->spec_info;
+        }
+        pipeline_desc.pStages = stages;
     }
 
     /* If we're using identifiers, set the appropriate flag. */
@@ -7251,6 +7304,10 @@ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
             return VK_NULL_HANDLE;
     }
 
+    /* The fallback specializes the logical view and current attachment bounds. */
+    if (graphics->multiview.draw_loop)
+        return VK_NULL_HANDLE;
+
     /* We also need a fallback pipeline if view instance mask does not match. */
     if (state->graphics.multiview.view_mask &&
             state->graphics.multiview.dynamic_mask &&
@@ -7289,7 +7346,13 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
     }
 
     pipeline_key.dsv_format = dsv_format ? dsv_format->vk_format : VK_FORMAT_UNDEFINED;
-    pipeline_key.view_mask = graphics->multiview.dynamic_mask ? dyn_state->view_mask : 0;
+    pipeline_key.view_mask = graphics->multiview.dynamic_mask && !graphics->multiview.draw_loop ? dyn_state->view_mask : 0;
+    if (graphics->multiview.draw_loop)
+    {
+        pipeline_key.view_id = dyn_state->view_id;
+        pipeline_key.view_layer_count = dyn_state->view_layer_count;
+        pipeline_key.view_viewport_count = dyn_state->viewport_count;
+    }
 
     if (!(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES))
     {

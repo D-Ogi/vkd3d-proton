@@ -7497,7 +7497,7 @@ static bool d3d12_command_list_update_rendering_info(struct d3d12_command_list *
     if (graphics)
     {
         rendering_info->info.viewMask = graphics->multiview.dynamic_mask ?
-                list->dynamic_state.view_mask : graphics->multiview.view_mask;
+                vkd3d_view_mask_to_multiview_mask(graphics, list->dynamic_state.view_mask) : graphics->multiview.view_mask;
     }
     else
     {
@@ -7829,7 +7829,8 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
 
     pso_invalidates_rp = false;
     view_mask = list->state->graphics.multiview.dynamic_mask ?
-            list->dynamic_state.view_mask : list->state->graphics.multiview.view_mask;
+            vkd3d_view_mask_to_multiview_mask(&list->state->graphics, list->dynamic_state.view_mask) :
+            list->state->graphics.multiview.view_mask;
 
     /* With unified layouts, we can mitigate this, since layout will always be either GENERAL or UNDEFINED anyway.
      * If we have unused_attachments, UNDEFINED use will follow OMSetRenderTargets.
@@ -9443,7 +9444,72 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
     return true;
 }
 
-static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_list_iface *iface,
+struct d3d12_view_draw_scope
+{
+    struct d3d12_pipeline_state *parent;
+    uint32_t mask;
+    bool loop;
+};
+
+static struct d3d12_view_draw_scope d3d12_command_list_begin_view_draw(
+        struct d3d12_command_list *list, bool indirect)
+{
+    struct d3d12_view_draw_scope scope = {list->state, 1, false};
+    const struct d3d12_graphics_pipeline_state *graphics;
+    bool use_fast;
+    uint32_t mask, i;
+
+    if (!d3d12_pipeline_state_is_graphics(list->state) || !list->state->graphics.multiview.count)
+        return scope;
+
+    /* Deferred DGC retains an earlier PSO and logical mask. Drain it before
+     * temporarily binding this draw's private fallback. */
+    d3d12_command_list_flush_dgc_batch(list);
+    graphics = &list->state->graphics;
+    mask = graphics->multiview.default_mask;
+    if (graphics->multiview.dynamic_mask)
+        mask &= list->dynamic_state.view_mask;
+    use_fast = !graphics->multiview.draw_loop && !indirect;
+    for (i = 0; i < graphics->multiview.count; i++)
+    {
+        if ((mask & (1u << i)) &&
+                (graphics->multiview.locations[i].RenderTargetArrayIndex >= list->fb_layer_count ||
+                 graphics->multiview.locations[i].ViewportArrayIndex >= list->dynamic_state.viewport_count))
+            use_fast = false;
+    }
+    if (use_fast)
+    {
+        scope.mask = mask ? 1 : 0;
+        return scope;
+    }
+    if (!graphics->multiview.draw_loop)
+        list->state = graphics->multiview.fallback;
+    scope.loop = true;
+    scope.mask = mask;
+    return scope;
+}
+
+static void d3d12_command_list_select_view(struct d3d12_command_list *list,
+        const struct d3d12_view_draw_scope *scope, uint32_t view)
+{
+    if (!scope->loop)
+        return;
+    list->dynamic_state.view_id = view;
+    list->dynamic_state.view_layer_count = list->fb_layer_count;
+    d3d12_command_list_invalidate_current_pipeline(list, false);
+}
+
+static void d3d12_command_list_end_view_draw(struct d3d12_command_list *list,
+        const struct d3d12_view_draw_scope *scope)
+{
+    if (!scope->loop)
+        return;
+    list->state = scope->parent;
+    list->dynamic_state.view_id = 0;
+    d3d12_command_list_invalidate_current_pipeline(list, false);
+}
+
+static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced_one_view(d3d12_command_list_iface *iface,
         UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location,
         UINT start_instance_location)
 {
@@ -9491,6 +9557,24 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
     VKD3D_BREADCRUMB_COMMAND(DRAW);
 }
 
+static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_list_iface *iface,
+        UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location,
+        UINT start_instance_location)
+{
+    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+    struct d3d12_view_draw_scope scope;
+    uint32_t view;
+
+    scope = d3d12_command_list_begin_view_draw(list, false);
+    while (scope.mask)
+    {
+        view = vkd3d_bitmask_iter32(&scope.mask);
+        d3d12_command_list_select_view(list, &scope, view);
+        d3d12_command_list_DrawInstanced_one_view(iface, vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);
+    }
+    d3d12_command_list_end_view_draw(list, &scope);
+}
+
 static bool d3d12_command_list_update_index_buffer(struct d3d12_command_list *list)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -9533,7 +9617,7 @@ static bool d3d12_command_list_update_index_buffer(struct d3d12_command_list *li
     return true;
 }
 
-static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_command_list_iface *iface,
+static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced_one_view(d3d12_command_list_iface *iface,
         UINT index_count_per_instance, UINT instance_count, UINT start_vertex_location,
         INT base_vertex_location, UINT start_instance_location)
 {
@@ -9586,6 +9670,24 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
     VKD3D_BREADCRUMB_AUX32(base_vertex_location);
     VKD3D_BREADCRUMB_AUX32(start_instance_location);
     VKD3D_BREADCRUMB_COMMAND(DRAW_INDEXED);
+}
+
+static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_command_list_iface *iface,
+        UINT index_count_per_instance, UINT instance_count, UINT start_vertex_location,
+        INT base_vertex_location, UINT start_instance_location)
+{
+    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+    struct d3d12_view_draw_scope scope;
+    uint32_t view;
+
+    scope = d3d12_command_list_begin_view_draw(list, false);
+    while (scope.mask)
+    {
+        view = vkd3d_bitmask_iter32(&scope.mask);
+        d3d12_command_list_select_view(list, &scope, view);
+        d3d12_command_list_DrawIndexedInstanced_one_view(iface, index_count_per_instance, instance_count, start_vertex_location, base_vertex_location, start_instance_location);
+    }
+    d3d12_command_list_end_view_draw(list, &scope);
 }
 
 static void d3d12_command_list_check_pre_compute_barrier(
@@ -18580,7 +18682,8 @@ static void d3d12_command_list_execute_indirect_state_template_dgc(
      * Don't do this on tilers since we'll be introducing more technically unnecessary render pass flushes. */
     if (!list->predication.va && dgc_mode == VKD3D_DGC_MODE_APPLICATION_CALL &&
         !list->device->workarounds.tiler_suspend_resume &&
-        !explicit_preprocess && list->state && list->state->pipeline_type != VKD3D_PIPELINE_TYPE_COMPUTE)
+        !explicit_preprocess && list->state && list->state->pipeline_type != VKD3D_PIPELINE_TYPE_COMPUTE &&
+        !list->state->graphics.multiview.draw_loop)
     {
         /* FIXME: Will not work if doing indirect breadcrumb trace, but that's not merged. */
         struct vkd3d_dgc_batch_draw *draw;
@@ -19006,7 +19109,7 @@ VKD3D_NOINLINE void d3d12_command_list_flush_dgc_batch_draws(struct d3d12_comman
             state ? &state->ID3D12PipelineState_iface : NULL);
 }
 
-static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_list_iface *iface,
+static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect_one_view(d3d12_command_list_iface *iface,
         ID3D12CommandSignature *command_signature, UINT max_command_count, ID3D12Resource *arg_buffer,
         UINT64 arg_buffer_offset, ID3D12Resource *count_buffer, UINT64 count_buffer_offset)
 {
@@ -19285,6 +19388,31 @@ static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_l
 
     if (list->state && list->state->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE)
         d3d12_command_list_check_compute_barrier(list);
+}
+
+static void STDMETHODCALLTYPE d3d12_command_list_ExecuteIndirect(d3d12_command_list_iface *iface,
+        ID3D12CommandSignature *command_signature, UINT max_command_count, ID3D12Resource *arg_buffer,
+        UINT64 arg_buffer_offset, ID3D12Resource *count_buffer, UINT64 count_buffer_offset)
+{
+    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+    struct d3d12_view_draw_scope scope;
+    uint32_t view;
+
+    if (impl_from_ID3D12CommandSignature(command_signature)->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE)
+    {
+        d3d12_command_list_ExecuteIndirect_one_view(iface, command_signature, max_command_count,
+                arg_buffer, arg_buffer_offset, count_buffer, count_buffer_offset);
+        return;
+    }
+
+    scope = d3d12_command_list_begin_view_draw(list, true);
+    while (scope.mask)
+    {
+        view = vkd3d_bitmask_iter32(&scope.mask);
+        d3d12_command_list_select_view(list, &scope, view);
+        d3d12_command_list_ExecuteIndirect_one_view(iface, command_signature, max_command_count, arg_buffer, arg_buffer_offset, count_buffer, count_buffer_offset);
+    }
+    d3d12_command_list_end_view_draw(list, &scope);
 }
 
 static void STDMETHODCALLTYPE d3d12_command_list_AtomicCopyBufferUINT(d3d12_command_list_iface *iface,
@@ -22511,7 +22639,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_RSSetShadingRateImage(d3d12_com
     list->vrs_image = vrs_image;
 }
 
-static void STDMETHODCALLTYPE d3d12_command_list_DispatchMesh(d3d12_command_list_iface *iface, UINT x, UINT y, UINT z)
+static void STDMETHODCALLTYPE d3d12_command_list_DispatchMesh_one_view(d3d12_command_list_iface *iface, UINT x, UINT y, UINT z)
 {
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -22544,6 +22672,22 @@ static void STDMETHODCALLTYPE d3d12_command_list_DispatchMesh(d3d12_command_list
         VK_CALL(vkCmdDrawMeshTasksEXT(list->cmd.vk_command_buffer, x, y, z));
     else
         VK_CALL(vkCmdDrawMeshTasksIndirectEXT(list->cmd.vk_command_buffer, scratch.buffer, scratch.offset, 1, 0));
+}
+
+static void STDMETHODCALLTYPE d3d12_command_list_DispatchMesh(d3d12_command_list_iface *iface, UINT x, UINT y, UINT z)
+{
+    struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+    struct d3d12_view_draw_scope scope;
+    uint32_t view;
+
+    scope = d3d12_command_list_begin_view_draw(list, false);
+    while (scope.mask)
+    {
+        view = vkd3d_bitmask_iter32(&scope.mask);
+        d3d12_command_list_select_view(list, &scope, view);
+        d3d12_command_list_DispatchMesh_one_view(iface, x, y, z);
+    }
+    d3d12_command_list_end_view_draw(list, &scope);
 }
 
 static bool d3d12_barrier_invalidates_indirect_arguments(D3D12_BARRIER_SYNC sync, D3D12_BARRIER_ACCESS access)

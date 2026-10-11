@@ -444,6 +444,25 @@ static HRESULT APIENTRY bc250_query_adapter_caps(const BC250_VKD3D_DEVICE_CREATE
 
     for (i = 0; i < count; ++i)
     {
+        if (queries[i].Feature == BC250_VKD3D_FEATURE_VIEW_INSTANCING_CONTRACT)
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS3 options;
+            BC250_VKD3D_VIEW_INSTANCING_CONTRACT value;
+            queries[i].Result = E_INVALIDARG;
+            if (queries[i].Reserved || !queries[i].pData || queries[i].DataSize != sizeof(value))
+                continue;
+            memset(&options, 0, sizeof(options));
+            queries[i].Result = vkd3d_adapter_caps_check_feature_support(caps,
+                    D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
+            if (SUCCEEDED(queries[i].Result))
+            {
+                value.Revision = BC250_VKD3D_VIEW_INSTANCING_CONTRACT_REVISION;
+                value.ViewInstancingTier = options.ViewInstancingTier >= D3D12_VIEW_INSTANCING_TIER_2 ?
+                        D3D12_VIEW_INSTANCING_TIER_2 : D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+                memcpy(queries[i].pData, &value, sizeof(value));
+            }
+            continue;
+        }
         queries[i].Result = queries[i].Reserved ? E_INVALIDARG : vkd3d_adapter_caps_check_feature_support(caps,
                 (D3D12_FEATURE)queries[i].Feature, queries[i].pData, queries[i].DataSize);
     }

@@ -2737,6 +2737,12 @@ void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_com
             H32(desc->view_instancing_desc.pViewInstanceLocations[i].ViewportArrayIndex);
         }
         H32(desc->view_instancing_desc.Flags);
+        if (desc->view_instancing_desc.ViewInstanceCount)
+        {
+            /* Translator/location ABI revision; old blobs must not bypass it. */
+            H32(0x56494c31);
+            H32(desc->force_view_draw_loop);
+        }
     }
     H32(desc->node_mask);
     H32(desc->flags);

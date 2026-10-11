@@ -2311,7 +2311,7 @@ VkPipeline vkd3d_fragment_output_pipeline_create(struct d3d12_device *device,
         const struct vkd3d_fragment_output_pipeline_desc *desc);
 void vkd3d_fragment_output_pipeline_free(struct hash_map_entry *entry, void *userdata);
 
-#define VKD3D_SHADER_SPEC_INFO_MAP_ENTRIES 4
+#define VKD3D_SHADER_SPEC_INFO_MAP_ENTRIES 16
 struct vkd3d_shader_spec_info
 {
     union
@@ -2412,12 +2412,37 @@ struct d3d12_graphics_pipeline_state
         uint32_t view_mask;
         uint32_t spec_data_index_to_id_mapping;
         uint32_t spec_data_viewport_mapping;
+        uint32_t count;
+        D3D12_VIEW_INSTANCE_LOCATION locations[D3D12_MAX_VIEW_INSTANCE_COUNT];
+        bool draw_loop;
+        /* Owned public reference, retained as long as this parent PSO lives. */
+        struct d3d12_pipeline_state *fallback;
         uint32_t default_mask;
         bool dynamic_mask;
     } multiview;
 
     bool disable_optimization;
 };
+
+static inline uint32_t vkd3d_view_mask_to_multiview_mask(
+        const struct d3d12_graphics_pipeline_state *graphics, uint32_t view_mask)
+{
+    /* Convert D3D12 view mask to the remapped Vulkan multiview mask. */
+    uint32_t base_mask = graphics->multiview.view_mask;
+    uint32_t mask = 0;
+
+    while (base_mask)
+    {
+        unsigned int vk_index = vkd3d_bitmask_iter32(&base_mask);
+        unsigned int view_id;
+
+        view_id = (graphics->multiview.spec_data_index_to_id_mapping >> (2 * vk_index)) & 3;
+        if (view_mask & (1u << view_id))
+            mask |= 1u << vk_index;
+    }
+
+    return mask;
+}
 
 static inline unsigned int dsv_attachment_mask(const struct d3d12_graphics_pipeline_state *graphics)
 {
@@ -2534,6 +2559,7 @@ struct d3d12_pipeline_state_desc
     DXGI_FORMAT dsv_format;
     DXGI_SAMPLE_DESC sample_desc;
     D3D12_VIEW_INSTANCING_DESC view_instancing_desc;
+    bool force_view_draw_loop; /* Internal cache-distinct fallback, never application state. */
     UINT node_mask;
     struct d3d12_cached_pipeline_state cached_pso;
     D3D12_PIPELINE_STATE_FLAGS flags;
@@ -2567,6 +2593,7 @@ struct vkd3d_pipeline_key
     VkFormat dsv_format;
     VkSampleCountFlagBits rasterization_samples;
     uint32_t view_mask;
+    uint32_t view_id, view_layer_count, view_viewport_count;
 
     bool dynamic_topology;
 };
@@ -3105,6 +3132,7 @@ struct vkd3d_dynamic_state
     VkRect2D scissors[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
     VkSampleCountFlagBits rasterization_samples;
     uint32_t view_mask;
+    uint32_t view_id, view_layer_count;
 
     float blend_constants[4];
 

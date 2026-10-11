@@ -9637,25 +9637,13 @@ static void d3d12_device_caps_init_feature_options3(struct d3d12_device *device)
             D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY |
             D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE;
 
-    /* This comes up in various games, and there are no known cases of applications needing the edge cases to work.
-     * Just expose view instancing unconditionally even if we cannot make all cases work yet.
-     * Native implementations aren't exactly fully compliant either as our test suite demonstrates.
-     * With descriptor heap, there is a path forward with draw unrolling if we *really* have to at least.
-     *
-     * TIER_2 is most appropriate since it allows for fast path in certain situations and
-     * fallback in some other cases.
-     * Turnip does not support multiviewGeom/Tess. This should not come up, so shove it under the rug for now. */
+    /* Tier 2: native multiview where exact, per-view draw fallback for the
+     * complete location domain. Tier 3 forbids this redundant shading. */
     options3->ViewInstancingTier =
             device->device_info.vulkan_1_1_features.multiview &&
             device->device_info.vulkan_1_2_features.shaderOutputLayer &&
-            device->device_info.vulkan_1_2_features.shaderOutputViewportIndex &&
-            (device->workarounds.tiler_suspend_resume ||
-                    (device->device_info.vulkan_1_1_features.multiviewGeometryShader &&
-                    device->device_info.vulkan_1_1_features.multiviewTessellationShader)) &&
-            (!device->device_info.mesh_shader_features.meshShader ||
-                    device->device_info.mesh_shader_features.multiviewMeshShader) ?
-            D3D12_VIEW_INSTANCING_TIER_2 :
-            D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+            device->device_info.vulkan_1_2_features.shaderOutputViewportIndex ?
+            D3D12_VIEW_INSTANCING_TIER_2 : D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
 
     /* We can implement barycentrics with unstable barycentrics.
      * Don't enable on GCN since the affected game breaks. */

@@ -412,7 +412,20 @@ typedef struct BC250_VKD3D_IMPORTED_MEMORY
     UINT32 Flags;                                  /* BC250_VKD3D_IMPORTED_MEMORY_FLAG_*; other bits: E_INVALIDARG */
 } BC250_VKD3D_IMPORTED_MEMORY;
 
-/* 1.2, V11. One CheckFeatureSupport call of QueryAdapterCaps. */
+/* Optional engine-only query carried by QueryAdapterCaps, never CheckFeatureSupport.
+ * Earlier engines reject the unknown Feature, so their incomplete OPTIONS3 answer
+ * cannot accidentally enable native view instancing. The function-table ABI stays 1.3.
+ * Revision 1 covers repeated layers, independent viewports, shader offsets and masking.
+ * ViewInstancingTier is the actual adapter tier, limited to 2 for the draw fallback. */
+#define BC250_VKD3D_FEATURE_VIEW_INSTANCING_CONTRACT 0x7f250001u
+#define BC250_VKD3D_VIEW_INSTANCING_CONTRACT_REVISION 1u
+typedef struct BC250_VKD3D_VIEW_INSTANCING_CONTRACT
+{
+    UINT32 Revision;
+    UINT32 ViewInstancingTier;
+} BC250_VKD3D_VIEW_INSTANCING_CONTRACT;
+
+/* 1.2, V11. One CheckFeatureSupport call (or the optional engine query above). */
 typedef struct BC250_VKD3D_FEATURE_QUERY
 {
     UINT32 Feature;                                /* a D3D12_FEATURE */
