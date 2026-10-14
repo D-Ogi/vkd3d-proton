@@ -17,7 +17,7 @@ as a whole word:
   - lab (the macro defined): every forbidden name is still found, which shows that the scan reaches its
     lookup and that the lab build keeps it;
   - the option exists, is boolean with the value false, and meson.build adds -DAMDGPU_WDDM_LAB_FLAVOUR=1.
-The bc250-win gate tools/quality/release_flavour.py checks the same names in the built DLLs.
+The bc250-win gate tools/quality/flavour_gate.py checks the same names in the built DLLs.
 """
 import argparse
 import os
