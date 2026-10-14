@@ -5,9 +5,9 @@
 The release flavour is the default build. Only a named lab build passes -Damdgpu-wddm-lab-flavour=true, which
 defines AMDGPU_WDDM_LAB_FLAVOUR=1 for every C and C++ unit, so a build that forgets the switch is the release
 flavour. A release driver must not let an environment variable replace shaders with files from a directory, dump
-them or move the pipeline library that holds compiled shader code, and the criterion is that the variable's name
-is absent from the binary: a lookup that is compiled out passes, a lookup that is only ignored at run time does
-not.
+them, move the pipeline library that holds compiled shader code or read per-shader quirk and barrier files, and
+the criterion is that the variable's name is absent from the binary: a lookup that is compiled out passes, a
+lookup that is only ignored at run time does not.
 
 The test reads every C and C++ file under libs/ and include/ (the test programs excepted, they ship in no
 package), blanks the comments, resolves only the conditionals on AMDGPU_WDDM_LAB_FLAVOUR (any other conditional
@@ -28,6 +28,8 @@ FORBIDDEN = (
     'VKD3D_SHADER_OVERRIDE',    # replaces each shader with a SPIR-V file of the same hash from a directory
     'VKD3D_SHADER_DUMP_PATH',   # writes every DXBC, DXIL and SPIR-V shader to a directory
     'VKD3D_SHADER_CACHE_PATH',  # moves the pipeline library that holds compiled shader code to a directory
+    'VKD3D_SHADER_QUIRKS',      # reads a file that sets code generation quirks per shader hash
+    'VKD3D_BARRIER_HASHES',     # reads a file that adds barriers around shaders per hash
 )
 SCAN = ('libs', 'include')
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')

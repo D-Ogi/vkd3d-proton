@@ -857,6 +857,7 @@ void vkd3d_breadcrumb_tracer_end_command_list(struct d3d12_command_list *list)
 
 void vkd3d_breadcrumb_tracer_update_barrier_hashes(struct vkd3d_breadcrumb_tracer *tracer)
 {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     char env[VKD3D_PATH_MAX];
     size_t new_count;
     FILE *file;
@@ -876,6 +877,10 @@ void vkd3d_breadcrumb_tracer_update_barrier_hashes(struct vkd3d_breadcrumb_trace
         else
             vkd3d_atomic_uint32_store_explicit(&tracer->barrier_hashes_count, 0, vkd3d_memory_order_relaxed);
     }
+#else
+    /* BD-167: the release flavour reads no barrier hash file; the list stays empty. */
+    (void)tracer;
+#endif
 }
 
 uint32_t vkd3d_breadcrumb_tracer_shader_hash_forces_barrier(struct vkd3d_breadcrumb_tracer *tracer,

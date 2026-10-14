@@ -451,6 +451,7 @@ static const struct vkd3d_shader_quirk_mapping
 
 static void vkd3d_shader_init_quirk_table(void)
 {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     struct vkd3d_shader_quirk_entry entry;
     size_t size = 0;
     char env[128];
@@ -501,6 +502,10 @@ static void vkd3d_shader_init_quirk_table(void)
     }
 
     fclose(file);
+#else
+    /* BD-167: the release flavour reads no per-shader quirk file; the built-in quirks of
+     * vkd3d_shader_compile_arguments_select_quirks stay. */
+#endif
 }
 
 static pthread_once_t vkd3d_shader_quirk_once = PTHREAD_ONCE_INIT;
