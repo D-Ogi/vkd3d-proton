@@ -78,17 +78,20 @@
  *   It waits about 10 s, and vkd3d-proton logs the timeout as an error.
  *
  * Usage: amdgpu_wddm_vkd3d_engine_test.exe <path to amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]
- *        [--fl <hex>] [--inline | --hang]
+ *        [--fl <hex>] [--inline | --hang | --diagnostics-only <new log file>]
  *   adapter substring  picks the DXGI adapter whose description contains it (default: first hardware adapter)
  *   --icd              loads that Vulkan driver DLL directly (entry vk_icdGetInstanceProcAddr), as the shell
  *                      loads hosted RADV, instead of the Vulkan loader (vulkan-1.dll)
  *   --fl               MinimumFeatureLevel for CreateDevice, default b000 (11_0)
  *   --inline           runs the INLINE suite instead of the THREADED one
  *   --hang             runs the GPU hang suite instead of the THREADED one
+ *   --diagnostics-only checks WARN capture from the loaded lab DLL with an invalid queue mode; creates a new
+ *                      log file, loads no Vulkan driver, enumerates no adapters and makes no GPU calls
  * Exit code 0 = all checks passed. "icd:" lines name every loaded Vulkan driver and its SHA-256.
  */
 
 #define COBJMACROS
+#include "../../include/private/vkd3d_shader_diagnostics.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
@@ -3905,6 +3908,63 @@ static void instance_isolation(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC25
     DeleteCriticalSection(&hostw.lock);
 }
 
+static unsigned int diagnostic_vulkan_calls;
+
+static PFN_vkVoidFunction VKAPI_CALL diagnostic_get_proc(VkInstance instance, const char *name)
+{
+    ++diagnostic_vulkan_calls;
+    return NULL;
+}
+
+/* Exercise the actual DLL's logger before any Vulkan loader or adapter query. The invalid queue mode is
+ * rejected by CreateDevice before its supplied Vulkan entry point can be used. An existing log is refused
+ * by main so a previous run cannot satisfy the warning check. This deliberately fails on a release DLL
+ * built with VKD3D_NO_DEBUG_MESSAGES, even though its E_INVALIDARG result is the same. */
+static void test_diagnostics_only(HMODULE engine, const char *log_path)
+{
+    PFN_BC250_VKD3D_ENGINE_GET_FUNCS get_funcs;
+    BC250_VKD3D_DEVICE_CREATE_INFO info;
+    BC250_VKD3D_ENGINE_FUNCS funcs;
+    void *device = (void *)1;
+    char text[4096];
+    size_t length;
+    HRESULT hr;
+    FILE *file;
+
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    checkf(vkd3d_shader_diagnostic_fnv1a64(NULL, 0) == UINT64_C(0xcbf29ce484222325)
+            && vkd3d_shader_diagnostic_fnv1a64("hello", 5) == UINT64_C(0xa430d84680aabd0b),
+            "diagnostics: FNV-1a64 vectors match the shell's full-bytecode digest");
+#endif
+    get_funcs = (PFN_BC250_VKD3D_ENGINE_GET_FUNCS)(void *)GetProcAddress(engine, BC250_VKD3D_ENGINE_GET_FUNCS_NAME);
+    checkf(!!get_funcs, "diagnostics: engine export is present");
+    if (!get_funcs)
+        return;
+    memset(&funcs, 0, sizeof(funcs));
+    funcs.Size = sizeof(funcs);
+    hr = get_funcs(BC250_VKD3D_ENGINE_ABI_VERSION, &funcs);
+    checkf(hr == S_OK && funcs.CreateDevice, "diagnostics: GetFuncs -> S_OK");
+    if (hr != S_OK || !funcs.CreateDevice)
+        return;
+    memset(&info, 0, sizeof(info));
+    info.Size = sizeof(info);
+    info.AbiVersion = BC250_VKD3D_ENGINE_ABI_VERSION;
+    info.GetInstanceProcAddr = diagnostic_get_proc;
+    info.QueueMode = 7;
+    hr = funcs.CreateDevice(&info, &IID_ID3D12Device, &device);
+    checkf(hr == E_INVALIDARG && !device, "diagnostics: invalid queue mode -> E_INVALIDARG, no device");
+    checkf(!diagnostic_vulkan_calls, "diagnostics: no Vulkan entry point called");
+    file = fopen(log_path, "rb");
+    checkf(!!file, "diagnostics: warning log is readable");
+    if (!file)
+        return;
+    length = fread(text, 1, sizeof(text) - 1, file);
+    text[length] = 0;
+    checkf(!ferror(file) && strstr(text, "warn:bc250_prepare_device: Unknown queue mode 7."),
+            "diagnostics: actual engine WARN captured through AMDGPU_WDDM_LOG with VKD3D_DEBUG=warn");
+    fclose(file);
+}
+
 int main(int argc, char **argv)
 {
     PFN_BC250_VKD3D_ENGINE_GET_FUNCS get_funcs;
@@ -3912,7 +3972,7 @@ int main(int argc, char **argv)
     BC250_VKD3D_SHELL_SERVICES services;
     BC250_VKD3D_ENGINE_FUNCS funcs;
     PFN_vkGetInstanceProcAddr gipa = NULL;
-    const char *filter = NULL, *icd = NULL;
+    const char *filter = NULL, *icd = NULL, *diagnostic_log = NULL;
     ID3D12Device *device = NULL;
     UINT32 min_fl = 0xb000;
     HMODULE engine, driver;
@@ -3925,7 +3985,7 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         printf("usage: amdgpu_wddm_vkd3d_engine_test <amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]"
-                " [--fl <hex>] [--inline | --hang]\n");
+                " [--fl <hex>] [--inline | --hang | --diagnostics-only <new log file>]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -3940,6 +4000,8 @@ int main(int argc, char **argv)
             inline_mode = TRUE;
         else if (!strcmp(argv[i], "--hang"))
             hang_mode = TRUE;
+        else if (!strcmp(argv[i], "--diagnostics-only") && i + 1 < argc)
+            diagnostic_log = argv[++i];
         else if (argv[i][0] == '-')
         {
             printf("FAIL  unknown or incomplete option %s\n", argv[i]);
@@ -3953,6 +4015,33 @@ int main(int argc, char **argv)
         printf("FAIL  --inline and --hang are separate runs\n");
         return 2;
     }
+    if (diagnostic_log)
+    {
+        char destination[MAX_PATH + 5];
+        HANDLE log;
+        if (inline_mode || hang_mode || icd || filter || strlen(diagnostic_log) >= MAX_PATH)
+        {
+            printf("FAIL  --diagnostics-only is a separate host run with a new log path shorter than MAX_PATH\n");
+            return 2;
+        }
+        log = CreateFileA(diagnostic_log, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (log == INVALID_HANDLE_VALUE)
+        {
+            printf("FAIL  diagnostic log must be a new writable file: %lu\n", GetLastError());
+            return 2;
+        }
+        CloseHandle(log);
+        sprintf(destination, "file:%s", diagnostic_log);
+        if (!SetEnvironmentVariableA("VKD3D_LOG_FILE", NULL)
+                || !SetEnvironmentVariableA("AMDGPU_WDDM_LOG", destination)
+                || !SetEnvironmentVariableA("VKD3D_DEBUG", "warn")
+                || !SetEnvironmentVariableA("VKD3D_SHADER_DEBUG", "warn"))
+        {
+            printf("FAIL  cannot configure diagnostic log: %lu\n", GetLastError());
+            return 1;
+        }
+    }
 
     /* The shell's loads: absolute paths, dependencies from the DLL's own directory and System32 only. */
     if (!GetFullPathNameA(argv[1], MAX_PATH, full, NULL)
@@ -3960,6 +4049,13 @@ int main(int argc, char **argv)
     {
         printf("FAIL  LoadLibrary %s: %lu\n", argv[1], GetLastError());
         return 1;
+    }
+    if (diagnostic_log)
+    {
+        test_diagnostics_only(engine, diagnostic_log);
+        FreeLibrary(engine);
+        DeleteCriticalSection(&vkw.lock);
+        return failures ? 1 : 0;
     }
     if (icd)
     {

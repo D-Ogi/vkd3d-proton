@@ -23,6 +23,7 @@
 #include "vkd3d_shader_private.h"
 #include "vkd3d_utf8.h"
 #include "vkd3d_string.h"
+#include "vkd3d_shader_diagnostics.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <dxil_spirv_c.h>
@@ -1517,12 +1518,22 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
 
     if (dxil_spv_parse_dxil_blob(dxbc->code, dxbc->size, &blob) != DXIL_SPV_SUCCESS)
     {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+        WARN("Shader parse-blob failed: format %s, stage %#x, bytecode bytes %zu, bytecode fnv1a64 %016"PRIx64".\n",
+                is_dxil ? "DXIL" : "DXBC", shader_interface_info->stage, dxbc->size,
+                vkd3d_shader_diagnostic_fnv1a64(dxbc->code, dxbc->size));
+#endif
         ret = VKD3D_ERROR_INVALID_SHADER;
         goto end;
     }
 
     if (dxil_spv_parsed_blob_get_entry_point_demangled_name(blob, 0, &quirk_entry) != DXIL_SPV_SUCCESS)
     {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+        WARN("Shader entry-point failed: format %s, stage %#x, bytecode bytes %zu, bytecode fnv1a64 %016"PRIx64".\n",
+                is_dxil ? "DXIL" : "DXBC", shader_interface_info->stage, dxbc->size,
+                vkd3d_shader_diagnostic_fnv1a64(dxbc->code, dxbc->size));
+#endif
         ret = VKD3D_ERROR_INVALID_SHADER;
         goto end;
     }

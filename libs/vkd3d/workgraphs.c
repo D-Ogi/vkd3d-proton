@@ -2312,7 +2312,8 @@ static HRESULT d3d12_wg_state_object_convert_entry_point(
     if (!d3d12_device_validate_shader_meta(object->device, &spirv.meta))
         return E_INVALIDARG;
 
-    if (FAILED(hr = d3d12_pipeline_state_create_shader_module(object->device, &module->vk_module, &spirv)))
+    if (FAILED(hr = d3d12_pipeline_state_create_shader_module(object->device, &module->vk_module,
+            &spirv, VK_SHADER_STAGE_COMPUTE_BIT)))
         return hr;
 
     return S_OK;

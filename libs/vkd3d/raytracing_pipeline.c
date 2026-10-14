@@ -2231,7 +2231,7 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
         if (!d3d12_device_validate_shader_meta(object->device, &spirv.meta))
             return E_INVALIDARG;
 
-        if (FAILED(hr = d3d12_pipeline_state_create_shader_module(object->device, &stage->module, &spirv)))
+        if (FAILED(hr = d3d12_pipeline_state_create_shader_module(object->device, &stage->module, &spirv, stage->stage)))
             return hr;
 
         if (spirv.meta.flags & VKD3D_SHADER_META_FLAG_USES_SUBGROUP_OPERATIONS)

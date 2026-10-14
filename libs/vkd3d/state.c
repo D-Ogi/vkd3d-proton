@@ -23,6 +23,7 @@
 #include "vkd3d_descriptor_debug.h"
 #include "vkd3d_rw_spinlock.h"
 #include "vkd3d_timestamp_profiler.h"
+#include "vkd3d_shader_diagnostics.h"
 #include <stdio.h>
 
 /* ID3D12RootSignature */
@@ -2706,7 +2707,7 @@ static ULONG STDMETHODCALLTYPE d3d12_pipeline_state_AddRef(ID3D12PipelineState *
 }
 
 HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *device,
-        VkShaderModule *vk_module, const struct vkd3d_shader_code *code)
+        VkShaderModule *vk_module, const struct vkd3d_shader_code *code, VkShaderStageFlagBits stage)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkShaderModuleCreateInfo shader_desc;
@@ -2721,7 +2722,13 @@ HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *device,
     vr = VK_CALL(vkCreateShaderModule(device->vk_device, &shader_desc, NULL, vk_module));
     if (vr < 0)
     {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+        WARN("Failed to create Vulkan shader module: stage %#x, SPIR-V bytes %zu, "
+                "source vkd3d hash %016"PRIx64", SPIR-V fnv1a64 %016"PRIx64", vr %d.\n",
+                stage, code->size, code->meta.hash, vkd3d_shader_diagnostic_fnv1a64(code->code, code->size), vr);
+#else
         WARN("Failed to create Vulkan shader module, vr %d.\n", vr);
+#endif
         return hresult_from_vk_result(vr);
     }
 
@@ -3295,7 +3302,7 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
     assert(state->root_signature->heap.mapping_info.pNext == NULL);
 
     if (spirv_code->size)
-        return d3d12_pipeline_state_create_shader_module(device, &stage_desc->module, spirv_code);
+        return d3d12_pipeline_state_create_shader_module(device, &stage_desc->module, spirv_code, stage);
     else
         return S_OK;
 }
@@ -3372,7 +3379,13 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
         if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug,
                 0, &shader_interface, &compile_args)) < 0)
         {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+            WARN("Failed to compile shader: stage %#x, bytecode bytes %zu, bytecode fnv1a64 %016"PRIx64
+                    ", vkd3d result %d.\n", stage, dxbc.size,
+                    vkd3d_shader_diagnostic_fnv1a64(dxbc.code, dxbc.size), ret);
+#else
             WARN("Failed to compile shader, vkd3d result %d.\n", ret);
+#endif
             return hresult_from_vkd3d_result(ret);
         }
         TRACE("Called vkd3d_shader_compile_dxbc.\n");
@@ -3484,7 +3497,7 @@ static HRESULT vkd3d_late_compile_shader_stages(struct d3d12_pipeline_state *sta
         {
             if (FAILED(hr = d3d12_pipeline_state_create_shader_module(state->device,
                     &graphics->stages[i].module,
-                    &graphics->code[i])))
+                    &graphics->code[i], graphics->stages[i].stage)))
             {
                 break;
             }
@@ -7061,7 +7074,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
             if (stages[i].module == VK_NULL_HANDLE && graphics->code[i].code)
             {
                 if (FAILED(hr = d3d12_pipeline_state_create_shader_module(device,
-                        &stages[i].module, &graphics->code[i])))
+                        &stages[i].module, &graphics->code[i], stages[i].stage)))
                 {
                     /* This is kind of fatal and should only happen for out-of-memory. */
                     ERR("Unexpected failure (hr %x) in creating fallback SPIR-V module.\n", (int)hr);
