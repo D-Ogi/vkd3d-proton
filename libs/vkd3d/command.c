@@ -101,6 +101,8 @@ static void d3d12_command_list_flush_query_resolves(struct d3d12_command_list *l
 
 static void d3d12_command_allocator_ensure_compute_fallback(struct d3d12_command_allocator *allocator);
 
+#if defined(AMDGPU_WDDM_LAB_FLAVOUR)
+
 /* amdgpu-wddm fork: BC250_DRAW_STATS=1, from the environment or else from the ICD's knob file
  * C:\BC250\tmp\amdgpu_wddm_radv.cfg (which also reaches a game that Steam starts), counts how the process's D3D12
  * barriers become Vulkan ones, next to what the ICD counts of the Vulkan barriers (its draw: and sync: lines): at
@@ -356,6 +358,47 @@ static void vkd3d_barrier_stats_transition(struct d3d12_command_list *list, cons
     else
         counts[VKD3D_BARRIER_STAT_tr_other]++;
 }
+
+#else /* !AMDGPU_WDDM_LAB_FLAVOUR */
+
+/* The release flavour of the BC-250 driver compiles none of the above: no counter names, no knob that reads
+ * BC250_DRAW_STATS from the environment or from the ICD's configuration file, no log. vkd3d_barrier_stats_on is
+ * false at compile time, so every counted site and every call that only names resources for the counters is a
+ * branch on a constant that the compiler removes with the code behind it. */
+static inline bool vkd3d_barrier_stats_on(void)
+{
+    return false;
+}
+
+#define VKD3D_BARRIER_STAT(list, name) ((void)0)
+
+static inline void vkd3d_barrier_stats_add_list(struct d3d12_command_list *list)
+{
+    (void)list;
+}
+
+static inline void vkd3d_barrier_stats_add_submission(unsigned int list_count, bool init_transitions)
+{
+    (void)list_count;
+    (void)init_transitions;
+}
+
+void vkd3d_barrier_stats_final(void)
+{
+}
+
+static inline void vkd3d_barrier_stats_transition(struct d3d12_command_list *list,
+        const struct d3d12_resource *resource, const D3D12_RESOURCE_TRANSITION_BARRIER *transition,
+        VkImageLayout old_layout, VkImageLayout new_layout)
+{
+    (void)list;
+    (void)resource;
+    (void)transition;
+    (void)old_layout;
+    (void)new_layout;
+}
+
+#endif /* AMDGPU_WDDM_LAB_FLAVOUR */
 
 static HRESULT vkd3d_create_binary_semaphore(struct d3d12_device *device, VkSemaphore *vk_semaphore)
 {
