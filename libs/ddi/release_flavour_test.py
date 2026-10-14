@@ -33,7 +33,9 @@ FORBIDDEN = (
     'VKD3D_BARRIER_HASHES',     # reads a file that adds barriers around shaders per hash
     'MESA_VK_TRACE',            # the driver trace switch: the release driver has none, so no label mode
     'AMDGPU_WDDM_VKD3D_PSO_LOG',  # writes a pipeline creation log next to the pipeline cache
-    'VKD3D_QUEUE_PROFILE',    # writes a queue timeline trace to any path (lead decision 4)
+    'VKD3D_LOG_FILE',           # writes the log to any path (lead decision 4)
+    'VKD3D_LOG_BUFFERED',       # its companion: buffers the log in chunks of a given size
+    'VKD3D_QUEUE_PROFILE',  # writes a queue timeline trace to any path (lead decision 4)
     'VKD3D_QUEUE_PROFILE_ABSOLUTE',  # its companion: absolute timestamps in that trace
     'AMDGPU_WDDM_VKD3D_COMPILE_THREADS',  # the compile limiter's slots; release keeps 2 (lead decision 2)
     'AMDGPU_WDDM_VKD3D_COMPILE_THERMAL',  # the compile limiter's thermal band; release keeps it on

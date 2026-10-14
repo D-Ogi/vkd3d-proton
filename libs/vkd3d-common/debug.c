@@ -80,6 +80,8 @@ static PFN_wine_log wine_log_output;
 static bool vkd3d_log_debugger_only;
 static uint32_t vkd3d_debugger_budget = 1024;
 
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+/* That is the lab flavour (AMDGPU_WDDM_LAB_FLAVOUR, BD-167). The release flavour follows below the lab code. */
 static FILE *vkd3d_open_shared_log(const char *path)
 {
 #ifdef _WIN32
@@ -128,6 +130,165 @@ static enum vkd3d_amdgpu_wddm_sink vkd3d_amdgpu_wddm_log_sink(char *path, size_t
     strcpy(path, value + 5);
     return VKD3D_AMDGPU_WDDM_SINK_FILE;
 }
+#else
+/* amdgpu-wddm, the release flavour (BD-167): AMDGPU_WDDM_LOG is only the carrier of the control app's timed switch
+ * ("Record game logs"). The engine reads it beside the marker AMDGPU_WDDM_GAMELOG=<pid>;<16 hex digits> that names
+ * this process, and only as "file:" and a plain file name directly in %ProgramData%\amdgpu-wddm\logs\games that
+ * already exists: the file the D3D12 shell or the ICD opened for the switch. Its lines then stop at the marker's
+ * instant and at the file's size cap, as theirs do (stdio-log.h of the D3D12 shell). "stderr", every other value,
+ * every other path and no marker keep the default: errors on the debugger's output only. VKD3D_LOG_FILE and
+ * VKD3D_LOG_BUFFERED are lab only. An explicit VKD3D_DEBUG or VKD3D_SHADER_DEBUG still asks for stderr. */
+#define VKD3D_GAME_LOG_FOLDER "amdgpu-wddm\\logs\\games"
+#define VKD3D_GAME_LOG_CAP (64ull << 20)
+/* The UTC FILETIME after which nothing is written; 0 when the sink is not the switch's file. */
+static uint64_t vkd3d_game_log_until;
+#ifdef _WIN32
+static LONG vkd3d_game_log_stopped;
+
+/* The marker: one to ten decimal digits, ';', exactly 16 hex digits of either case, and nothing after them. */
+static bool vkd3d_game_log_parse_marker(const char *value, unsigned long *pid, uint64_t *until)
+{
+    unsigned int digits = 0, hex = 0, nibble;
+    uint64_t id = 0, instant = 0;
+    const char *p = value;
+
+    for (; *p >= '0' && *p <= '9'; p++, digits++)
+    {
+        if (digits == 10)
+            return false;
+        id = id * 10 + (unsigned int)(*p - '0');
+    }
+    if (!digits || *p != ';' || id > 0xffffffffu)
+        return false;
+    for (p++; *p; p++, hex++)
+    {
+        if (*p >= '0' && *p <= '9')
+            nibble = (unsigned int)(*p - '0');
+        else if (*p >= 'a' && *p <= 'f')
+            nibble = (unsigned int)(*p - 'a' + 10);
+        else if (*p >= 'A' && *p <= 'F')
+            nibble = (unsigned int)(*p - 'A' + 10);
+        else
+            return false;
+        if (hex == 16)
+            return false;
+        instant = (instant << 4) | nibble;
+    }
+    if (hex != 16)
+        return false;
+    *pid = (unsigned long)id;
+    *until = instant;
+    return true;
+}
+
+/* Whether path names a file directly in folder: the folder, one backslash and a plain file name, with no directory
+ * part, no stream and neither "." nor "..". The folder is compared without regard to case, as Windows compares it. */
+static bool vkd3d_game_log_member(const char *path, const char *folder)
+{
+    size_t length = strlen(folder);
+    const char *name, *p;
+
+    if (!length || _strnicmp(path, folder, length) || path[length] != '\\')
+        return false;
+    name = path + length + 1;
+    if (!*name || !strcmp(name, ".") || !strcmp(name, ".."))
+        return false;
+    for (p = name; *p; p++)
+    {
+        if (*p == '\\' || *p == '/' || *p == ':')
+            return false;
+    }
+    return true;
+}
+#endif
+
+/* The switch's file, joined: OPEN_EXISTING, so a join never creates a name, with FILE_FLAG_OPEN_REPARSE_POINT, and
+ * refused unless it is a plain file on a disk with one name. Fully buffered and flushed after each line, so each
+ * line reaches the shared file in one write. */
+static FILE *vkd3d_game_log_join(void)
+{
+#ifdef _WIN32
+    char value[VKD3D_PATH_MAX], mark[48], root[MAX_PATH], folder[MAX_PATH];
+    BY_HANDLE_FILE_INFORMATION info;
+    unsigned long pid;
+    uint64_t until;
+    HANDLE handle;
+    FILE *file;
+    int fd, n;
+
+    if (!vkd3d_get_env_var("AMDGPU_WDDM_GAMELOG", mark, sizeof(mark)) ||
+            !vkd3d_game_log_parse_marker(mark, &pid, &until) || pid != GetCurrentProcessId() || !until)
+        return NULL;
+    if (!vkd3d_get_env_var("AMDGPU_WDDM_LOG", value, sizeof(value)) || strncmp(value, "file:", 5) || !value[5])
+        return NULL;
+    if (!vkd3d_get_env_var("ProgramData", root, sizeof(root)))
+        return NULL;
+    n = snprintf(folder, sizeof(folder), "%s\\%s", root, VKD3D_GAME_LOG_FOLDER);
+    if (n < 0 || n >= (int)sizeof(folder) || !vkd3d_game_log_member(value + 5, folder))
+        return NULL;
+    handle = CreateFileA(value + 5, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (handle == INVALID_HANDLE_VALUE)
+        return NULL;
+    if (GetFileType(handle) != FILE_TYPE_DISK || !GetFileInformationByHandle(handle, &info) ||
+            (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+            info.nNumberOfLinks != 1)
+    {
+        CloseHandle(handle);
+        return NULL;
+    }
+    if ((fd = _open_osfhandle((intptr_t)handle, _O_APPEND | _O_WRONLY)) < 0)
+    {
+        CloseHandle(handle);
+        return NULL;
+    }
+    if (!(file = _fdopen(fd, "a")))
+    {
+        _close(fd);
+        return NULL;
+    }
+    setvbuf(file, NULL, _IOFBF, 16384);
+    vkd3d_game_log_until = until;
+    return file;
+#else
+    return NULL;
+#endif
+}
+
+/* Whether a line may go to the switch's file: the marker's instant still ahead and the file under its cap, measured
+ * on the file, so the lines of every module writing into it count. The first line that finds a bound passed writes
+ * one last line, and nothing is written after it. */
+static bool vkd3d_game_log_admit(FILE *file)
+{
+#ifdef _WIN32
+    const char *reason = NULL;
+    LARGE_INTEGER size;
+    FILETIME now;
+
+    if (vkd3d_game_log_stopped)
+        return false;
+    GetSystemTimeAsFileTime(&now);
+    if ((((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime) >= vkd3d_game_log_until)
+        reason = "the recording time is over";
+    else if (!GetFileSizeEx((HANDLE)_get_osfhandle(_fileno(file)), &size))
+        reason = "the recording stopped";
+    else if ((uint64_t)size.QuadPart >= VKD3D_GAME_LOG_CAP)
+        reason = "this file is full";
+    if (!reason)
+        return true;
+    if (!InterlockedCompareExchange(&vkd3d_game_log_stopped, 1, 0))
+    {
+        fprintf(file, "amdgpu-wddm game log: nothing more is written, %s.\n", reason);
+        fflush(file);
+    }
+    return false;
+#else
+    (void)file;
+    return false;
+#endif
+}
+#endif
 
 /* With breadcrumbs trace and similar intensive logging operations,
  * reduce stdio/syscall overhead to an absolute minimum. */
@@ -141,9 +302,12 @@ static struct vkd3d_string_stream vkd3d_dbg_buffer;
 
 static void vkd3d_dbg_init_once(void)
 {
-    bool explicit_request = false, log_file_requested;
+    bool explicit_request = false;
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    bool log_file_requested;
     enum vkd3d_amdgpu_wddm_sink sink;
     char sink_path[VKD3D_PATH_MAX];
+#endif
     char vkd3d_debug[VKD3D_PATH_MAX];
     unsigned int channel, i;
 
@@ -163,6 +327,28 @@ static void vkd3d_dbg_init_once(void)
             explicit_request = true;
     }
 
+#ifndef AMDGPU_WDDM_LAB_FLAVOUR
+    /* The release flavour: the switch's file beside a marker of this process, else what an explicit VKD3D_DEBUG or
+     * VKD3D_SHADER_DEBUG asks for, else errors on the debugger's output only. */
+    vkd3d_log_file = vkd3d_disable_file ? NULL : vkd3d_game_log_join();
+    if (!vkd3d_log_file && !explicit_request)
+    {
+        vkd3d_log_debugger_only = true;
+        for (channel = 0; channel < VKD3D_DBG_CHANNEL_COUNT; channel++)
+            vkd3d_dbg_level[channel] = VKD3D_DBG_LEVEL_ERR;
+        vkd3d_atomic_uint32_store_explicit(&vkd3d_dbg_initialized, 1, vkd3d_memory_order_release);
+        return;
+    }
+#ifdef _WIN32
+    if (!vkd3d_log_file)
+    {
+        HMODULE module = LoadLibraryA("ntdll.dll");
+        if (module)
+            wine_log_output = (void*)GetProcAddress(module, "__wine_dbg_output");
+    }
+#endif
+    (void)vkd3d_debug;
+#else
     if (vkd3d_get_env_var("VKD3D_LOG_BUFFERED", vkd3d_debug, sizeof(vkd3d_debug)))
         explicit_request = true;
 
@@ -211,6 +397,7 @@ static void vkd3d_dbg_init_once(void)
             wine_log_output = (void*)GetProcAddress(module, "__wine_dbg_output");
 #endif
     }
+#endif
 
     vkd3d_atomic_uint32_store_explicit(&vkd3d_dbg_initialized, 1, vkd3d_memory_order_release);
 }
@@ -289,6 +476,10 @@ void vkd3d_dbg_printf(enum vkd3d_dbg_channel channel, enum vkd3d_dbg_level level
     }
 
     log_file = vkd3d_log_file ? vkd3d_log_file : stderr;
+#ifndef AMDGPU_WDDM_LAB_FLAVOUR
+    if (vkd3d_game_log_until && !vkd3d_game_log_admit(log_file))
+        return;
+#endif
 
     va_start(args, fmt);
     tid = vkd3d_get_current_thread_id();
