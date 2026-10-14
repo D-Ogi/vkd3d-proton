@@ -3697,7 +3697,9 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkPipelineCacheCreateInfo info;
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     char line[160];
+#endif
     size_t size = 0;
     uint64_t begin_ns;
     void *data;
@@ -3739,8 +3741,11 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
     INFO("Driver cache %s: %zu bytes loaded in %.3f ms.\n", cache->driver_path, size,
             1e-6 * (double)(cache->driver_last_save_ns - begin_ns));
 
-    /* The pipeline log is opt-in, so one build serves lab diagnosis and production. Without it no creation
-     * feedback is chained and each creation costs one clock read. With it the file is opened by the jobs only. */
+    /* The pipeline log is opt-in. Without it no creation feedback is chained and each creation costs one clock
+     * read. With it the file is opened by the jobs only. BD-167: the log writes a file next to the cache, so only a
+     * lab build (AMDGPU_WDDM_LAB_FLAVOUR) reads AMDGPU_WDDM_VKD3D_PSO_LOG; the release flavour keeps driver_log
+     * false, as with the variable unset. */
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     if (!vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_PSO_LOG", 0) || pthread_mutex_init(&cache->driver_log_lock, NULL))
         return;
     snprintf(cache->driver_log_path, sizeof(cache->driver_log_path), "%s.pso-log.txt", cache->read_path);
@@ -3749,6 +3754,7 @@ static void vkd3d_driver_cache_init(struct vkd3d_pipeline_library_disk_cache *ca
     snprintf(line, sizeof(line), "# pid %lu, driver cache %zu bytes loaded; ms tid path outcome vr driver_us "
             "wall_us pso stages key\n", vkd3d_driver_cache_pid(), size);
     vkd3d_driver_cache_log(cache, line);
+#endif
 }
 
 /* Decides on the calling thread whether a save is due; the snapshot is taken by the device's work item
