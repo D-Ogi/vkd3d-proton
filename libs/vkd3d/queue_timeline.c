@@ -27,6 +27,7 @@
 
 HRESULT vkd3d_queue_timeline_trace_init(struct vkd3d_queue_timeline_trace *trace, struct d3d12_device *device)
 {
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     char env[VKD3D_PATH_MAX];
     unsigned int i;
 
@@ -69,6 +70,13 @@ HRESULT vkd3d_queue_timeline_trace_init(struct vkd3d_queue_timeline_trace *trace
 
     trace->active = true;
     return S_OK;
+#else
+    /* BD-167: the release flavour writes no timeline trace file (VKD3D_QUEUE_PROFILE and
+     * VKD3D_QUEUE_PROFILE_ABSOLUTE are lab only), so the trace stays inactive, as with the variable unset. */
+    (void)trace;
+    (void)device;
+    return S_OK;
+#endif
 }
 
 static void vkd3d_queue_timeline_trace_free_index(struct vkd3d_queue_timeline_trace *trace, unsigned int index)

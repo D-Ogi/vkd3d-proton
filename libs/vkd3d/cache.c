@@ -4006,12 +4006,17 @@ void vkd3d_pipeline_compile_limiter_init(struct vkd3d_pipeline_compile_limiter *
     uint32_t slots;
 
     memset(limiter, 0, sizeof(*limiter));
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     slots = vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_COMPILE_THREADS", VKD3D_COMPILE_LIMITER_DEFAULT_SLOTS);
     if (!slots)
     {
         INFO("Pipeline compile limiter off (AMDGPU_WDDM_VKD3D_COMPILE_THREADS=0).\n");
         return;
     }
+#else
+    /* BD-167: the release flavour has no limiter switches; it keeps the default slots and the thermal band. */
+    slots = VKD3D_COMPILE_LIMITER_DEFAULT_SLOTS;
+#endif
     if (pthread_mutex_init(&limiter->lock, NULL))
     {
         ERR("Failed to initialise the compile limiter lock; compiles stay unbounded.\n");
@@ -4025,12 +4030,20 @@ void vkd3d_pipeline_compile_limiter_init(struct vkd3d_pipeline_compile_limiter *
     }
     limiter->slots = slots;
     limiter->log = device->disk_cache.driver_log;
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     limiter->thermal = !!vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_COMPILE_THERMAL", 1);
+#else
+    limiter->thermal = true;
+#endif
     limiter->adapter_luid = device->adapter_luid;
     limiter->thermal_max_mc = INT32_MIN;
     limiter->active = true;
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     INFO("Pipeline compile limiter: %u concurrent compiles, cache hits without a slot, thermal band %s.\n", slots,
             limiter->thermal ? "on" : "off (AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0)");
+#else
+    INFO("Pipeline compile limiter: %u concurrent compiles, cache hits without a slot, thermal band on.\n", slots);
+#endif
 }
 
 void vkd3d_pipeline_compile_limiter_cleanup(struct vkd3d_pipeline_compile_limiter *limiter)

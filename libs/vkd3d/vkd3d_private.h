@@ -2835,7 +2835,8 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
  * created at draw time, ray tracing pipelines) a driver compile holds a slot across the call alone. Waiters are
  * admitted in arrival order (tickets), so no creation waits behind later ones.
  *
- * Default: 2 slots. AMDGPU_WDDM_VKD3D_COMPILE_THREADS overrides it; 0 removes the bound.
+ * Default: 2 slots. In the lab flavour AMDGPU_WDDM_VKD3D_COMPILE_THREADS overrides it; 0 removes the bound. The
+ * release flavour has no switch (BD-167).
  *
  * Thermal band. With 2 slots the game's own ~2.7 CPUs and the compiles still took Tctl from 84.6 to 87.8 C in a
  * load burst (lab session 379), so the bound also follows the die temperature the KMD reports
@@ -2843,7 +2844,8 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
  * fewer than one: a pause in compiles does not cool a die the GPU keeps hot, and it starved the game of pipelines
  * (380). A variant compiled at draw time blocks the thread that records commands, so it is exempt from the band:
  * it needs only a free slot of the fixed bound and does not queue behind the creations. A failed reading counts
- * as cool. AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0 turns the band off. The constants are in cache.c. */
+ * as cool. In the lab flavour AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0 turns the band off; the release flavour always
+ * keeps it. The constants are in cache.c. */
 struct vkd3d_pipeline_compile_limiter
 {
     pthread_mutex_t lock;
