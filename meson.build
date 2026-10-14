@@ -46,6 +46,13 @@ if enable_descriptor_qa
   add_project_arguments('-DVKD3D_ENABLE_DESCRIPTOR_QA', language : 'c')
 endif
 
+# amdgpu-wddm (BD-167): the lab flavour keeps the diagnostic variables and statistics (here the
+# BC250_DRAW_STATS barrier counters, their knob and their log). The default build is the release flavour,
+# which leaves them out of the binary.
+if get_option('amdgpu-wddm-lab-flavour')
+  add_project_arguments('-DAMDGPU_WDDM_LAB_FLAVOUR=1', language : ['c', 'cpp'])
+endif
+
 if enable_extended_emulation
   add_project_arguments('-DVKD3D_ENABLE_EXTENDED_EMULATION', language : 'c')
 endif
