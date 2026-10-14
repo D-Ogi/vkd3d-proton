@@ -871,6 +871,7 @@ void vkd3d_instance_deduce_config_flags_from_environment(void)
 {
     char env[VKD3D_PATH_MAX];
 
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     if (vkd3d_get_env_var("VKD3D_SHADER_OVERRIDE", env, sizeof(env)) ||
             vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH", env, sizeof(env)) ||
             vkd3d_get_env_var("VKD3D_QA_HASHES", env, sizeof(env)))
@@ -878,6 +879,14 @@ void vkd3d_instance_deduce_config_flags_from_environment(void)
         INFO("VKD3D_SHADER_OVERRIDE, VKD3D_SHADER_DUMP_PATH or VKD3D_QA_HASHES is used, pipeline_library_ignore_spirv option is enforced.\n");
         vkd3d_config_flag_global_add(VKD3D_CONFIG_FLAG(PIPELINE_LIBRARY_IGNORE_SPIRV));
     }
+#else
+    /* BD-167: the release flavour has no shader override or dump directory (vkd3d_shader_main.c). */
+    if (vkd3d_get_env_var("VKD3D_QA_HASHES", env, sizeof(env)))
+    {
+        INFO("VKD3D_QA_HASHES is used, pipeline_library_ignore_spirv option is enforced.\n");
+        vkd3d_config_flag_global_add(VKD3D_CONFIG_FLAG(PIPELINE_LIBRARY_IGNORE_SPIRV));
+    }
+#endif
 
     if (vkd3d_get_env_var("FOSSILIZE", env, sizeof(env)) && strcmp(env, "1") == 0 &&
             vkd3d_get_env_var("FOSSILIZE_DUMP_PATH", env, sizeof(env)))
@@ -886,12 +895,14 @@ void vkd3d_instance_deduce_config_flags_from_environment(void)
         vkd3d_config_flag_global_add(VKD3D_CONFIG_FLAG(PIPELINE_LIBRARY_IGNORE_SPIRV));
     }
 
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR   /* BD-167: the release flavour has no cache path variable (cache.c) */
     vkd3d_get_env_var("VKD3D_SHADER_CACHE_PATH", env, sizeof(env));
     if (strcmp(env, "0") == 0)
     {
         INFO("Shader cache is explicitly disabled, relying solely on application caches.\n");
         vkd3d_config_flag_global_add(VKD3D_CONFIG_FLAG(PIPELINE_LIBRARY_APP_CACHE_ONLY));
     }
+#endif
 
     /* If we're using a global shader cache, it's meaningless to use PSO caches. */
     if (!VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_APP_CACHE_ONLY))

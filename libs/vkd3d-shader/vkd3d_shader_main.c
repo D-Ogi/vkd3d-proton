@@ -84,6 +84,30 @@ err:
     return false;
 }
 
+/* BD-167: the amdgpu-wddm release flavour (meson -Damdgpu-wddm-release=true) has no shader override or dump
+ * directory. The variable names are compiled out, not ignored, so both lookups answer "not set" there. */
+static bool vkd3d_shader_override_path(char *path, size_t size)
+{
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    return vkd3d_get_env_var("VKD3D_SHADER_OVERRIDE", path, size);
+#else
+    (void)path;
+    (void)size;
+    return false;
+#endif
+}
+
+static bool vkd3d_shader_dump_path(char *path, size_t size)
+{
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    return vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH", path, size);
+#else
+    (void)path;
+    (void)size;
+    return false;
+#endif
+}
+
 bool vkd3d_shader_replace(vkd3d_shader_hash_t hash, const void **data, size_t *size)
 {
     static bool enabled = true;
@@ -93,7 +117,7 @@ bool vkd3d_shader_replace(vkd3d_shader_hash_t hash, const void **data, size_t *s
     if (!enabled)
         return false;
 
-    if (!vkd3d_get_env_var("VKD3D_SHADER_OVERRIDE", path, sizeof(path)))
+    if (!vkd3d_shader_override_path(path, sizeof(path)))
     {
         enabled = false;
         return false;
@@ -112,7 +136,7 @@ bool vkd3d_shader_replace_export(vkd3d_shader_hash_t hash, const void **data, si
     if (!enabled)
         return false;
 
-    if (!vkd3d_get_env_var("VKD3D_SHADER_OVERRIDE", path, sizeof(path)))
+    if (!vkd3d_shader_override_path(path, sizeof(path)))
     {
         enabled = false;
         return false;
@@ -130,7 +154,7 @@ void vkd3d_shader_dump_shader(vkd3d_shader_hash_t hash, const struct vkd3d_shade
     if (!enabled)
         return;
 
-    if (!vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH", path, sizeof(path)))
+    if (!vkd3d_shader_dump_path(path, sizeof(path)))
     {
         enabled = false;
         return;
@@ -147,7 +171,7 @@ void vkd3d_shader_dump_spirv_shader(vkd3d_shader_hash_t hash, const struct vkd3d
     if (!enabled)
         return;
 
-    if (!vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH", path, sizeof(path)))
+    if (!vkd3d_shader_dump_path(path, sizeof(path)))
     {
         enabled = false;
         return;
@@ -166,7 +190,7 @@ void vkd3d_shader_dump_spirv_shader_export(vkd3d_shader_hash_t hash, const struc
     if (!enabled)
         return;
 
-    if (!vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH", path, sizeof(path)))
+    if (!vkd3d_shader_dump_path(path, sizeof(path)))
     {
         enabled = false;
         return;

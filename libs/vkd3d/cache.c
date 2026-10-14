@@ -4349,7 +4349,11 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
 
     /* Match DXVK style here. The environment variable is a directory.
      * If not set, it is in current working directory. */
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
     vkd3d_get_env_var("VKD3D_SHADER_CACHE_PATH", path_buf, sizeof(path_buf));
+#else
+    path_buf[0] = '\0';   /* BD-167: no cache path variable in the release flavour; the embedder's path stays */
+#endif
     if (*path_buf == '\0')
         vkd3d_strlcpy(path_buf, sizeof(path_buf), vkd3d_embedder_cache_path);
     path = *path_buf != '\0' ? path_buf : NULL;
