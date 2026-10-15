@@ -1529,13 +1529,24 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
 
     if (dxil_spv_parsed_blob_get_entry_point_demangled_name(blob, 0, &quirk_entry) != DXIL_SPV_SUCCESS)
     {
+        unsigned int entry_count;
+
+        /* dxilconv can omit the hull control-point function while keeping its patch-constant
+         * function. The converter supports that representation, but entry enumeration omits
+         * null functions. A name is optional for quirks; keep every other validation below. */
+        if (shader_interface_info->stage != VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ||
+                dxil_spv_parsed_blob_get_shader_stage(blob) != DXIL_SPV_STAGE_HULL ||
+                dxil_spv_parsed_blob_get_num_entry_points(blob, &entry_count) != DXIL_SPV_SUCCESS || entry_count)
+        {
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
-        WARN("Shader entry-point failed: format %s, stage %#x, bytecode bytes %zu, bytecode fnv1a64 %016"PRIx64".\n",
-                is_dxil ? "DXIL" : "DXBC", shader_interface_info->stage, dxbc->size,
-                vkd3d_shader_diagnostic_fnv1a64(dxbc->code, dxbc->size));
+            WARN("Shader entry-point failed: format %s, stage %#x, bytecode bytes %zu, bytecode fnv1a64 %016"PRIx64".\n",
+                    is_dxil ? "DXIL" : "DXBC", shader_interface_info->stage, dxbc->size,
+                    vkd3d_shader_diagnostic_fnv1a64(dxbc->code, dxbc->size));
 #endif
-        ret = VKD3D_ERROR_INVALID_SHADER;
-        goto end;
+            ret = VKD3D_ERROR_INVALID_SHADER;
+            goto end;
+        }
+        quirk_entry = NULL;
     }
 
     quirks = vkd3d_shader_compile_arguments_select_quirks(compiler_args, hash, quirk_entry);
@@ -1679,6 +1690,10 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     if (spirv_debug)
     {
         dxil_spv_converter_get_compiled_entry_point(converter, &spirv_debug->debug_entry_point_name);
+        /* A null hull control-point function also has no DXIL debug name. The converter
+         * emits the single-stage SPIR-V entry as "main"; use it only for this diagnostic. */
+        if (!quirk_entry && (!spirv_debug->debug_entry_point_name || !spirv_debug->debug_entry_point_name[0]))
+            spirv_debug->debug_entry_point_name = "main";
         spirv_debug->debug_entry_point_name = vkd3d_strdup(spirv_debug->debug_entry_point_name);
     }
 

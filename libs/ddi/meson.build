@@ -22,3 +22,10 @@ amdgpu_wddm_vkd3d_test = executable('amdgpu_wddm_vkd3d_engine_test', 'engine_tes
   dependencies        : [ vkd3d_compiler.find_library('dxgi'), vkd3d_compiler.find_library('psapi'),
                           vkd3d_compiler.find_library('bcrypt') ],
   install             : false)
+
+# Shader translation has no Vulkan/device dependency and runs in both driver flavours.
+amdgpu_wddm_vkd3d_shader_test = executable('amdgpu_wddm_vkd3d_shader_test', 'engine_test_shader.c',
+  include_directories : vkd3d_private_includes,
+  dependencies        : [ vkd3d_shader_dep, dxil_spirv_dep ],
+  install             : false)
+test('ddi-shader-compile', amdgpu_wddm_vkd3d_shader_test, timeout : 30)
