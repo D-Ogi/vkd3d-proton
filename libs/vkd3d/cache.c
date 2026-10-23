@@ -4052,10 +4052,11 @@ void vkd3d_pipeline_compile_limiter_cleanup(struct vkd3d_pipeline_compile_limite
 
     if (!limiter->active)
         return;
-    INFO("Pipeline compile limiter: %"PRIu64" admitted (%"PRIu64" draw-time), %"PRIu64" waited, %"PRIu64" ms waited, "
-            "at most %u waiting; driver calls: %"PRIu64" cache hits without a slot, %"PRIu64" compiles.\n",
-            limiter->admitted, limiter->exempt_admitted, limiter->waits, limiter->wait_ns / 1000000,
-            limiter->max_waiting, limiter->cache_hits, limiter->compiles);
+    INFO("Pipeline compile limiter: %"PRIu64" admitted (%"PRIu64" draw-time, %"PRIu64" of them past the bound), "
+            "%"PRIu64" waited, %"PRIu64" ms waited, at most %u waiting; driver calls: %"PRIu64" cache hits without a "
+            "slot, %"PRIu64" compiles.\n",
+            limiter->admitted, limiter->exempt_admitted, limiter->exempt_over_bound, limiter->waits,
+            limiter->wait_ns / 1000000, limiter->max_waiting, limiter->cache_hits, limiter->compiles);
     if (limiter->thermal)
     {
         band_ns = limiter->thermal_band_ns;
@@ -4114,15 +4115,18 @@ static uint32_t vkd3d_compile_limiter_thermal_slots(struct vkd3d_pipeline_compil
     return limiter->one_slot ? 1 : limiter->slots;
 }
 
-/* Under the lock: may this caller go now? An exempt caller needs only a free slot of the fixed bound. Otherwise
- * only the oldest ticket can go, within the fixed bound and the thermal band. */
+/* Under the lock: may this caller go now? An exempt caller goes at once, past the fixed bound: it compiles a
+ * variant inside a draw of the thread that records the frame, and a slot that a pool compile holds for hundreds
+ * of milliseconds would make that draw a frame-long stall (Clair Obscur: Expedition 33 drew 65 to 81 ms inside
+ * DrawIndexedInstanced with both slots taken, BD-226). Otherwise only the oldest ticket can go, within the fixed
+ * bound and the thermal band. */
 static bool vkd3d_compile_limiter_may_admit(struct vkd3d_pipeline_compile_limiter *limiter, bool exempt,
         uint64_t ticket, bool *thermal_delayed)
 {
-    if (limiter->in_flight >= limiter->slots)
-        return false;
     if (exempt)
         return true;
+    if (limiter->in_flight >= limiter->slots)
+        return false;
     if (ticket != limiter->next_admit)
         return false;
     if (limiter->in_flight < vkd3d_compile_limiter_thermal_slots(limiter, vkd3d_get_current_time_ns()))
@@ -4196,7 +4200,11 @@ static void vkd3d_compile_limiter_acquire(struct vkd3d_compile_slot *slot,
     if (thermal_delayed)
         limiter->thermal_waits++;
     if (exempt)
+    {
         limiter->exempt_admitted++;
+        if (limiter->in_flight >= limiter->slots)
+            limiter->exempt_over_bound++;
+    }
     else
         limiter->next_admit++;
     limiter->in_flight++;

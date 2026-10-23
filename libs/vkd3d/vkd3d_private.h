@@ -2842,8 +2842,10 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
  * load burst (lab session 379), so the bound also follows the die temperature the KMD reports
  * (vkd3d_kmd_read_temperature), read at most every 250 ms: from 80 C one slot, below 80 C all of them. Never
  * fewer than one: a pause in compiles does not cool a die the GPU keeps hot, and it starved the game of pipelines
- * (380). A variant compiled at draw time blocks the thread that records commands, so it is exempt from the band:
- * it needs only a free slot of the fixed bound and does not queue behind the creations. A failed reading counts
+ * (380). A variant compiled at draw time blocks the thread that records commands, so it is exempt from the band
+ * and from the bound: it goes at once, past the slots the pool compiles hold, and does not queue behind the
+ * creations (until BD-226 it needed a free slot of the fixed bound, and a pool compile that held a slot for
+ * hundreds of milliseconds made the draw a frame-long stall). A failed reading counts
  * as cool. In the lab flavour AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0 turns the band off; the release flavour always
  * keeps it. The constants are in cache.c. */
 struct vkd3d_pipeline_compile_limiter
@@ -2863,6 +2865,8 @@ struct vkd3d_pipeline_compile_limiter
     bool log;
     uint64_t admitted;
     uint64_t exempt_admitted;
+    /* Draw-time admissions while every slot of the bound was held. */
+    uint64_t exempt_over_bound;
     uint64_t waits;
     uint64_t logged_waits;
     uint64_t wait_ns;
@@ -2906,8 +2910,8 @@ struct vkd3d_compile_scope
 void vkd3d_pipeline_compile_limiter_init(struct vkd3d_pipeline_compile_limiter *limiter,
         struct d3d12_device *device);
 void vkd3d_pipeline_compile_limiter_cleanup(struct vkd3d_pipeline_compile_limiter *limiter);
-/* Takes a slot, waiting in arrival order. exempt: the thermal band does not apply and the caller does not queue
- * behind the others (a variant at draw time). Inside a compile scope on this thread, takes the scope's slot
+/* Takes a slot, waiting in arrival order. exempt: neither the thermal band nor the bound applies and the caller
+ * does not queue behind the others (a variant at draw time). Inside a compile scope on this thread, takes the scope's slot
  * instead (if it does not hold it yet) and the call itself holds nothing. */
 void vkd3d_compile_slot_begin(struct vkd3d_compile_slot *slot, struct d3d12_device *device, bool exempt);
 void vkd3d_compile_slot_end(struct vkd3d_compile_slot *slot);
