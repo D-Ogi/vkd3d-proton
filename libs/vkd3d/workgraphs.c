@@ -62,6 +62,33 @@ static inline bool d3d12_wg_fault_injected(const char *point, unsigned int index
 }
 #endif
 
+/* amdgpu-wddm fork: "scratch:<n>" fails scratch allocation n (counted from 0) of a DispatchGraph call. Fault injection
+ * is for tests that record on one thread, so one counter for all command lists is enough. */
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+static unsigned int d3d12_wg_scratch_ordinal;
+#define d3d12_wg_scratch_fault_reset() (d3d12_wg_scratch_ordinal = 0)
+#define d3d12_wg_scratch_fault_injected() d3d12_wg_fault_injected("scratch", d3d12_wg_scratch_ordinal++)
+#else
+#define d3d12_wg_scratch_fault_reset() ((void)0)
+#define d3d12_wg_scratch_fault_injected() false
+#endif
+
+/* amdgpu-wddm fork: a failed scratch allocation marks the command list as out of memory, so that Close fails with
+ * E_OUTOFMEMORY and the partly recorded graph never executes. */
+static bool d3d12_command_list_workgraph_allocate_scratch(struct d3d12_command_list *list,
+        enum vkd3d_scratch_pool_kind kind, VkDeviceSize size, VkDeviceSize alignment,
+        struct vkd3d_scratch_allocation *allocation)
+{
+    if (d3d12_wg_scratch_fault_injected() ||
+            !d3d12_command_allocator_allocate_scratch_memory(list->allocator, kind, size, alignment, ~0u, allocation))
+    {
+        d3d12_command_list_mark_out_of_memory(list, "work graph scratch memory");
+        return false;
+    }
+
+    return true;
+}
+
 /* This is arbitrary, but we have a trade-off to make.
  * If amplification count is low, we spawn very few redundant threads,
  * but occupancy might be too low if number of records is low.
@@ -162,6 +189,10 @@ struct d3d12_wg_state_object_program
     VkDeviceSize share_mapping_scratch_size;
     VkDeviceSize payload_expander_scratch_offset;
     VkDeviceSize payload_expander_scratch_size;
+    /* amdgpu-wddm fork: the staging range of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT. It is in the backing memory,
+     * so each execution context has its own. */
+    VkDeviceSize multi_input_staging_scratch_offset;
+    VkDeviceSize multi_input_staging_scratch_size;
     VkDeviceSize required_scratch_size;
 
     int32_t *coalesce_dividers_or_amp;
@@ -2475,6 +2506,7 @@ static HRESULT d3d12_wg_state_object_compile_program(
     alloc_scratch(dividers_scratch, program->num_pipelines * sizeof(uint32_t));
     alloc_scratch(share_mapping_scratch, program->num_pipelines * sizeof(uint32_t));
     alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
+    alloc_scratch(multi_input_staging_scratch, VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE);
 #undef alloc_scratch
 
     program->required_scratch_size = scratch_offset;
@@ -2939,7 +2971,7 @@ static unsigned int d3d12_command_list_workgraph_remaining_levels(
     return node_input->recursion_factor - program->slot_depth[node_index];
 }
 
-static void d3d12_command_list_workgraph_execute_node_cpu_entry(struct d3d12_command_list *list,
+static bool d3d12_command_list_workgraph_execute_node_cpu_entry(struct d3d12_command_list *list,
         const struct d3d12_wg_state_object *state,
         const struct d3d12_wg_state_object_program *program,
         uint32_t node_index, const D3D12_NODE_CPU_INPUT *desc,
@@ -2967,9 +2999,9 @@ static void d3d12_command_list_workgraph_execute_node_cpu_entry(struct d3d12_com
     push.node_remaining_recursion_levels = d3d12_command_list_workgraph_remaining_levels(state, program, node_index);
 
     push.node_payload_stride_or_offsets_bda = desc->RecordStrideInBytes;
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
-            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, sizeof(uint32_t) * 3, sizeof(uint32_t), ~0u, &offset_scratch))
-        return;
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
+            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, sizeof(uint32_t) * 3, sizeof(uint32_t), &offset_scratch))
+        return false;
 
     ((uint32_t *)offset_scratch.host_ptr)[0] = 0; /* primary offset */
     ((uint32_t *)offset_scratch.host_ptr)[1] = desc->NumRecords & ~(WG_DIVIDER - 1u); /* secondary offset */
@@ -3151,6 +3183,8 @@ static void d3d12_command_list_workgraph_execute_node_cpu_entry(struct d3d12_com
     VKD3D_BREADCRUMB_TAG(node_input->node_id);
     VKD3D_BREADCRUMB_AUX32(node_input->node_array_index);
     VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_NODE);
+
+    return true;
 }
 
 static void d3d12_command_list_workgraph_barrier(struct d3d12_command_list *list,
@@ -3460,36 +3494,32 @@ static void d3d12_command_list_workgraph_execute_level(struct d3d12_command_list
     }
 }
 
-static bool d3d12_command_list_workgraph_setup_indirect(
-        struct d3d12_command_list *list, struct d3d12_wg_state_object *wg_state,
-        const struct d3d12_wg_state_object_program *program, D3D12_GPU_VIRTUAL_ADDRESS va,
-        struct vkd3d_scratch_allocation *indirect_scratch)
+/* The coalesce dividers and the entry point mapping of the GPU input setup pass. They are the same for each input of
+ * a DispatchGraph call. */
+struct d3d12_wg_gpu_input_tables
 {
-    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkDeviceAddress dividers_va;
+    VkDeviceAddress entry_point_mapping_va;
+};
+
+static bool d3d12_command_list_workgraph_setup_indirect_tables(
+        struct d3d12_command_list *list, struct d3d12_wg_state_object *wg_state,
+        const struct d3d12_wg_state_object_program *program, struct d3d12_wg_gpu_input_tables *tables)
+{
     struct vkd3d_scratch_allocation dividers_scratch;
-    struct vkd3d_workgraph_setup_gpu_input_args args;
     struct vkd3d_scratch_allocation entry_scratch;
-    VkMemoryBarrier2 vk_barrier;
-    VkDependencyInfo dep_info;
-    unsigned int num_wgs;
     unsigned int i, j;
 
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
-            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
-            program->num_pipelines * sizeof(struct vkd3d_workgraph_gpu_input_indirect),
-            64, ~0u, indirect_scratch))
-        return false;
-
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
             VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
             program->num_pipelines * sizeof(uint32_t),
-            64, ~0u, &dividers_scratch))
+            64, &dividers_scratch))
         return false;
 
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
             VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
             program->num_pipelines * sizeof(uint32_t),
-            64, ~0u, &entry_scratch))
+            64, &entry_scratch))
         return false;
 
     for (i = 0; i < program->num_pipelines; i++)
@@ -3534,10 +3564,26 @@ static bool d3d12_command_list_workgraph_setup_indirect(
         }
     }
 
+    tables->dividers_va = dividers_scratch.va;
+    tables->entry_point_mapping_va = entry_scratch.va;
+    return true;
+}
+
+/* Writes the indirect commands of every pipeline for the D3D12_NODE_GPU_INPUT at va. The caller emits the barrier
+ * before the commands are used, so that the setup of several inputs needs one barrier. */
+static void d3d12_command_list_workgraph_emit_setup_indirect(
+        struct d3d12_command_list *list, const struct d3d12_wg_state_object_program *program,
+        const struct d3d12_wg_gpu_input_tables *tables, D3D12_GPU_VIRTUAL_ADDRESS va,
+        const struct vkd3d_scratch_allocation *indirect_scratch)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    struct vkd3d_workgraph_setup_gpu_input_args args;
+    unsigned int num_wgs;
+
     args.gpu_input_va = va;
     args.indirect_commands_va = indirect_scratch->va;
-    args.coalesce_divider_va = dividers_scratch.va;
-    args.entry_point_mapping_va = entry_scratch.va;
+    args.coalesce_divider_va = tables->dividers_va;
+    args.entry_point_mapping_va = tables->entry_point_mapping_va;
     args.num_entry_points = program->num_pipelines;
 
     d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
@@ -3557,24 +3603,37 @@ static bool d3d12_command_list_workgraph_setup_indirect(
 
     VKD3D_BREADCRUMB_TAG("setup-indirect");
     VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
+}
 
-    memset(&vk_barrier, 0, sizeof(vk_barrier));
-    memset(&dep_info, 0, sizeof(dep_info));
-    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-    dep_info.memoryBarrierCount = 1;
-    dep_info.pMemoryBarriers = &vk_barrier;
+static void d3d12_command_list_workgraph_setup_indirect_barrier(struct d3d12_command_list *list)
+{
+    d3d12_command_list_workgraph_barrier(list,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+}
 
-    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    vk_barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
-    vk_barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+static bool d3d12_command_list_workgraph_setup_indirect(
+        struct d3d12_command_list *list, struct d3d12_wg_state_object *wg_state,
+        const struct d3d12_wg_state_object_program *program, D3D12_GPU_VIRTUAL_ADDRESS va,
+        struct vkd3d_scratch_allocation *indirect_scratch)
+{
+    struct d3d12_wg_gpu_input_tables tables;
 
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
+            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
+            program->num_pipelines * sizeof(struct vkd3d_workgraph_gpu_input_indirect),
+            64, indirect_scratch))
+        return false;
+
+    if (!d3d12_command_list_workgraph_setup_indirect_tables(list, wg_state, program, &tables))
+        return false;
+
+    d3d12_command_list_workgraph_emit_setup_indirect(list, program, &tables, va, indirect_scratch);
+    d3d12_command_list_workgraph_setup_indirect_barrier(list);
     return true;
 }
 
-static void d3d12_command_list_workgraph_execute_entry_gpu(
+static bool d3d12_command_list_workgraph_execute_entry_gpu(
         struct d3d12_command_list *list, struct d3d12_wg_state_object *state,
         const struct d3d12_wg_state_object_program *program, D3D12_GPU_VIRTUAL_ADDRESS va,
         VkDeviceAddress vk_root_param_buffer_va)
@@ -3583,9 +3642,9 @@ static void d3d12_command_list_workgraph_execute_entry_gpu(
     unsigned int i;
 
     if (program->levels[0].nodes_count == 0)
-        return;
+        return true;
     if (!d3d12_command_list_workgraph_setup_indirect(list, state, program, va, &indirect_scratch))
-        return;
+        return false;
 
     /* We don't know which entry gets to execute, so have to spam indirects.
      * FIXME: DGCC can help with this if number of entry points is large. */
@@ -3603,15 +3662,42 @@ static void d3d12_command_list_workgraph_execute_entry_gpu(
                 list, state, program, state->payload[0].va, va, 0, program->levels[0].shared_nodes[i].node_pipeline_index,
                 &indirect_scratch, vk_root_param_buffer_va);
     }
+
+    return true;
+}
+
+static void d3d12_command_list_workgraph_multi_gpu_input_pass(struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program, struct vkd3d_workgraph_multi_gpu_input_prepare_args *args,
+        enum vkd3d_workgraph_multi_gpu_input_mode mode, uint32_t num_groups, const char *tag)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+
+    args->mode = mode;
+    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+            program->multi_gpu_input_prepare.vk_pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT, sizeof(*args), args);
+    VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            program->multi_gpu_input_prepare.vk_pipeline));
+
+    if (list->device->vk_info.EXT_debug_utils)
+        d3d12_command_list_debug_mark_label(list, tag, 1.0f, 0.8f, 0.8f, 1.0f);
+
+    VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, num_groups, 1, 1));
+    VKD3D_BREADCRUMB_TAG(tag);
+    VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
+
+    d3d12_command_list_workgraph_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 }
 
 /* amdgpu-wddm fork: D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT (WorkGraphs.md, D3D12_MULTI_NODE_GPU_INPUT).
- * The number of inputs and their record counts are only in GPU memory. Two meta passes copy the records of each
- * entry point into one contiguous range of a payload ring that level 0 does not write (level 0 writes payload[0])
- * and write one D3D12_NODE_GPU_INPUT per entry point that points to that range. Then each entry point executes
- * as with D3D12_DISPATCH_MODE_NODE_GPU_INPUT. The ring has the fixed size of the other payload rings; records
- * that do not fit are dropped and never written outside the ring. */
-static void d3d12_command_list_workgraph_execute_entry_multi_gpu(
+ * The number of inputs and their record counts are only in GPU memory, and the spec sets no limit on them for a
+ * compute-only graph. Meta passes (cs_workgraph_multi_gpu_input_*.comp) give each entry point direct slots and one
+ * merge slot, each a D3D12_NODE_GPU_INPUT that then executes as with D3D12_DISPATCH_MODE_NODE_GPU_INPUT.
+ * A direct slot reads the records of one large input in place. The merge slot reads the records of the other inputs
+ * from the staging range in the backing memory, so each execution context has its own copy, and the state of the
+ * passes is scratch memory of this call. */
+static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
         struct d3d12_command_list *list, struct d3d12_wg_state_object *state,
         const struct d3d12_wg_state_object_program *program, D3D12_GPU_VIRTUAL_ADDRESS va,
         VkDeviceAddress vk_root_param_buffer_va)
@@ -3622,118 +3708,138 @@ static void d3d12_command_list_workgraph_execute_entry_multi_gpu(
     struct vkd3d_scratch_allocation indirect_scratch;
     struct vkd3d_scratch_allocation strides_scratch;
     struct vkd3d_scratch_allocation state_scratch;
-    uint32_t num_entries, node_index, stride;
-    VkDeviceSize synth_offset;
-    VkDeviceAddress synth_va, entry_va;
-    VkMemoryBarrier2 vk_barrier;
-    VkDependencyInfo dep_info;
-    unsigned int i, j;
+    struct vkd3d_scratch_allocation slot_indirect;
+    uint32_t num_entries, num_slots, node_index;
+    struct d3d12_wg_gpu_input_tables tables;
+    VkDeviceSize indirect_size, state_size;
+    VkDeviceAddress slots_va, slot_va;
+    bool has_record_data = false;
+    unsigned int i, j, s;
 
     num_entries = program->levels[0].nodes_count;
     if (num_entries == 0)
-        return;
+        return true;
+    num_slots = vkd3d_workgraph_multi_gpu_input_slot_count(num_entries);
 
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
-            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, num_entries * sizeof(uint32_t), 64, ~0u, &strides_scratch))
-        return;
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
+            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, num_entries * sizeof(uint32_t), 64, &strides_scratch))
+        return false;
 
-    /* Layout: struct vkd3d_workgraph_multi_gpu_input_prepare_args. */
-    synth_offset = 32 + 2 * vkd3d_workgraph_multi_gpu_input_counters_size(num_entries);
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
-            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE, synth_offset + num_entries * sizeof(D3D12_NODE_GPU_INPUT),
-            64, ~0u, &state_scratch))
-        return;
+    state_size = vkd3d_workgraph_multi_gpu_input_slots_offset(num_entries) +
+            (VkDeviceSize)num_slots * sizeof(D3D12_NODE_GPU_INPUT);
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
+            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE, state_size, 64, &state_scratch))
+        return false;
+
+    indirect_size = program->num_pipelines * sizeof(struct vkd3d_workgraph_gpu_input_indirect);
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
+            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE, num_slots * indirect_size, 64, &indirect_scratch))
+        return false;
+
+    if (!d3d12_command_list_workgraph_setup_indirect_tables(list, state, program, &tables))
+        return false;
 
     for (i = 0; i < num_entries; i++)
     {
         node_index = program->levels[0].nodes[i];
-        /* The destination stride is the application record size, aligned to 4 bytes. 0 means an empty record.
-         * An entry point does not use the internal word of [NodeTrackRWInputSharing]: it must not call
-         * FinishedCrossGroupSharing(). */
-        stride = align(state->entry_points[node_index].node_input->record_size, 4);
-        ((uint32_t *)strides_scratch.host_ptr)[i] = stride;
+        /* The record stride of the merge slot is the application record size, aligned to 4 bytes. 0 means an
+         * empty record. An entry point does not use the internal word of [NodeTrackRWInputSharing]: it must not
+         * call FinishedCrossGroupSharing(). */
+        ((uint32_t *)strides_scratch.host_ptr)[i] = align(state->entry_points[node_index].node_input->record_size, 4);
+        if (state->entry_points[node_index].node_input->record_size)
+            has_record_data = true;
     }
-
-    synth_va = state_scratch.va + synth_offset;
 
     memset(&prepare_args, 0, sizeof(prepare_args));
     prepare_args.multi_input_va = va;
     prepare_args.record_strides_va = strides_scratch.va;
     prepare_args.state_va = state_scratch.va;
-    prepare_args.dest_va = state->payload[1].va;
-    prepare_args.dest_capacity = VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE;
     prepare_args.num_entry_points = num_entries;
-
-    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
-            program->multi_gpu_input_prepare.vk_pipeline_layout,
-            VK_SHADER_STAGE_COMPUTE_BIT, sizeof(prepare_args), &prepare_args);
-    VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            program->multi_gpu_input_prepare.vk_pipeline));
-
-    if (list->device->vk_info.EXT_debug_utils)
-        d3d12_command_list_debug_mark_label(list, "Multi GPU Input Prepare", 1.0f, 0.8f, 0.8f, 1.0f);
-
-    VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, 1, 1, 1));
-    VKD3D_BREADCRUMB_TAG("multi-gpu-input-prepare");
-    VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
-
-    memset(&vk_barrier, 0, sizeof(vk_barrier));
-    memset(&dep_info, 0, sizeof(dep_info));
-    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dep_info.memoryBarrierCount = 1;
-    dep_info.pMemoryBarriers = &vk_barrier;
-    vk_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-    vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    vk_barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    vk_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
-    vk_barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
-
-    memset(&copy_args, 0, sizeof(copy_args));
-    copy_args.multi_input_va = va;
-    copy_args.state_va = state_scratch.va;
-    copy_args.num_entry_points = num_entries;
-
-    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
-            program->multi_gpu_input_copy.vk_pipeline_layout,
-            VK_SHADER_STAGE_COMPUTE_BIT, sizeof(copy_args), &copy_args);
-    VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            program->multi_gpu_input_copy.vk_pipeline));
-
-    if (list->device->vk_info.EXT_debug_utils)
-        d3d12_command_list_debug_mark_label(list, "Multi GPU Input Copy", 1.0f, 0.8f, 0.8f, 1.0f);
-
-    VK_CALL(vkCmdDispatchIndirect(list->cmd.vk_command_buffer, state_scratch.buffer, state_scratch.offset));
-    VKD3D_BREADCRUMB_TAG("multi-gpu-input-copy");
-    VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
-
-    /* The copied records and the inputs of the entry points are read by the setup pass and the nodes. */
-    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
-
-    for (i = 0; i < num_entries; i++)
+    if (list->wg_state.BackingMemory.SizeInBytes >= program->required_scratch_size)
     {
-        entry_va = synth_va + i * sizeof(D3D12_NODE_GPU_INPUT);
-        if (!d3d12_command_list_workgraph_setup_indirect(list, state, program, entry_va, &indirect_scratch))
-            return;
+        prepare_args.staging_va = list->wg_state.BackingMemory.StartAddress + program->multi_input_staging_scratch_offset;
+        prepare_args.staging_capacity = program->multi_input_staging_scratch_size;
+    }
+    else
+    {
+        /* The application gave less backing memory than GetWorkGraphMemoryRequirements() asks for. Only the
+         * direct slots then work. */
+        ERR("Backing memory is not large enough for the staging range (%"PRIu64" < %"PRIu64").\n",
+                list->wg_state.BackingMemory.SizeInBytes, program->required_scratch_size);
+    }
 
+    d3d12_command_list_workgraph_multi_gpu_input_pass(list, program, &prepare_args,
+            VKD3D_WORKGRAPH_MULTI_INPUT_MODE_INIT, 1, "multi-gpu-input-init");
+    d3d12_command_list_workgraph_multi_gpu_input_pass(list, program, &prepare_args,
+            VKD3D_WORKGRAPH_MULTI_INPUT_MODE_CLASSIFY, VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS, "multi-gpu-input-classify");
+    d3d12_command_list_workgraph_multi_gpu_input_pass(list, program, &prepare_args,
+            VKD3D_WORKGRAPH_MULTI_INPUT_MODE_LAYOUT, 1, "multi-gpu-input-layout");
+
+    /* Only empty records: the merge slots need no copy. */
+    if (has_record_data)
+    {
+        memset(&copy_args, 0, sizeof(copy_args));
+        copy_args.multi_input_va = va;
+        copy_args.record_strides_va = strides_scratch.va;
+        copy_args.state_va = state_scratch.va;
+        copy_args.num_entry_points = num_entries;
+
+        d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
+                program->multi_gpu_input_copy.vk_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, sizeof(copy_args), &copy_args);
+        VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                program->multi_gpu_input_copy.vk_pipeline));
+
+        if (list->device->vk_info.EXT_debug_utils)
+            d3d12_command_list_debug_mark_label(list, "Multi GPU Input Copy", 1.0f, 0.8f, 0.8f, 1.0f);
+
+        VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS, 1, 1));
+        VKD3D_BREADCRUMB_TAG("multi-gpu-input-copy");
+        VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
+
+        /* The setup passes read the slots, the nodes read the slots and the copied records. */
+        d3d12_command_list_workgraph_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+
+    slots_va = state_scratch.va + vkd3d_workgraph_multi_gpu_input_slots_offset(num_entries);
+    slot_indirect = indirect_scratch;
+    for (s = 0; s < num_slots; s++)
+    {
+        slot_indirect.offset = indirect_scratch.offset + s * indirect_size;
+        slot_indirect.va = indirect_scratch.va + s * indirect_size;
+        d3d12_command_list_workgraph_emit_setup_indirect(list, program, &tables,
+                slots_va + s * sizeof(D3D12_NODE_GPU_INPUT), &slot_indirect);
+    }
+    d3d12_command_list_workgraph_setup_indirect_barrier(list);
+
+    /* A slot with no records has indirect commands of zero workgroups. */
+    for (s = 0; s < num_slots; s++)
+    {
+        i = s / (VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS + 1);
         node_index = program->levels[0].nodes[i];
-        d3d12_command_list_workgraph_execute_node_gpu(list, state, program, state->payload[0].va, entry_va,
-                0, node_index, &indirect_scratch, vk_root_param_buffer_va);
+        slot_va = slots_va + s * sizeof(D3D12_NODE_GPU_INPUT);
+        slot_indirect.offset = indirect_scratch.offset + s * indirect_size;
+        slot_indirect.va = indirect_scratch.va + s * indirect_size;
+
+        d3d12_command_list_workgraph_execute_node_gpu(list, state, program, state->payload[0].va, slot_va,
+                0, node_index, &slot_indirect, vk_root_param_buffer_va);
 
         for (j = 0; j < program->levels[0].shared_nodes_count; j++)
         {
             if (program->levels[0].shared_nodes[j].node_payload_index == node_index)
             {
                 d3d12_command_list_workgraph_execute_node_gpu(list, state, program, state->payload[0].va,
-                        entry_va, 0, program->levels[0].shared_nodes[j].node_pipeline_index,
-                        &indirect_scratch, vk_root_param_buffer_va);
+                        slot_va, 0, program->levels[0].shared_nodes[j].node_pipeline_index,
+                        &slot_indirect, vk_root_param_buffer_va);
             }
         }
     }
+
+    return true;
 }
 
-static void d3d12_command_list_workgraph_execute_entry_cpu(
+static bool d3d12_command_list_workgraph_execute_entry_cpu(
         struct d3d12_command_list *list, struct d3d12_wg_state_object *wg_state,
         const struct d3d12_wg_state_object_program *program, const D3D12_NODE_CPU_INPUT *desc,
         VkDeviceAddress vk_root_param_buffer_va)
@@ -3745,12 +3851,12 @@ static void d3d12_command_list_workgraph_execute_entry_cpu(
     unsigned int i;
 
     if (desc->NumRecords == 0)
-        return;
+        return true;
 
     if (desc->EntrypointIndex >= program->levels[0].nodes_count)
     {
         ERR("EntryPointIndex %u is out of bounds.\n", desc->EntrypointIndex);
-        return;
+        return true;
     }
 
     node_index = program->levels[0].nodes[desc->EntrypointIndex];
@@ -3766,32 +3872,38 @@ static void d3d12_command_list_workgraph_execute_entry_cpu(
     else
         payload_size = (VkDeviceSize)(desc->NumRecords - 1) * desc->RecordStrideInBytes + record_size;
 
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
-            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, max(payload_size, 4), 64, ~0u, &payload_scratch))
-        return;
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
+            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, max(payload_size, 4), 64, &payload_scratch))
+        return false;
 
     /* Alternatively use vkCmdUpdateBuffer, but at least for now, just rely on ReBAR doing its thing. */
     if (payload_size)
         memcpy(payload_scratch.host_ptr, desc->pRecords, payload_size);
 
-    d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program, node_index, desc,
+    if (!d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program, node_index, desc,
             wg_state->payload[0].va, payload_scratch.va,
-            vk_root_param_buffer_va);
+            vk_root_param_buffer_va))
+        return false;
 
     /* For any shared nodes, just execute those as well. */
     for (i = 0; i < program->levels[0].shared_nodes_count; i++)
     {
         if (program->levels[0].shared_nodes[i].node_payload_index == node_index)
         {
-            d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program,
+            if (!d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program,
                     program->levels[0].shared_nodes[i].node_pipeline_index, desc,
                     wg_state->payload[0].va, payload_scratch.va,
-                    vk_root_param_buffer_va);
+                    vk_root_param_buffer_va))
+                return false;
         }
     }
+
+    return true;
 }
 
-static void d3d12_command_list_workgraph_execute_entry_level(
+/* amdgpu-wddm fork: false if a scratch allocation failed. The command list is then marked as out of memory, and
+ * the levels after the entry level are not recorded. */
+static bool d3d12_command_list_workgraph_execute_entry_level(
         struct d3d12_command_list *list, struct d3d12_wg_state_object *wg_state,
         const struct d3d12_wg_state_object_program *program, const D3D12_DISPATCH_GRAPH_DESC *desc,
         VkDeviceAddress vk_root_param_buffer_va)
@@ -3800,10 +3912,9 @@ static void d3d12_command_list_workgraph_execute_entry_level(
     switch (desc->Mode)
     {
         case D3D12_DISPATCH_MODE_NODE_CPU_INPUT:
-            d3d12_command_list_workgraph_execute_entry_cpu(
+            return d3d12_command_list_workgraph_execute_entry_cpu(
                     list, wg_state, program, &desc->NodeCPUInput,
                     vk_root_param_buffer_va);
-            break;
 
         case D3D12_DISPATCH_MODE_MULTI_NODE_CPU_INPUT:
             for (i = 0; i < desc->MultiNodeCPUInput.NumNodeInputs; i++)
@@ -3811,29 +3922,28 @@ static void d3d12_command_list_workgraph_execute_entry_level(
                 const D3D12_NODE_CPU_INPUT *input;
                 input = (const void *)((const uint8_t *)desc->MultiNodeCPUInput.pNodeInputs +
                         desc->MultiNodeCPUInput.NodeInputStrideInBytes * i);
-                d3d12_command_list_workgraph_execute_entry_cpu(
+                if (!d3d12_command_list_workgraph_execute_entry_cpu(
                         list, wg_state, program, input,
-                        vk_root_param_buffer_va);
+                        vk_root_param_buffer_va))
+                    return false;
             }
-            break;
+            return true;
 
         case D3D12_DISPATCH_MODE_NODE_GPU_INPUT:
-            d3d12_command_list_workgraph_execute_entry_gpu(
+            return d3d12_command_list_workgraph_execute_entry_gpu(
                     list, wg_state, program, desc->NodeGPUInput,
                     vk_root_param_buffer_va);
-            break;
 
         case D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT:
-            d3d12_command_list_workgraph_execute_entry_multi_gpu(
+            return d3d12_command_list_workgraph_execute_entry_multi_gpu(
                     list, wg_state, program, desc->MultiNodeGPUInput,
                     vk_root_param_buffer_va);
-            break;
 
         default:
             /* amdgpu-wddm fork: an error, not a FIXME. The release flavour removes FIXME lines, and this graph
              * then does not run, which a log must show. */
             ERR("Unimplemented mode %u, the graph does not run.\n", desc->Mode);
-            break;
+            return true;
     }
 }
 
@@ -3854,6 +3964,8 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
         return;
     }
 
+    d3d12_wg_scratch_fault_reset();
+
     d3d12_command_list_end_current_render_pass(list, false);
     d3d12_command_list_debug_mark_begin_region(list, "WGDispatch");
 
@@ -3866,17 +3978,18 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
 
     program = &wg_state->programs[wg_state_program_index];
 
-    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
+    if (!d3d12_command_list_workgraph_allocate_scratch(list,
             VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
             sizeof(union vkd3d_root_parameter_data), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
-            ~0u, &root_param_scratch))
-        return;
+            &root_param_scratch))
+        goto out;
 
     d3d12_command_list_fetch_root_parameter_data(list, &list->compute_bindings, root_param_scratch.host_ptr);
     /* TODO: For mesh nodes, may have to fetch graphics root parameter data. */
 
-    d3d12_command_list_workgraph_execute_entry_level(list, wg_state, program, desc,
-            root_param_scratch.va);
+    if (!d3d12_command_list_workgraph_execute_entry_level(list, wg_state, program, desc,
+            root_param_scratch.va))
+        goto out;
 
     for (i = 1; i < program->num_levels; i++)
     {
@@ -3885,5 +3998,6 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
                 root_param_scratch.va);
     }
 
+out:
     d3d12_command_list_debug_mark_end_region(list);
 }

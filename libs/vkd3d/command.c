@@ -2596,6 +2596,15 @@ static void d3d12_command_list_mark_as_invalid(struct d3d12_command_list *list,
     list->is_valid = false;
 }
 
+/* amdgpu-wddm fork: a command that cannot get its memory during recording is not recorded completely. The list must
+ * then not execute, and Close tells the application with E_OUTOFMEMORY. */
+void d3d12_command_list_mark_out_of_memory(struct d3d12_command_list *list, const char *what)
+{
+    ERR("Command list %p: out of memory for %s.\n", list, what);
+    list->is_valid = false;
+    list->is_out_of_memory = true;
+}
+
 static void d3d12_command_list_update_conditional_rendering_state(struct d3d12_command_list *list, bool end)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -2671,6 +2680,7 @@ static HRESULT d3d12_command_list_begin_command_buffer(struct d3d12_command_list
 
     list->is_recording = true;
     list->is_valid = true;
+    list->is_out_of_memory = false;
 
     return S_OK;
 }
@@ -7416,7 +7426,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
     if (!list->is_valid)
     {
         WARN("Error occurred during command list recording.\n");
-        return E_INVALIDARG;
+        return list->is_out_of_memory ? E_OUTOFMEMORY : E_INVALIDARG;
     }
 
     return S_OK;

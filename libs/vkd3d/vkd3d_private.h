@@ -3788,6 +3788,8 @@ struct d3d12_command_list
 
     bool is_recording;
     bool is_valid;
+    /* amdgpu-wddm fork: a recording ran out of memory. Close then returns E_OUTOFMEMORY. */
+    bool is_out_of_memory;
     bool debug_capture;
     bool has_replaced_shaders;
 
@@ -5576,28 +5578,66 @@ struct vkd3d_workgraph_setup_gpu_input_args
 };
 
 /* amdgpu-wddm fork: D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT (cs_workgraph_multi_gpu_input_*.comp).
- * The state buffer holds the copy arguments (32 bytes), the totals and the cursors (each N u32, aligned to
- * 16 bytes), then N D3D12_NODE_GPU_INPUT, for N entry points. Meta push data is limited to 64 bytes. */
+ * Each entry point has VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS direct slots, for large inputs that are read in place,
+ * and one merge slot, for the records of all other inputs, copied into the staging range of the backing memory.
+ * An input is large if its records take more than VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE bytes in the staging range.
+ * The shaders have the same constants. The state buffer (per DispatchGraph call) holds a 16-byte header with the
+ * overflow word, one vkd3d_workgraph_multi_gpu_input_entry per entry point, the input index of each direct slot
+ * (aligned to 16 bytes), then the slots: (DIRECT_SLOTS + 1) D3D12_NODE_GPU_INPUT per entry point, the merge slot
+ * last. Meta push data is limited to 64 bytes. */
+#define VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS 4u
+#define VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE (512u * 1024u)
+#define VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE (32u * 1024u * 1024u)
+/* Workgroups of the classify and copy passes. Each loops over the inputs, so any number of inputs fits. */
+#define VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS 1024u
+
+enum vkd3d_workgraph_multi_gpu_input_mode
+{
+    VKD3D_WORKGRAPH_MULTI_INPUT_MODE_INIT = 0,
+    VKD3D_WORKGRAPH_MULTI_INPUT_MODE_CLASSIFY = 1,
+    VKD3D_WORKGRAPH_MULTI_INPUT_MODE_LAYOUT = 2,
+};
+
+struct vkd3d_workgraph_multi_gpu_input_entry
+{
+    uint32_t direct_count;
+    uint32_t merged_lo;
+    uint32_t merged_hi;
+    uint32_t cursor;
+    uint32_t fit;
+    uint32_t padding[3];
+};
+
 struct vkd3d_workgraph_multi_gpu_input_prepare_args
 {
     VkDeviceAddress multi_input_va;
     VkDeviceAddress record_strides_va;
     VkDeviceAddress state_va;
-    VkDeviceAddress dest_va;
-    VkDeviceSize dest_capacity;
+    VkDeviceAddress staging_va;
+    VkDeviceSize staging_capacity;
     uint32_t num_entry_points;
+    uint32_t mode;
 };
 
 struct vkd3d_workgraph_multi_gpu_input_copy_args
 {
     VkDeviceAddress multi_input_va;
+    VkDeviceAddress record_strides_va;
     VkDeviceAddress state_va;
     uint32_t num_entry_points;
 };
 
-static inline VkDeviceSize vkd3d_workgraph_multi_gpu_input_counters_size(uint32_t num_entry_points)
+static inline VkDeviceSize vkd3d_workgraph_multi_gpu_input_slots_offset(uint32_t num_entry_points)
 {
-    return (num_entry_points * sizeof(uint32_t) + 15) & ~(VkDeviceSize)15;
+    VkDeviceSize offset = 16 + (VkDeviceSize)num_entry_points * sizeof(struct vkd3d_workgraph_multi_gpu_input_entry);
+
+    return offset + align64((VkDeviceSize)num_entry_points * VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS *
+            sizeof(uint32_t), 16);
+}
+
+static inline uint32_t vkd3d_workgraph_multi_gpu_input_slot_count(uint32_t num_entry_points)
+{
+    return num_entry_points * (VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS + 1);
 }
 
 struct vkd3d_workgraph_indirect_pipeline
@@ -5722,11 +5762,6 @@ void vkd3d_meta_get_workgraph_complete_compaction_pipeline(struct vkd3d_meta_ops
         struct vkd3d_workgraph_meta_pipeline_info *info);
 void vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_workgraph_meta_pipeline_info *prepare, struct vkd3d_workgraph_meta_pipeline_info *copy);
-
-static inline uint32_t vkd3d_meta_get_workgraph_multi_gpu_input_copy_max_groups_x(void)
-{
-    return 65535;
-}
 
 static inline uint32_t vkd3d_meta_get_workgraph_setup_gpu_input_workgroup_size(void)
 {
@@ -6999,6 +7034,7 @@ struct d3d12_wg_state_object
 
 void d3d12_command_list_workgraph_initialize_scratch(struct d3d12_command_list *list);
 void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, const D3D12_DISPATCH_GRAPH_DESC *desc);
+void d3d12_command_list_mark_out_of_memory(struct d3d12_command_list *list, const char *what);
 
 static inline struct d3d12_wg_state_object *wg_impl_from_ID3D12StateObject(ID3D12StateObject *iface)
 {
