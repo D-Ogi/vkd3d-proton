@@ -53,25 +53,26 @@ STATIC_ASSERT(sizeof(struct vkd3d_workgraph_abandoned) == 20 * sizeof(uint32_t))
 /* 64k is arbitrary, but reasonable. */
 #define VKD3D_WORKGRAPH_BACKING_GRANULARITY D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT
 
-/* amdgpu-wddm fork: the components of a record pool of the draining scheduler: payload bytes, then packed entries,
- * unrolled offsets and record headers, which W counts in records. Pool L (1 <= L < num_levels) holds the input records
- * of level L, which level L - 1 writes. The pools are computed at state object creation; execution does not use them
- * yet. */
+/* amdgpu-wddm fork: the components of a record pool of the draining scheduler: payload bytes, then packed entries and
+ * unrolled offsets, which W counts in records. Pool L (1 <= L < num_levels) holds the input records of level L, which
+ * level L - 1 writes. A record is retained as a whole, so there is no record header yet. The pools are computed at state
+ * object creation; execution does not use them yet. */
 enum d3d12_wg_pool_component
 {
     D3D12_WG_POOL_PAYLOAD,
     D3D12_WG_POOL_ENTRIES,
     D3D12_WG_POOL_OFFSETS,
-    D3D12_WG_POOL_HEADERS,
     D3D12_WG_POOL_COMPONENT_COUNT,
 };
 
 /* The bytes of one unit of each component (the payload is in bytes), and the alignment of each component region. */
-static const uint32_t d3d12_wg_pool_unit_bytes[D3D12_WG_POOL_COMPONENT_COUNT] = { 1, 8, 4, 16 };
-static const uint32_t d3d12_wg_pool_alignment[D3D12_WG_POOL_COMPONENT_COUNT] = { 16, 8, 4, 16 };
+static const uint32_t d3d12_wg_pool_unit_bytes[D3D12_WG_POOL_COMPONENT_COUNT] = { 1, 8, 4 };
+static const uint32_t d3d12_wg_pool_alignment[D3D12_WG_POOL_COMPONENT_COUNT] = { 16, 8, 4 };
 
 /* One producer item of a thread launch node is one wave of up to 64 threads. */
 #define D3D12_WG_POOL_THREAD_ITEM 64u
+/* The node output allocator charges each empty record 4 bytes of the payload capacity (dxil-spirv). */
+#define D3D12_WG_POOL_EMPTY_RECORD_BYTES 4u
 
 struct d3d12_wg_drain_region
 {
@@ -79,14 +80,21 @@ struct d3d12_wg_drain_region
     VkDeviceSize size;
 };
 
-/* amdgpu-wddm fork: the regions of the backing memory for one backing size (d3d12_wg_drain_layout). */
+/* amdgpu-wddm fork: the regions of the backing memory for one backing size (d3d12_wg_drain_layout). The producers of
+ * a level address their pool with one base and a 32-bit payload offset, and find the output guard 32 bytes before the
+ * packed entries (dxil-spirv). So each pool half has one payload region with its sink directly after it, the packed
+ * entries start where the fixed bookkeeping (which ends with the output guard) ends, and the entries and the offsets
+ * are shared by the pools: the entries of pool L are not used after the payload expander of level L, and the offsets
+ * not after level L. */
 struct d3d12_wg_drain_layout
 {
     VkDeviceSize backing_size; /* The size that the layout uses: the given size, at most pool_max_size. */
     struct d3d12_wg_drain_region fixed;
+    struct d3d12_wg_drain_region entries;
+    struct d3d12_wg_drain_region offsets;
     struct d3d12_wg_drain_region empty_state;
-    struct d3d12_wg_drain_region isolated[MAX_WORKGRAPH_LEVELS][2][D3D12_WG_POOL_COMPONENT_COUNT];
-    struct d3d12_wg_drain_region arena[2][D3D12_WG_POOL_COMPONENT_COUNT];
+    struct d3d12_wg_drain_region payload[MAX_WORKGRAPH_LEVELS][2];
+    struct d3d12_wg_drain_region sink[MAX_WORKGRAPH_LEVELS][2];
     struct d3d12_wg_drain_region staging;
 };
 
@@ -155,11 +163,12 @@ struct amdgpu_wddm_wg_drain
 };
 
 /* amdgpu-wddm fork, lab flavour only: GetPrivateData with this GUID gives struct amdgpu_wddm_wg_pools of the first
- * program, for test_workgraph_drain_layout: W of each pool, Min and Max of the pool layout, and the layouts with
- * Min - 16 bytes (none), Min, Min + one granule + 8 bytes, Max and Max + one granule of backing memory. The empty-record
- * state has no size yet, so Min is not the final Min of the scheduler. */
+ * program, for test_workgraph_drain_layout: W and the record bound of each pool, Min and Max of the pool layout, and
+ * the layouts with Min - 16 bytes (none), Min, Min + one granule + 8 bytes, Max and Max + one granule of backing
+ * memory. The empty-record state has no size yet, so Min is not the final Min of the scheduler. The last byte is the
+ * version of the struct (8: the layout of P2, 9: one payload region per pool half, shared entries and offsets). */
 static const GUID amdgpu_wddm_wg_pool_guid =
-        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x08 } };
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x09 } };
 
 struct amdgpu_wddm_wg_region
 {
@@ -171,20 +180,25 @@ struct amdgpu_wddm_wg_pools
 {
     uint32_t valid;
     uint32_t pools; /* The number of levels: pool L for 1 <= L < pools. */
+    uint32_t execution; /* 1 if DispatchGraph uses the pool layout. */
+    uint32_t padding;
     uint64_t fixed_size;
     uint64_t staging_size;
-    uint64_t arena_payload;
+    uint64_t sink_size;
     uint64_t min_size;
     uint64_t max_size;
     uint64_t w[MAX_WORKGRAPH_LEVELS][D3D12_WG_POOL_COMPONENT_COUNT];
+    uint64_t bound[MAX_WORKGRAPH_LEVELS][D3D12_WG_POOL_COMPONENT_COUNT];
     struct
     {
         uint64_t size; /* The backing size asked for. */
         uint64_t used; /* The backing size that the layout uses, or 0 if there is no layout for that size. */
         struct amdgpu_wddm_wg_region fixed;
+        struct amdgpu_wddm_wg_region entries;
+        struct amdgpu_wddm_wg_region offsets;
         struct amdgpu_wddm_wg_region empty_state;
-        struct amdgpu_wddm_wg_region isolated[MAX_WORKGRAPH_LEVELS][2][D3D12_WG_POOL_COMPONENT_COUNT];
-        struct amdgpu_wddm_wg_region arena[2][D3D12_WG_POOL_COMPONENT_COUNT];
+        struct amdgpu_wddm_wg_region payload[MAX_WORKGRAPH_LEVELS][2];
+        struct amdgpu_wddm_wg_region sink[MAX_WORKGRAPH_LEVELS][2];
         struct amdgpu_wddm_wg_region staging;
     } layouts[5];
 };
@@ -475,15 +489,20 @@ struct d3d12_wg_state_object_program
     uint32_t drain_pending;
     struct vkd3d_workgraph_meta_pipeline_info drain;
     /* amdgpu-wddm fork: the record pools of the draining scheduler. pool_w[L] is W of pool L, the componentwise
-     * maximum of the W of the producer items of level L - 1. pool_valid is false if the metadata gave no bound; the
-     * pools are then not used. pool_arena_payload is the payload bytes per record of the arena. */
+     * maximum of the W of the producer items of level L - 1. pool_bound[L] is the largest demand on pool L of one
+     * record of level L - 1, all its groups and readers. pool_valid is false if the metadata gave no bound; the pools
+     * are then not used. pool_sink_size is the sink after each payload region, with the lab canary.
+     * pool_ignored_overrides is true if a node override that the engine does not apply (output budgets, shared input,
+     * new name) is set: the metadata then does not describe the graph of the application, and the pools are not valid. */
     bool pool_valid;
+    bool pool_ignored_overrides;
     uint32_t pool_test_records;
     uint32_t pool_test_stride;
     uint64_t pool_w[MAX_WORKGRAPH_LEVELS][D3D12_WG_POOL_COMPONENT_COUNT];
+    uint64_t pool_bound[MAX_WORKGRAPH_LEVELS][D3D12_WG_POOL_COMPONENT_COUNT];
     VkDeviceSize pool_fixed_size;
     VkDeviceSize pool_staging_size;
-    VkDeviceSize pool_arena_payload;
+    VkDeviceSize pool_sink_size;
     VkDeviceSize pool_min_size;
     VkDeviceSize pool_max_size;
     /* amdgpu-wddm fork: struct vkd3d_workgraph_output_guard, the last range of the required scratch memory. */
@@ -1212,6 +1231,8 @@ static HRESULT d3d12_wg_state_object_apply_node_overrides(
             case D3D12_NODE_OVERRIDES_TYPE_BROADCASTING_LAUNCH:
             {
                 const D3D12_BROADCASTING_LAUNCH_OVERRIDES *override = shader_node->pBroadcastingLaunchOverrides;
+                if (override->NumOutputOverrides || override->pShareInputOf || override->pNewName)
+                    program->pool_ignored_overrides = true;
                 if (override->NumOutputOverrides)
                     FIXME("Output overrides not supported yet.\n");
                 if (override->pShareInputOf)
@@ -1265,6 +1286,8 @@ static HRESULT d3d12_wg_state_object_apply_node_overrides(
             case D3D12_NODE_OVERRIDES_TYPE_COMMON_COMPUTE:
             {
                 const D3D12_COALESCING_LAUNCH_OVERRIDES *override = shader_node->pCoalescingLaunchOverrides;
+                if (override->NumOutputOverrides || override->pShareInputOf || override->pNewName)
+                    program->pool_ignored_overrides = true;
                 if (override->NumOutputOverrides)
                     FIXME("Output overrides not supported yet.\n");
                 if (override->pShareInputOf)
@@ -2149,7 +2172,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
         const struct d3d12_wg_state_object_program *program;
         struct amdgpu_wddm_wg_pools *pools;
         struct d3d12_wg_drain_layout layout;
-        unsigned int n, level, half, c;
+        unsigned int n, level, half;
 
         if (!data_size)
             return E_INVALIDARG;
@@ -2167,10 +2190,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
                 pools->pools = program->num_levels;
                 pools->fixed_size = program->pool_fixed_size;
                 pools->staging_size = program->pool_staging_size;
-                pools->arena_payload = program->pool_arena_payload;
+                pools->sink_size = program->pool_sink_size;
                 pools->min_size = program->pool_min_size;
                 pools->max_size = program->pool_max_size;
                 memcpy(pools->w, program->pool_w, sizeof(pools->w));
+                memcpy(pools->bound, program->pool_bound, sizeof(pools->bound));
                 pools->layouts[0].size = program->pool_min_size - 16;
                 pools->layouts[1].size = program->pool_min_size;
                 pools->layouts[2].size = program->pool_min_size + VKD3D_WORKGRAPH_BACKING_GRANULARITY + 8;
@@ -2183,15 +2207,17 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
                     pools->layouts[n].used = layout.backing_size;
 #define copy_region(dst, src) ((dst).offset = (src).offset, (dst).size = (src).size)
                     copy_region(pools->layouts[n].fixed, layout.fixed);
+                    copy_region(pools->layouts[n].entries, layout.entries);
+                    copy_region(pools->layouts[n].offsets, layout.offsets);
                     copy_region(pools->layouts[n].empty_state, layout.empty_state);
                     for (level = 0; level < MAX_WORKGRAPH_LEVELS; level++)
+                    {
                         for (half = 0; half < 2; half++)
-                            for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-                                copy_region(pools->layouts[n].isolated[level][half][c],
-                                        layout.isolated[level][half][c]);
-                    for (half = 0; half < 2; half++)
-                        for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-                            copy_region(pools->layouts[n].arena[half][c], layout.arena[half][c]);
+                        {
+                            copy_region(pools->layouts[n].payload[level][half], layout.payload[level][half]);
+                            copy_region(pools->layouts[n].sink[level][half], layout.sink[level][half]);
+                        }
+                    }
                     copy_region(pools->layouts[n].staging, layout.staging);
 #undef copy_region
                 }
@@ -2950,12 +2976,14 @@ static bool d3d12_wg_add_u64(uint64_t *sum, uint64_t value)
 /* amdgpu-wddm fork: W of one producer item of a slot: the most that one group (one wave of a thread launch node) can
  * write into the next pool. For each output declaration with a target that has a payload: MaxRecords x the largest
  * round16(stride) of its targets payload bytes (the allocator reserves round16(count x stride) per allocation, and
- * the worst case is one record per allocation), and MaxRecords of each other component. The records of an empty
- * target are counted, not stored, so they add nothing here. A recursive output writes into the slot of the next
- * depth, and adds nothing if the slot is at the last depth. The shader metadata has no MaxRecordsSharedWith: such an
- * output has max_records 0, and is charged the largest max_records of the slot's outputs, which is at least the
- * shared budget. Each declaration of a shared set is counted on its own, which gives a larger W, never a smaller
- * one. Returns false if a sum does not fit in 64 bits. */
+ * the worst case is one record per allocation), and MaxRecords of each other component. An empty target has no
+ * payload and no packed entry, but the allocator charges 4 bytes of the payload capacity for each record, so it adds
+ * 4 x MaxRecords payload bytes. The distributor counts empty records in the linear offsets of the level, so an empty
+ * target also adds MaxRecords unrolled offsets. A recursive output writes into the slot of the next depth, and adds nothing if the
+ * slot is at the last depth. The shader metadata has no MaxRecordsSharedWith: such an output has max_records 0, and is
+ * charged the largest max_records of the slot's outputs, which is at least the shared budget. Each declaration of a
+ * shared set is counted on its own, which gives a larger W, never a smaller one. Returns false if a sum does not fit in
+ * 64 bits. */
 static bool d3d12_wg_state_object_program_item_w(const struct d3d12_wg_state_object_program *program,
         const struct d3d12_wg_state_object_data *data, unsigned int slot, uint64_t *w)
 {
@@ -2965,6 +2993,7 @@ static bool d3d12_wg_state_object_program_item_w(const struct d3d12_wg_state_obj
     uint32_t node_array_size, node_index, largest = 0;
     uint64_t records, stride, max_stride, payload;
     unsigned int i, j, c;
+    bool empty;
 
     for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
         w[c] = 0;
@@ -2982,6 +3011,7 @@ static bool d3d12_wg_state_object_program_item_w(const struct d3d12_wg_state_obj
         node_array_size = output->node_array_size ? output->node_array_size : 1;
 
         max_stride = 0;
+        empty = false;
         for (j = 0; j < node_array_size; j++)
         {
             node_index = d3d12_work_graph_find_node_by_id(data->entry_points, data->entry_points_count,
@@ -2995,15 +3025,17 @@ static bool d3d12_wg_state_object_program_item_w(const struct d3d12_wg_state_obj
             stride = align64(target->payload_stride, 16);
             if (stride && program->pool_test_stride)
                 stride = align64(program->pool_test_stride, 16);
+            if (!stride)
+                empty = true;
             max_stride = max(max_stride, stride);
         }
-        if (!max_stride)
+        if (!max_stride && !empty)
             continue;
 
         records = output->max_records ? output->max_records : largest;
         if (program->pool_test_records)
             records = program->pool_test_records;
-        payload = records * max_stride;
+        payload = records * (max_stride ? max_stride : D3D12_WG_POOL_EMPTY_RECORD_BYTES);
         if (entry->node_input->launch_type == VKD3D_SHADER_NODE_LAUNCH_TYPE_THREAD)
         {
             if (payload > UINT64_MAX / D3D12_WG_POOL_THREAD_ITEM)
@@ -3011,11 +3043,11 @@ static bool d3d12_wg_state_object_program_item_w(const struct d3d12_wg_state_obj
             payload *= D3D12_WG_POOL_THREAD_ITEM;
             records *= D3D12_WG_POOL_THREAD_ITEM;
         }
-        if (!d3d12_wg_add_u64(&w[D3D12_WG_POOL_PAYLOAD], payload))
+        if (!d3d12_wg_add_u64(&w[D3D12_WG_POOL_PAYLOAD], payload) ||
+                !d3d12_wg_add_u64(&w[D3D12_WG_POOL_OFFSETS], records))
             return false;
-        for (c = D3D12_WG_POOL_ENTRIES; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-            if (!d3d12_wg_add_u64(&w[c], records))
-                return false;
+        if (max_stride && !d3d12_wg_add_u64(&w[D3D12_WG_POOL_ENTRIES], records))
+            return false;
     }
 
     return true;
@@ -3047,30 +3079,146 @@ static bool d3d12_wg_pool_bytes(unsigned int component, uint64_t units, VkDevice
     return true;
 }
 
-/* Places the fixed bookkeeping, the empty-record state and the isolated shares from offset 0, below limit. */
-static bool d3d12_wg_drain_place_isolated(const struct d3d12_wg_state_object_program *program,
-        VkDeviceSize limit, VkDeviceSize *cursor, struct d3d12_wg_drain_layout *layout)
+/* amdgpu-wddm fork: the demand of one record of a slot of a level on the next pool. For each reader of the record (the
+ * slot and the slots of the level that share its input): W of one item x the items of the record, which is the grid
+ * product for a broadcasting reader (the NodeMaxDispatchGrid bound for a dynamic grid) and 1 for the others, because
+ * one group can take the record. A record is admitted as a whole, so this space must be free to admit one record.
+ * Returns false if a value does not fit in 64 bits. */
+static bool d3d12_wg_state_object_program_record_demand(const struct d3d12_wg_state_object_program *program,
+        const struct d3d12_wg_state_object_data *data, unsigned int level, unsigned int slot, uint64_t *demand)
 {
-    unsigned int level, half, c;
-    VkDeviceSize bytes;
+    const struct d3d12_workgraph_level_execution *exec = &program->levels[level];
+    const struct vkd3d_shader_node_input_data *input;
+    uint64_t w[D3D12_WG_POOL_COMPONENT_COUNT], items;
+    unsigned int i, j, reader, c;
+
+    for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
+        demand[c] = 0;
+    for (i = 0; i <= exec->shared_nodes_count; i++)
+    {
+        if (i == exec->shared_nodes_count)
+            reader = slot;
+        else if (exec->shared_nodes[i].node_payload_index == slot)
+            reader = exec->shared_nodes[i].node_pipeline_index;
+        else
+            continue;
+        if (!d3d12_wg_state_object_program_item_w(program, data, reader, w))
+            return false;
+
+        input = data->entry_points[program->slot_entry[reader]].node_input;
+        items = 1;
+        if (input && input->launch_type == VKD3D_SHADER_NODE_LAUNCH_TYPE_BROADCASTING)
+        {
+            for (j = 0; j < ARRAY_SIZE(input->broadcast_grid); j++)
+            {
+                if (input->broadcast_grid[j] && items > UINT64_MAX / input->broadcast_grid[j])
+                    return false;
+                items *= input->broadcast_grid[j];
+            }
+        }
+        for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
+        {
+            if (items && w[c] > UINT64_MAX / items)
+                return false;
+            if (!d3d12_wg_add_u64(&demand[c], w[c] * items))
+                return false;
+        }
+    }
+    return true;
+}
+
+/* floor(a x b / c) for 0 < c < 2^63 and b <= c: the product is formed in 128 bits, and the quotient is at most a. */
+static uint64_t d3d12_wg_mul_div(uint64_t a, uint64_t b, uint64_t c)
+{
+    uint64_t p0, p1, p2, p3, mid, hi, lo, q = 0, r = 0;
+    int i;
+
+    p0 = (a & 0xffffffffu) * (b & 0xffffffffu);
+    p1 = (a & 0xffffffffu) * (b >> 32);
+    p2 = (a >> 32) * (b & 0xffffffffu);
+    p3 = (a >> 32) * (b >> 32);
+    mid = (p0 >> 32) + (p1 & 0xffffffffu) + (p2 & 0xffffffffu);
+    lo = (mid << 32) | (p0 & 0xffffffffu);
+    hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+
+    /* Long division. The remainder is below c < 2^63, so the shift does not overflow; the quotient is below 2^64, so
+     * the bits that the shift of q removes are 0. */
+    for (i = 127; i >= 0; i--)
+    {
+        r = (r << 1) | ((i >= 64 ? hi >> (i - 64) : lo >> i) & 1);
+        q <<= 1;
+        if (r >= c)
+        {
+            r -= c;
+            q |= 1;
+        }
+    }
+    return q;
+}
+
+/* A payload region and its sink: the producers address both with 32-bit offsets from the start of the region. */
+#define D3D12_WG_POOL_PAYLOAD_LIMIT ((VkDeviceSize)UINT32_MAX)
+/* The regions that get a part of the arena: the packed entries, the unrolled offsets and two payload halves per pool. */
+#define D3D12_WG_DRAIN_REGIONS (2 + 2 * (MAX_WORKGRAPH_LEVELS - 1))
+
+/* The isolated size of each region that gets a part of the arena: index 0 the packed entries and 1 the unrolled
+ * offsets, each for the largest W of the pools, then 2 + 2 x (L - 1) + half the payload of pool L, its W rounded up to
+ * 16 bytes. */
+static bool d3d12_wg_drain_isolated_sizes(const struct d3d12_wg_state_object_program *program,
+        VkDeviceSize *isolated, unsigned int *count)
+{
+    uint64_t entries = 0, offsets = 0;
+    unsigned int level, half;
+
+    for (level = 1; level < program->num_levels; level++)
+    {
+        entries = max(entries, program->pool_w[level][D3D12_WG_POOL_ENTRIES]);
+        offsets = max(offsets, program->pool_w[level][D3D12_WG_POOL_OFFSETS]);
+    }
+    if (!d3d12_wg_pool_bytes(D3D12_WG_POOL_ENTRIES, entries, &isolated[0]) ||
+            !d3d12_wg_pool_bytes(D3D12_WG_POOL_OFFSETS, offsets, &isolated[1]))
+        return false;
+    *count = 2;
+    for (level = 1; level < program->num_levels; level++)
+    {
+        if (program->pool_w[level][D3D12_WG_POOL_PAYLOAD] > UINT64_MAX - 15)
+            return false;
+        for (half = 0; half < 2; half++)
+            isolated[(*count)++] = align64(program->pool_w[level][D3D12_WG_POOL_PAYLOAD], 16);
+    }
+    return true;
+}
+
+/* Places the regions from offset 0, below limit, with the sizes of d3d12_wg_drain_isolated_sizes: the fixed
+ * bookkeeping, the packed entries, the unrolled offsets, the empty-record state, and for each pool and each half the
+ * payload region with its sink. The entry and offset counters are 32-bit, and a payload region and its sink stay
+ * below the 32-bit limit. */
+static bool d3d12_wg_drain_place_regions(const struct d3d12_wg_state_object_program *program,
+        const VkDeviceSize *size, VkDeviceSize limit, VkDeviceSize *cursor, struct d3d12_wg_drain_layout *layout)
+{
+    unsigned int level, half, n = 2;
 
     *cursor = 0;
-    if (!d3d12_wg_drain_place(cursor, 64, program->pool_fixed_size, limit, &layout->fixed))
+    if (size[0] > (VkDeviceSize)UINT32_MAX * d3d12_wg_pool_unit_bytes[D3D12_WG_POOL_ENTRIES] ||
+            size[1] > (VkDeviceSize)UINT32_MAX * d3d12_wg_pool_unit_bytes[D3D12_WG_POOL_OFFSETS])
         return false;
-    /* The empty-record counters are not there yet. */
-    if (!d3d12_wg_drain_place(cursor, 16, 0, limit, &layout->empty_state))
+    if (!d3d12_wg_drain_place(cursor, 64, program->pool_fixed_size, limit, &layout->fixed) ||
+            !d3d12_wg_drain_place(cursor, d3d12_wg_pool_alignment[D3D12_WG_POOL_ENTRIES], size[0], limit,
+            &layout->entries) ||
+            !d3d12_wg_drain_place(cursor, d3d12_wg_pool_alignment[D3D12_WG_POOL_OFFSETS], size[1], limit,
+            &layout->offsets) ||
+            /* The empty-record counters are not there yet. */
+            !d3d12_wg_drain_place(cursor, 16, 0, limit, &layout->empty_state))
         return false;
     for (level = 1; level < program->num_levels; level++)
     {
-        for (half = 0; half < 2; half++)
+        for (half = 0; half < 2; half++, n++)
         {
-            for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-            {
-                if (!d3d12_wg_pool_bytes(c, program->pool_w[level][c], &bytes) ||
-                        !d3d12_wg_drain_place(cursor, d3d12_wg_pool_alignment[c], bytes, limit,
-                        &layout->isolated[level][half][c]))
-                    return false;
-            }
+            if (size[n] > D3D12_WG_POOL_PAYLOAD_LIMIT - program->pool_sink_size ||
+                    !d3d12_wg_drain_place(cursor, d3d12_wg_pool_alignment[D3D12_WG_POOL_PAYLOAD], size[n], limit,
+                    &layout->payload[level][half]) ||
+                    !d3d12_wg_drain_place(cursor, 16, program->pool_sink_size, limit, &layout->sink[level][half]))
+                return false;
         }
     }
     return true;
@@ -3091,39 +3239,60 @@ static bool d3d12_wg_drain_check_region(const struct d3d12_wg_drain_region *regi
     return true;
 }
 
-/* Checks that the regions of a layout are aligned, in order without overlap, and inside the backing size. */
+/* Checks that the regions of a layout are aligned, in order without overlap, and inside the backing size; that the
+ * packed entries start directly after the output guard, the last 32 bytes of the fixed bookkeeping; and that each sink
+ * directly follows its payload region, below the 32-bit limit. */
 static bool d3d12_wg_drain_layout_check(const struct d3d12_wg_state_object_program *program,
         const struct d3d12_wg_drain_layout *layout)
 {
     VkDeviceSize end = 0, size = layout->backing_size;
-    unsigned int level, half, c;
+    const struct d3d12_wg_drain_region *payload, *sink;
+    unsigned int level, half;
 
     if (!d3d12_wg_drain_check_region(&layout->fixed, 64, size, &end) ||
+            !d3d12_wg_drain_check_region(&layout->entries, d3d12_wg_pool_alignment[D3D12_WG_POOL_ENTRIES], size, &end) ||
+            !d3d12_wg_drain_check_region(&layout->offsets, d3d12_wg_pool_alignment[D3D12_WG_POOL_OFFSETS], size, &end) ||
             !d3d12_wg_drain_check_region(&layout->empty_state, 16, size, &end))
         return false;
+    if (layout->fixed.size < sizeof(struct vkd3d_workgraph_output_guard) ||
+            layout->entries.offset != layout->fixed.offset + layout->fixed.size)
+    {
+        ERR("Work graph pool layout: the packed entries at %#"PRIx64" do not follow the output guard.\n",
+                layout->entries.offset);
+        return false;
+    }
     for (level = 1; level < program->num_levels; level++)
+    {
         for (half = 0; half < 2; half++)
-            for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-                if (!d3d12_wg_drain_check_region(&layout->isolated[level][half][c], d3d12_wg_pool_alignment[c],
-                        size, &end))
-                    return false;
-    for (half = 0; half < 2; half++)
-        for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-            if (!d3d12_wg_drain_check_region(&layout->arena[half][c], d3d12_wg_pool_alignment[c], size, &end))
+        {
+            payload = &layout->payload[level][half];
+            sink = &layout->sink[level][half];
+            if (!d3d12_wg_drain_check_region(payload, d3d12_wg_pool_alignment[D3D12_WG_POOL_PAYLOAD], size, &end) ||
+                    !d3d12_wg_drain_check_region(sink, 16, size, &end))
                 return false;
+            if (sink->offset != payload->offset + payload->size ||
+                    payload->size + sink->size > D3D12_WG_POOL_PAYLOAD_LIMIT)
+            {
+                ERR("Work graph pool layout: the sink of pool %u half %u is not valid.\n", level, half);
+                return false;
+            }
+        }
+    }
     return d3d12_wg_drain_check_region(&layout->staging, 16, size, &end);
 }
 
 /* amdgpu-wddm fork: the layout of the record pools for backing_size bytes of backing memory. From offset 0: the
- * fixed bookkeeping, the empty-record state (0 bytes for now), for each pool and each half the isolated share of each
- * component (W of the pool), then the two arena halves, which hold the same number of records in each component, and
- * at the end the multi GPU input staging range. Above pool_max_size no region grows. Returns false if there is no
- * layout for this size (below pool_min_size, or the pools are not valid). */
+ * regions of d3d12_wg_drain_place_regions, then at the end the multi GPU input staging range. The bytes between
+ * them (the arena) go to the packed entries, the unrolled offsets and the payload regions in proportion to their
+ * isolated sizes, so that each region holds about the same number of records. The progress of the scheduler depends
+ * only on the isolated sizes. Above pool_max_size no region grows. Returns false if there is no layout for this size
+ * (below pool_min_size, or the pools are not valid). */
 static bool d3d12_wg_drain_layout(const struct d3d12_wg_state_object_program *program, VkDeviceSize backing_size,
         struct d3d12_wg_drain_layout *layout)
 {
-    VkDeviceSize used, limit, cursor, unit, free_half, records;
-    unsigned int half, c;
+    VkDeviceSize isolated[D3D12_WG_DRAIN_REGIONS], size[D3D12_WG_DRAIN_REGIONS];
+    VkDeviceSize used, limit, cursor, arena, total;
+    unsigned int count, n;
 
     memset(layout, 0, sizeof(*layout));
     if (!program->pool_valid || backing_size < program->pool_min_size)
@@ -3132,30 +3301,29 @@ static bool d3d12_wg_drain_layout(const struct d3d12_wg_state_object_program *pr
     if (used < program->pool_staging_size)
         return false;
     limit = (used - program->pool_staging_size) & ~(VkDeviceSize)15;
-    if (!d3d12_wg_drain_place_isolated(program, limit, &cursor, layout))
+    if (!d3d12_wg_drain_isolated_sizes(program, isolated, &count) ||
+            !d3d12_wg_drain_place_regions(program, isolated, limit, &cursor, layout))
         return false;
 
-    /* Each half takes the same number of records; 64 bytes of each half are kept for the alignment of the four
-     * components. */
-    records = 0;
-    unit = program->pool_arena_payload;
-    if (unit)
+    /* The regions are inside limit, so their sum does not overflow. 16 bytes per region are kept for alignment. Each
+     * part is rounded down to 16 bytes, and stays below the 32-bit limit of its region. */
+    total = 0;
+    for (n = 0; n < count; n++)
+        total += isolated[n];
+    arena = limit - cursor;
+    arena = arena > 16 * count ? arena - 16 * count : 0;
+    for (n = 0; n < count; n++)
     {
-        for (c = D3D12_WG_POOL_ENTRIES; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-            unit += d3d12_wg_pool_unit_bytes[c];
-        free_half = (limit - cursor) / 2;
-        records = free_half > 64 ? (free_half - 64) / unit : 0;
+        size[n] = isolated[n];
+        if (total)
+            size[n] += d3d12_wg_mul_div(arena, isolated[n], total) & ~(VkDeviceSize)15;
     }
-    for (half = 0; half < 2; half++)
-    {
-        for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
-        {
-            if (!d3d12_wg_drain_place(&cursor, d3d12_wg_pool_alignment[c],
-                    records * (c == D3D12_WG_POOL_PAYLOAD ? program->pool_arena_payload : d3d12_wg_pool_unit_bytes[c]),
-                    limit, &layout->arena[half][c]))
-                return false;
-        }
-    }
+    size[0] = min(size[0], ((VkDeviceSize)UINT32_MAX * d3d12_wg_pool_unit_bytes[D3D12_WG_POOL_ENTRIES]));
+    size[1] = min(size[1], ((VkDeviceSize)UINT32_MAX * d3d12_wg_pool_unit_bytes[D3D12_WG_POOL_OFFSETS]));
+    for (n = 2; n < count; n++)
+        size[n] = min(size[n], (D3D12_WG_POOL_PAYLOAD_LIMIT - program->pool_sink_size) & ~(VkDeviceSize)15);
+    if (!d3d12_wg_drain_place_regions(program, size, limit, &cursor, layout))
+        return false;
 
     layout->staging.offset = limit;
     layout->staging.size = program->pool_staging_size;
@@ -3163,19 +3331,26 @@ static bool d3d12_wg_drain_layout(const struct d3d12_wg_state_object_program *pr
     return d3d12_wg_drain_layout_check(program, layout);
 }
 
-/* amdgpu-wddm fork: W of the pools, Min and Max of the pool layout. The state object does not depend on them: if the
- * metadata gives no bound, the pools are marked as not valid. */
+/* amdgpu-wddm fork: W and the record bound of the pools, Min and Max of the pool layout. The state object does not
+ * depend on them: if the metadata gives no bound, the pools are marked as not valid. */
 static void d3d12_wg_state_object_program_compute_pools(struct d3d12_wg_state_object_program *program,
         const struct d3d12_wg_state_object_data *data)
 {
-    uint64_t w[D3D12_WG_POOL_COMPONENT_COUNT], payload = 0, records = 0;
+    uint64_t w[D3D12_WG_POOL_COMPONENT_COUNT], demand[D3D12_WG_POOL_COMPONENT_COUNT];
+    VkDeviceSize isolated[D3D12_WG_DRAIN_REGIONS], cursor, size;
     const struct d3d12_workgraph_level_execution *exec;
     struct d3d12_wg_drain_layout layout;
-    unsigned int level, i, slot, c;
-    VkDeviceSize cursor, size;
+    unsigned int level, i, slot, c, count;
 
     memset(program->pool_w, 0, sizeof(program->pool_w));
+    memset(program->pool_bound, 0, sizeof(program->pool_bound));
     program->pool_valid = false;
+
+    if (program->pool_ignored_overrides)
+    {
+        WARN("Work graph pools: a node override that the engine ignores is set.\n");
+        return;
+    }
 
     for (level = 0; level < program->num_levels; level++)
     {
@@ -3204,20 +3379,25 @@ static void d3d12_wg_state_object_program_compute_pools(struct d3d12_wg_state_ob
             for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
                 program->pool_w[level + 1][c] = max(program->pool_w[level + 1][c], w[c]);
         }
-    }
 
-    for (level = 1; level < program->num_levels; level++)
-    {
-        if (!d3d12_wg_add_u64(&payload, program->pool_w[level][D3D12_WG_POOL_PAYLOAD]) ||
-                !d3d12_wg_add_u64(&records, program->pool_w[level][D3D12_WG_POOL_ENTRIES]))
-            return;
+        /* The records of the level: those of a slot and of the slots that share its input are one record. */
+        for (i = 0; i < exec->nodes_count && level + 1 < program->num_levels; i++)
+        {
+            if (!d3d12_wg_state_object_program_record_demand(program, data, level, exec->nodes[i], demand))
+            {
+                WARN("Work graph pools: a record of slot %u has no 64-bit bound.\n", exec->nodes[i]);
+                return;
+            }
+            for (c = 0; c < D3D12_WG_POOL_COMPONENT_COUNT; c++)
+                program->pool_bound[level + 1][c] = max(program->pool_bound[level + 1][c], demand[c]);
+        }
     }
-    program->pool_arena_payload = records ? align64(payload / records + !!(payload % records), 16) : 0;
 
     /* Min: no arena. The regions before the staging range end at a multiple of 16 bytes. */
-    if (!d3d12_wg_drain_place_isolated(program, UINT64_MAX / 4, &cursor, &layout))
+    if (!d3d12_wg_drain_isolated_sizes(program, isolated, &count) ||
+            !d3d12_wg_drain_place_regions(program, isolated, UINT64_MAX / 4, &cursor, &layout))
     {
-        WARN("Work graph pools: the isolated shares have no 64-bit bound.\n");
+        WARN("Work graph pools: the isolated regions do not fit their limits.\n");
         return;
     }
     size = align64(cursor, 16) + program->pool_staging_size;
@@ -3237,8 +3417,8 @@ static void d3d12_wg_state_object_program_compute_pools(struct d3d12_wg_state_ob
         return;
     }
 
-    TRACE("Work graph pools: %u levels, Min %#"PRIx64", Max %#"PRIx64", arena payload %"PRIu64" bytes per record.\n",
-            program->num_levels, program->pool_min_size, program->pool_max_size, program->pool_arena_payload);
+    TRACE("Work graph pools: %u levels, Min %#"PRIx64", Max %#"PRIx64".\n",
+            program->num_levels, program->pool_min_size, program->pool_max_size);
 }
 
 static HRESULT d3d12_wg_state_object_compile_program(
@@ -3436,6 +3616,7 @@ static HRESULT d3d12_wg_state_object_compile_program(
     add_fixed(output_guard_scratch);
 #undef add_fixed
     program->pool_staging_size = program->multi_input_staging_min_size;
+    program->pool_sink_size = VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size;
     program->pool_test_records = multi_input_config.pool_records;
     program->pool_test_stride = multi_input_config.pool_stride;
     d3d12_wg_state_object_program_compute_pools(program, data);

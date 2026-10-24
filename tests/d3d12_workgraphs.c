@@ -5612,14 +5612,15 @@ void test_workgraph_local_root_signature(void)
 }
 
 /* The lab flavour of the amdgpu-wddm engine gives the record pools of the draining scheduler through GetPrivateData
- * with this GUID (amdgpu_wddm_wg_pool_guid in libs/vkd3d/workgraphs.c). */
+ * with this GUID (amdgpu_wddm_wg_pool_guid in libs/vkd3d/workgraphs.c). The last byte is the version of the struct. */
 static const GUID workgraph_pool_guid =
-        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x08 } };
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x09 } };
 
 #define WG_POOL_LEVELS 32
 #define WG_POOL_PAYLOAD 0
 #define WG_POOL_ENTRIES 1
-#define WG_POOL_COMPONENTS 4
+#define WG_POOL_OFFSETS 2
+#define WG_POOL_COMPONENTS 3
 
 struct workgraph_pool_region
 {
@@ -5628,28 +5629,34 @@ struct workgraph_pool_region
 };
 
 /* struct amdgpu_wddm_wg_pools of the engine. Pool L (1 <= L < pools) holds the input records of level L. w[L] is W of
- * pool L: payload bytes, then packed entries, unrolled offsets and record headers in records. The layouts are for
- * Min - 16 bytes, Min, Min + 64 KiB + 8 bytes, Max and Max + 64 KiB; used is 0 if there is no layout for that size. */
+ * pool L: payload bytes, then packed entries and unrolled offsets in records. bound[L] is the largest demand on pool L
+ * of one record of level L - 1. The layouts are for Min - 16 bytes, Min, Min + 64 KiB + 8 bytes, Max and Max + 64 KiB;
+ * used is 0 if there is no layout for that size. */
 #define WG_POOL_LAYOUTS 5
 
 struct workgraph_pools
 {
     uint32_t valid;
     uint32_t pools;
+    uint32_t execution;
+    uint32_t padding;
     uint64_t fixed_size;
     uint64_t staging_size;
-    uint64_t arena_payload;
+    uint64_t sink_size;
     uint64_t min_size;
     uint64_t max_size;
     uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS];
+    uint64_t bound[WG_POOL_LEVELS][WG_POOL_COMPONENTS];
     struct workgraph_pool_layout
     {
         uint64_t size;
         uint64_t used;
         struct workgraph_pool_region fixed;
+        struct workgraph_pool_region entries;
+        struct workgraph_pool_region offsets;
         struct workgraph_pool_region empty_state;
-        struct workgraph_pool_region isolated[WG_POOL_LEVELS][2][WG_POOL_COMPONENTS];
-        struct workgraph_pool_region arena[2][WG_POOL_COMPONENTS];
+        struct workgraph_pool_region payload[WG_POOL_LEVELS][2];
+        struct workgraph_pool_region sink[WG_POOL_LEVELS][2];
         struct workgraph_pool_region staging;
     } layouts[WG_POOL_LAYOUTS];
 };
@@ -5663,6 +5670,8 @@ struct workgraph_pool_decl
     uint32_t max_records; /* MaxRecords, or the shared budget for MaxRecordsSharedWith. */
     uint32_t record_size; /* The largest record of its targets, 0 for an empty node. */
     unsigned int shares; /* 1 + the index of the declaration whose budget it shares (MaxRecordsSharedWith), or 0. */
+    uint32_t items; /* The work items of one input record of the producer: its grid if it broadcasts, else 1. */
+    unsigned int input_of; /* 1 + the producer whose input record this producer shares (NodeShareInputOf), or 0. */
 };
 
 #define WG_POOL_MAX_DECLS 8
@@ -5676,29 +5685,41 @@ struct workgraph_pool_graph
     unsigned int decl_count;
 };
 
-static const unsigned int workgraph_pool_unit[WG_POOL_COMPONENTS] = { 1, 8, 4, 16 };
-static const unsigned int workgraph_pool_alignment[WG_POOL_COMPONENTS] = { 16, 8, 4, 16 };
+static const unsigned int workgraph_pool_unit[WG_POOL_COMPONENTS] = { 1, 8, 4 };
+static const unsigned int workgraph_pool_alignment[WG_POOL_COMPONENTS] = { 16, 8, 4 };
 
-/* W of each pool from the declarations. With exact true, a MaxRecordsSharedWith set is charged once, with its budget
- * and the largest record of the set (the spec bound). With exact false, the engine's rule: the shader metadata does
- * not say which declarations share a budget, so each declaration is charged on its own, and a shared one with the
- * largest MaxRecords of its producer. records and stride, if not 0, replace MaxRecords and the record size of each
- * declaration with a payload (the pool_records and pool_stride hooks). Records of empty nodes are not stored. */
+/* W and the record bound of each pool from the declarations. With exact true, a MaxRecordsSharedWith set is charged
+ * once, with its budget and the largest record of the set (the spec bound). With exact false, the engine's rule: the
+ * shader metadata does not say which declarations share a budget, so each declaration is charged on its own, and a
+ * shared one with the largest MaxRecords of its producer. records and stride, if not 0, replace MaxRecords of each
+ * declaration and the record size of each declaration with a payload (the pool_records and pool_stride hooks). An
+ * empty record is not stored, but the node output allocator charges it 4 bytes of the payload capacity, and the
+ * distributor gives it an unrolled offset. The bound of a pool is the largest demand of one input record of its
+ * producers: W x items of the producer plus W x items of each producer that shares that input record, because a
+ * record is admitted with all its groups and all its readers. */
 static void workgraph_pool_oracle(const struct workgraph_pool_graph *graph, bool exact, uint32_t records_hook,
-        uint32_t stride_hook, uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS])
+        uint32_t stride_hook, uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS],
+        uint64_t bound[WG_POOL_LEVELS][WG_POOL_COMPONENTS])
 {
-    uint64_t item[WG_POOL_COMPONENTS], payload, records, stride, largest;
+    uint64_t demand[WG_POOL_MAX_DECLS][WG_POOL_COMPONENTS], item[WG_POOL_COMPONENTS], payload, records, stride;
+    unsigned int producer, i, j, c, pool, pools[WG_POOL_MAX_DECLS], input_of[WG_POOL_MAX_DECLS];
+    uint64_t group[WG_POOL_MAX_DECLS][WG_POOL_COMPONENTS], largest, items;
+    unsigned int group_pool[WG_POOL_MAX_DECLS];
     const struct workgraph_pool_decl *decl, *other;
-    unsigned int producer, i, j, c, pool;
     bool found;
 
     memset(w, 0, sizeof(uint64_t) * WG_POOL_LEVELS * WG_POOL_COMPONENTS);
+    memset(bound, 0, sizeof(uint64_t) * WG_POOL_LEVELS * WG_POOL_COMPONENTS);
+    memset(demand, 0, sizeof(demand));
+    memset(pools, 0, sizeof(pools));
+    memset(input_of, 0, sizeof(input_of));
     for (producer = 0; producer < WG_POOL_MAX_DECLS; producer++)
     {
         memset(item, 0, sizeof(item));
         found = false;
         pool = 0;
         largest = 0;
+        items = 1;
         for (i = 0; i < graph->decl_count; i++)
             if (graph->decls[i].producer == producer && !graph->decls[i].shares)
                 largest = max(largest, graph->decls[i].max_records);
@@ -5710,6 +5731,8 @@ static void workgraph_pool_oracle(const struct workgraph_pool_graph *graph, bool
                 continue;
             found = true;
             pool = decl->pool;
+            items = decl->items;
+            input_of[producer] = decl->input_of;
             if (exact && decl->shares)
                 continue;
             records = decl->shares ? largest : decl->max_records;
@@ -5723,27 +5746,47 @@ static void workgraph_pool_oracle(const struct workgraph_pool_graph *graph, bool
                         stride = max(stride, (other->record_size + 15) & ~15u);
                 }
             }
-            if (!stride)
-                continue;
             if (records_hook)
                 records = records_hook;
-            if (stride_hook)
+            if (stride_hook && stride)
                 stride = ((uint64_t)stride_hook + 15) & ~(uint64_t)15;
-            payload = records * stride;
+            payload = records * (stride ? stride : 4);
             if (decl->thread)
             {
                 payload *= 64;
                 records *= 64;
             }
             item[WG_POOL_PAYLOAD] += payload;
-            for (c = WG_POOL_ENTRIES; c < WG_POOL_COMPONENTS; c++)
-                item[c] += records;
+            item[WG_POOL_OFFSETS] += records;
+            if (stride)
+                item[WG_POOL_ENTRIES] += records;
         }
         if (!found)
             continue;
+        pools[producer] = pool;
         for (c = 0; c < WG_POOL_COMPONENTS; c++)
+        {
             w[pool][c] = max(w[pool][c], item[c]);
+            demand[producer][c] = item[c] * items;
+        }
     }
+
+    /* The readers of one input record: the producer that owns it and the producers that share it. A reader without
+     * outputs has no declaration and adds nothing. */
+    memset(group, 0, sizeof(group));
+    memset(group_pool, 0, sizeof(group_pool));
+    for (producer = 0; producer < WG_POOL_MAX_DECLS; producer++)
+    {
+        if (!pools[producer])
+            continue;
+        j = input_of[producer] ? input_of[producer] - 1 : producer;
+        group_pool[j] = pools[producer];
+        for (c = 0; c < WG_POOL_COMPONENTS; c++)
+            group[j][c] += demand[producer][c];
+    }
+    for (j = 0; j < WG_POOL_MAX_DECLS; j++)
+        for (c = 0; group_pool[j] && c < WG_POOL_COMPONENTS; c++)
+            bound[group_pool[j]][c] = max(bound[group_pool[j]][c], group[j][c]);
 }
 
 /* Checks one region: aligned, at or after *end, inside used bytes. */
@@ -5760,65 +5803,155 @@ static bool workgraph_check_pool_region(const struct workgraph_pool_region *regi
     return valid;
 }
 
-/* Checks one layout and returns the records of each arena half. */
+#define WG_POOL_REGIONS (2 + 2 * (WG_POOL_LEVELS - 1))
+
+/* The regions that get a part of the arena, with the isolated size of each from W: the packed entries and the
+ * unrolled offsets (the largest W of the pools), then the payload of each pool half (W rounded up to 16 bytes). */
+static unsigned int workgraph_pool_regions(const struct workgraph_pool_graph *graph,
+        const struct workgraph_pool_layout *layout, const uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS],
+        const struct workgraph_pool_region **regions, uint64_t *isolated)
+{
+    unsigned int level, half, count = 2;
+
+    regions[0] = &layout->entries;
+    regions[1] = &layout->offsets;
+    isolated[0] = isolated[1] = 0;
+    for (level = 1; level < graph->levels; level++)
+    {
+        isolated[0] = max(isolated[0], w[level][WG_POOL_ENTRIES] * workgraph_pool_unit[WG_POOL_ENTRIES]);
+        isolated[1] = max(isolated[1], w[level][WG_POOL_OFFSETS] * workgraph_pool_unit[WG_POOL_OFFSETS]);
+        for (half = 0; half < 2; half++)
+        {
+            regions[count] = &layout->payload[level][half];
+            isolated[count++] = (w[level][WG_POOL_PAYLOAD] + 15) & ~(uint64_t)15;
+        }
+    }
+    return count;
+}
+
+/* Min from W, independently of the layouts of the engine: the fixed bookkeeping at 0, the packed entries and the
+ * unrolled offsets with the largest W of the pools, the empty-record state (no size yet), the payload of each pool half
+ * with W rounded up to 16 bytes and its sink, then the staging range at a multiple of 16 bytes, all rounded up to the
+ * 64 KiB granularity of the backing memory. */
+static uint64_t workgraph_pool_min(const struct workgraph_pool_graph *graph, const struct workgraph_pools *pools,
+        const uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS])
+{
+    uint64_t cursor, entries = 0, offsets = 0;
+    unsigned int level, half;
+
+    for (level = 1; level < graph->levels; level++)
+    {
+        entries = max(entries, w[level][WG_POOL_ENTRIES] * 8);
+        offsets = max(offsets, w[level][WG_POOL_OFFSETS] * 4);
+    }
+    cursor = pools->fixed_size;
+    cursor = ((cursor + 7) & ~(uint64_t)7) + entries;
+    cursor = ((cursor + 3) & ~(uint64_t)3) + offsets;
+    cursor = (cursor + 15) & ~(uint64_t)15;
+    for (level = 1; level < graph->levels; level++)
+    {
+        for (half = 0; half < 2; half++)
+        {
+            cursor = ((cursor + 15) & ~(uint64_t)15) + ((w[level][WG_POOL_PAYLOAD] + 15) & ~(uint64_t)15);
+            cursor = ((cursor + 15) & ~(uint64_t)15) + pools->sink_size;
+        }
+    }
+    cursor = ((cursor + 15) & ~(uint64_t)15) + pools->staging_size;
+    return (cursor + 65535) & ~(uint64_t)65535;
+}
+
+/* Checks one layout and returns the bytes that its regions have above their isolated sizes (the arena). */
 static uint64_t workgraph_check_pool_layout(const struct workgraph_pool_graph *graph, const struct workgraph_pools *pools,
         const struct workgraph_pool_layout *layout, const uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS],
         const uint64_t exact[WG_POOL_LEVELS][WG_POOL_COMPONENTS])
 {
-    const uint64_t unit = pools->arena_payload, used = layout->used;
-    unsigned int level, half, c;
-    uint64_t end, bytes, records;
+    const struct workgraph_pool_region *regions[WG_POOL_REGIONS], *last;
+    uint64_t end, isolated[WG_POOL_REGIONS], arena = 0, unused;
+    const uint64_t used = layout->used;
+    unsigned int level, half, count, a, b;
+    uint64_t total;
     char what[64];
 
     end = 0;
     workgraph_check_pool_region(&layout->fixed, 64, used, &end, "Fixed bookkeeping");
     ok(layout->fixed.size == pools->fixed_size, "Got fixed size %#"PRIx64".\n", layout->fixed.size);
+    /* The producers find the output guard, the last 32 bytes of the fixed bookkeeping, before the packed entries. */
+    workgraph_check_pool_region(&layout->entries, 8, used, &end, "Packed entries");
+    ok(layout->fixed.size >= 32 && layout->entries.offset == layout->fixed.offset + layout->fixed.size,
+            "The packed entries at %#"PRIx64" do not follow the fixed bookkeeping.\n", layout->entries.offset);
+    workgraph_check_pool_region(&layout->offsets, 4, used, &end, "Unrolled offsets");
     workgraph_check_pool_region(&layout->empty_state, 16, used, &end, "Empty-record state");
     ok(!layout->empty_state.size, "Got empty-record state size %#"PRIx64".\n", layout->empty_state.size);
 
     for (level = 1; level < graph->levels; level++)
     {
+        ok(layout->entries.size >= exact[level][WG_POOL_ENTRIES] * 8 &&
+                layout->offsets.size >= exact[level][WG_POOL_OFFSETS] * 4,
+                "Pool %u: the shared regions are below the spec bound.\n", level);
         for (half = 0; half < 2; half++)
         {
-            for (c = 0; c < WG_POOL_COMPONENTS; c++)
-            {
-                const struct workgraph_pool_region *region = &layout->isolated[level][half][c];
+            const struct workgraph_pool_region *payload = &layout->payload[level][half];
+            const struct workgraph_pool_region *sink = &layout->sink[level][half];
 
-                sprintf(what, "Pool %u half %u component %u", level, half, c);
-                workgraph_check_pool_region(region, workgraph_pool_alignment[c], used, &end, what);
-                bytes = w[level][c] * workgraph_pool_unit[c];
-                ok(region->size == bytes, "%s: expected %#"PRIx64" bytes, got %#"PRIx64".\n", what, bytes,
-                        region->size);
-                ok(region->size >= exact[level][c] * workgraph_pool_unit[c],
-                        "%s: %#"PRIx64" bytes is below the spec bound.\n", what, region->size);
-            }
+            sprintf(what, "Pool %u half %u payload", level, half);
+            workgraph_check_pool_region(payload, 16, used, &end, what);
+            ok(payload->size >= exact[level][WG_POOL_PAYLOAD], "%s: %#"PRIx64" bytes is below the spec bound.\n",
+                    what, payload->size);
+            sprintf(what, "Pool %u half %u sink", level, half);
+            workgraph_check_pool_region(sink, 16, used, &end, what);
+            /* The producers address the payload and the sink with 32-bit offsets from the start of the payload. */
+            ok(sink->offset == payload->offset + payload->size && sink->size == pools->sink_size &&
+                    payload->size + sink->size <= UINT32_MAX, "%s: %#"PRIx64" bytes at %#"PRIx64".\n", what,
+                    sink->size, sink->offset);
         }
     }
     for (level = graph->levels; level < WG_POOL_LEVELS; level++)
         for (half = 0; half < 2; half++)
-            for (c = 0; c < WG_POOL_COMPONENTS; c++)
-                ok(!layout->isolated[level][half][c].size, "Pool %u after the last level has %#"PRIx64" bytes.\n",
-                        level, layout->isolated[level][half][c].size);
-
-    /* The two arena halves hold the same number of records in each component. */
-    records = unit ? layout->arena[0][WG_POOL_PAYLOAD].size / unit : 0;
+            ok(!layout->payload[level][half].size && !layout->sink[level][half].size,
+                    "Pool %u after the last level has %#"PRIx64" bytes.\n", level, layout->payload[level][half].size);
     for (half = 0; half < 2; half++)
-    {
-        for (c = 0; c < WG_POOL_COMPONENTS; c++)
-        {
-            sprintf(what, "Arena half %u component %u", half, c);
-            workgraph_check_pool_region(&layout->arena[half][c], workgraph_pool_alignment[c], used, &end, what);
-            bytes = records * (c == WG_POOL_PAYLOAD ? unit : workgraph_pool_unit[c]);
-            ok(layout->arena[half][c].size == bytes, "%s: expected %#"PRIx64" bytes, got %#"PRIx64".\n", what,
-                    bytes, layout->arena[half][c].size);
-        }
-    }
+        ok(!layout->payload[0][half].size, "Level 0 has a pool of %#"PRIx64" bytes.\n", layout->payload[0][half].size);
 
     workgraph_check_pool_region(&layout->staging, 16, used, &end, "Staging");
     ok(layout->staging.size == pools->staging_size, "Got staging size %#"PRIx64".\n", layout->staging.size);
     ok(layout->staging.offset == ((used - pools->staging_size) & ~(uint64_t)15), "Got staging at %#"PRIx64".\n",
             layout->staging.offset);
-    return records;
+
+    /* Each region has at least its isolated size. The arena goes to the regions in proportion to their isolated sizes:
+     * a region with the larger isolated size never gets the smaller part, and only alignment is left unused. */
+    count = workgraph_pool_regions(graph, layout, w, regions, isolated);
+    total = 0;
+    for (a = 0; a < count; a++)
+    {
+        total += isolated[a];
+        ok(regions[a]->size >= isolated[a], "Region %u: %#"PRIx64" bytes, isolated %#"PRIx64".\n", a,
+                regions[a]->size, isolated[a]);
+        if (regions[a]->size < isolated[a])
+            return 0;
+        arena += regions[a]->size - isolated[a];
+        for (b = 0; b < count; b++)
+        {
+            if (isolated[a] >= isolated[b])
+                ok(regions[a]->size - isolated[a] >= regions[b]->size - isolated[b],
+                        "Region %u gets less of the arena than region %u.\n", a, b);
+        }
+    }
+    /* Each part is the arena x isolated / total, rounded down to 16 bytes: the sum of the parts is at most 16 bytes per
+     * region below the arena, so a part is at most 16 bytes per region away from its share of the sum. */
+    for (a = 0; total && a < count; a++)
+    {
+        double share = (double)arena * (double)isolated[a] / (double)total;
+        double part = (double)(regions[a]->size - isolated[a]);
+
+        ok(part <= share + 16.0 * (count + 1) && part + 16.0 * (count + 1) >= share,
+                "Region %u: %.0f arena bytes, its share is %.0f.\n", a, part, share);
+    }
+    last = graph->levels > 1 ? &layout->sink[graph->levels - 1][1] : &layout->empty_state;
+    unused = layout->staging.offset - (last->offset + last->size);
+    /* A graph without pool records has no region that grows. */
+    if (total)
+        ok(unused <= 32 * count + 16, "%#"PRIx64" bytes before the staging range are not used.\n", unused);
+    return arena;
 }
 
 static void workgraph_check_pool_layouts(const struct workgraph_pool_graph *graph, const struct workgraph_pools *pools,
@@ -5826,24 +5959,15 @@ static void workgraph_check_pool_layouts(const struct workgraph_pool_graph *grap
         const char *limits)
 {
     static const uint64_t granule = 65536;
-    uint64_t sum_payload = 0, sum_records = 0, unit, expected_size, expected_used, records[WG_POOL_LAYOUTS];
-    unsigned int n, level;
-
-    for (level = 1; level < graph->levels; level++)
-    {
-        sum_payload += w[level][WG_POOL_PAYLOAD];
-        sum_records += w[level][WG_POOL_ENTRIES];
-    }
-    unit = sum_records ? ((sum_payload / sum_records + !!(sum_payload % sum_records)) + 15) & ~(uint64_t)15 : 0;
-    ok(pools->arena_payload == unit, "Expected %"PRIu64" payload bytes per arena record, got %"PRIu64".\n", unit,
-            pools->arena_payload);
+    uint64_t expected_size, expected_used, arena[WG_POOL_LAYOUTS];
+    unsigned int n;
 
     for (n = 0; n < WG_POOL_LAYOUTS; n++)
     {
         const struct workgraph_pool_layout *layout = &pools->layouts[n];
 
         vkd3d_test_set_context("%s, %s, layout %u", graph->name, limits, n);
-        records[n] = 0;
+        arena[n] = 0;
         switch (n)
         {
             case 0: expected_size = pools->min_size - 16; break;
@@ -5859,88 +5983,163 @@ static void workgraph_check_pool_layouts(const struct workgraph_pool_graph *grap
                 layout->used);
         if (!n || layout->used != expected_used)
             continue;
-        records[n] = workgraph_check_pool_layout(graph, pools, layout, w, exact);
+        arena[n] = workgraph_check_pool_layout(graph, pools, layout, w, exact);
     }
     vkd3d_test_set_context("%s, %s", graph->name, limits);
 
-    /* At Min the arena is what the 64 KiB granularity leaves; one more granule gives it more records, unless Max is
-     * Min. The layout above Max is the layout at Max. */
-    ok(records[1] <= granule / 2 / (unit ? unit : 1), "Got %"PRIu64" arena records at Min.\n", records[1]);
-    if (unit && pools->max_size > pools->min_size)
-        ok(records[2] > records[1], "Expected more arena records at Min + 64 KiB, got %"PRIu64".\n", records[2]);
+    /* At Min the arena is what the 64 KiB granularity leaves; one more granule gives it more, unless Max is Min or no
+     * region can grow. The layout above Max is the layout at Max. */
+    ok(arena[1] < granule + 16, "Got %#"PRIx64" arena bytes at Min.\n", arena[1]);
+    if (pools->max_size > pools->min_size && graph->levels > 1)
+        ok(arena[2] > arena[1], "Expected more arena bytes at Min + 64 KiB, got %#"PRIx64".\n", arena[2]);
     else
-        ok(records[2] == records[1], "Expected the arena of Min, got %"PRIu64" records.\n", records[2]);
-    ok(records[3] >= records[2], "Got %"PRIu64" arena records at Max.\n", records[3]);
+        ok(arena[2] == arena[1], "Expected the arena of Min, got %#"PRIx64" bytes.\n", arena[2]);
+    ok(arena[3] >= arena[2], "Got %#"PRIx64" arena bytes at Max.\n", arena[3]);
     ok(!memcmp(&pools->layouts[4].used, &pools->layouts[3].used,
             sizeof(pools->layouts[3]) - offsetof(struct workgraph_pool_layout, used)),
             "The layout above Max is not the layout at Max.\n");
+}
+
+/* The state object of try_create_workgraph_pso() with one explicitly defined node, Reader of pool_shared_reader, whose
+ * first output gets MaxRecords 16 from a node output override. */
+static HRESULT workgraph_create_output_override_pso(struct test_context_workgraph *context, D3D12_SHADER_BYTECODE code,
+        ID3D12StateObject **pso)
+{
+    static const UINT max_records = 16;
+    D3D12_BROADCASTING_LAUNCH_OVERRIDES launch;
+    D3D12_NODE_OUTPUT_OVERRIDES output;
+    D3D12_GLOBAL_ROOT_SIGNATURE grs_desc;
+    D3D12_STATE_SUBOBJECT subobjects[3];
+    D3D12_STATE_OBJECT_DESC pso_desc;
+    D3D12_WORK_GRAPH_DESC wg_desc;
+    D3D12_DXIL_LIBRARY_DESC dxil;
+    D3D12_NODE node;
+
+    memset(&pso_desc, 0, sizeof(pso_desc));
+    memset(subobjects, 0, sizeof(subobjects));
+    memset(&dxil, 0, sizeof(dxil));
+    memset(&wg_desc, 0, sizeof(wg_desc));
+    memset(&launch, 0, sizeof(launch));
+    memset(&output, 0, sizeof(output));
+    memset(&node, 0, sizeof(node));
+    pso_desc.NumSubobjects = ARRAY_SIZE(subobjects);
+    pso_desc.pSubobjects = subobjects;
+    pso_desc.Type = D3D12_STATE_OBJECT_TYPE_EXECUTABLE;
+    grs_desc.pGlobalRootSignature = context->default_root_uav_rs;
+
+    subobjects[0].pDesc = &dxil;
+    subobjects[0].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    subobjects[1].pDesc = &wg_desc;
+    subobjects[1].Type = D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH;
+    subobjects[2].pDesc = &grs_desc;
+    subobjects[2].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+
+    output.OutputIndex = 0;
+    output.pMaxRecords = &max_records;
+    launch.NumOutputOverrides = 1;
+    launch.pOutputOverrides = &output;
+    node.NodeType = D3D12_NODE_TYPE_SHADER;
+    node.Shader.Shader = u"Reader";
+    node.Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_BROADCASTING_LAUNCH;
+    node.Shader.pBroadcastingLaunchOverrides = &launch;
+
+    dxil.DXILLibrary = code;
+    wg_desc.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
+    wg_desc.ProgramName = u"Dummy";
+    wg_desc.NumExplicitlyDefinedNodes = 1;
+    wg_desc.pExplicitlyDefinedNodes = &node;
+
+    *pso = NULL;
+    return ID3D12Device5_CreateStateObject(context->device, &pso_desc, &IID_ID3D12StateObject, (void **)pso);
 }
 
 void test_workgraph_drain_layout(void)
 {
     /* The lab flavour of the amdgpu-wddm engine computes the record pools of the draining scheduler at state object
      * creation: W of each pool (the worst-case output of one producer item into it, componentwise maximum over the
-     * producers), and a layout of the backing memory for each size from Min. Execution does not use them yet, so the
-     * memory requirements do not change, and the empty-record state has no size yet, so Min is not final. The test
-     * computes W from the declarations of the HLSL source, independently of the engine, and checks W and the layouts
-     * below Min, at Min, Min + 64 KiB + 8 bytes, Max and above Max: every region aligned, in order, inside the backing
-     * size, the isolated shares of each pool equal to its W and at least the spec bound, and the two halves equal.
-     * The hooks pool_records and pool_stride (AMDGPU_WDDM_WG_LIMITS) make Min larger than the requirement of today,
-     * so that Max is Min, and make W exceed 64 bits, so that the pools are not valid while the state object is.
-     * Nothing is dispatched. */
+     * producers), the record bound (the most that one record with all its groups can write into the next pool), and a
+     * layout of the backing memory for each size from Min. Execution does not use them yet, so the memory requirements
+     * do not change, and the empty-record state has no size yet, so Min is not final. The test computes W and the bound
+     * from the declarations of the HLSL source, independently of the engine, and checks them and the layouts below Min,
+     * at Min, Min + 64 KiB + 8 bytes, Max and above Max: every region aligned, in order, inside the backing size, each
+     * payload region with its sink directly after it, the packed entries directly after the output guard, each region
+     * at least its isolated size and the spec bound, and the arena shared in proportion. The hooks pool_records and
+     * pool_stride (AMDGPU_WDDM_WG_LIMITS) make Min larger than the requirement of today, so that Max is Min, and make a
+     * payload region exceed its 32-bit limit or W exceed 64 bits, so that the pools are not valid while the state
+     * object is. Nothing is dispatched. */
 #include "shaders/workgraph/headers/basic_recursion.h"
 #include "shaders/workgraph/headers/shared_inputs.h"
 #include "shaders/workgraph/headers/two_level_broadcast_node_array.h"
 #include "shaders/workgraph/headers/two_level_thread.h"
 #include "shaders/workgraph/headers/pool_shared.h"
 #include "shaders/workgraph/headers/pool_empty.h"
+#include "shaders/workgraph/headers/pool_shared_reader.h"
     static const struct workgraph_pool_graph graphs[] =
     {
-        /* Entry -> Mid (MaxRecords 1, 4 bytes) -> Leaf (MaxRecords 64, 256 bytes). */
-        { "level_sinks", &level_sinks_dxil, 3, { { 1, 0, false, 1, 4 }, { 2, 1, false, 64, 256 } }, 2 },
-        /* Two entry points (broadcasting), each MaxRecords 64 of 4 bytes into Child. */
-        { "output_zero_counts", &output_zero_counts_dxil, 2, { { 1, 0, false, 64, 4 }, { 1, 1, false, 64, 4 } }, 2 },
+        /* Entry (grid 8) -> Mid (grid 8, MaxRecords 1, 4 bytes) -> Leaf (MaxRecords 64, 256 bytes). */
+        { "level_sinks", &level_sinks_dxil, 3, { { 1, 0, false, 1, 4, 0, 8 }, { 2, 1, false, 64, 256, 0, 8 } }, 2 },
+        /* Two entry points (broadcasting, grid 1), each MaxRecords 64 of 4 bytes into Child. */
+        { "output_zero_counts", &output_zero_counts_dxil, 2,
+                { { 1, 0, false, 64, 4, 0, 1 }, { 1, 1, false, 64, 4, 0, 1 } }, 2 },
         /* A thread launch entry with MaxRecords 2 into Recursive, which recurses 6 times with MaxRecords 2: level 7,
          * the last depth, writes nothing. */
         { "basic_recursion", &basic_recursion_dxil, 8,
-                { { 1, 0, true, 2, 4 }, { 2, 1, true, 2, 4 }, { 3, 2, true, 2, 4 }, { 4, 3, true, 2, 4 },
-                { 5, 4, true, 2, 4 }, { 6, 5, true, 2, 4 }, { 7, 6, true, 2, 4 } }, 7 },
+                { { 1, 0, true, 2, 4, 0, 1 }, { 2, 1, true, 2, 4, 0, 1 }, { 3, 2, true, 2, 4, 0, 1 },
+                { 4, 3, true, 2, 4, 0, 1 }, { 5, 4, true, 2, 4, 0, 1 }, { 6, 5, true, 2, 4, 0, 1 },
+                { 7, 6, true, 2, 4, 0, 1 } }, 7 },
         /* A thread launch entry with MaxRecords 1 of 8 bytes into Broadcast, whose input TappedInput shares. */
-        { "shared_inputs", &shared_inputs_dxil, 2, { { 1, 0, true, 1, 8 } }, 1 },
-        /* MaxRecords 8 for a node array of 2 nodes with 12-byte records. */
-        { "two_level_broadcast_node_array", &two_level_broadcast_node_array_dxil, 2, { { 1, 0, false, 8, 12 } }, 1 },
-        /* MaxRecords 256 of 8 bytes, and MaxRecordsSharedWith it of 8 bytes. */
-        { "two_level_thread", &two_level_thread_dxil, 2, { { 1, 0, false, 256, 8 }, { 1, 0, false, 256, 8, 1 } }, 2 },
+        { "shared_inputs", &shared_inputs_dxil, 2, { { 1, 0, true, 1, 8, 0, 1 } }, 1 },
+        /* A broadcasting entry (NodeMaxDispatchGrid 256), MaxRecords 8 for a node array of 2 nodes with 12-byte
+         * records. */
+        { "two_level_broadcast_node_array", &two_level_broadcast_node_array_dxil, 2,
+                { { 1, 0, false, 8, 12, 0, 256 } }, 1 },
+        /* A broadcasting entry (NodeMaxDispatchGrid 256), MaxRecords 256 of 8 bytes, and MaxRecordsSharedWith it of
+         * 8 bytes. */
+        { "two_level_thread", &two_level_thread_dxil, 2,
+                { { 1, 0, false, 256, 8, 0, 256 }, { 1, 0, false, 256, 8, 1, 256 } }, 2 },
         /* MaxRecords 16 of 4 bytes and MaxRecordsSharedWith it of 64 bytes; MaxRecords 32 of an empty node and
          * MaxRecordsSharedWith it of 160 bytes. */
         { "pool_shared", &pool_shared_dxil, 2,
-                { { 1, 0, false, 16, 4 }, { 1, 0, false, 16, 64, 1 }, { 1, 0, false, 32, 0 },
-                { 1, 0, false, 32, 160, 3 } }, 4 },
-        /* Empty records only: W is 0. */
-        { "pool_empty", &pool_empty_dxil, 2, { { 1, 0, false, 8, 0 } }, 1 },
+                { { 1, 0, false, 16, 4, 0, 1 }, { 1, 0, false, 16, 64, 1, 1 }, { 1, 0, false, 32, 0, 0, 1 },
+                { 1, 0, false, 32, 160, 3, 1 } }, 4 },
+        /* Empty records only: 4 payload bytes and one unrolled offset each, no packed entries. */
+        { "pool_empty", &pool_empty_dxil, 2, { { 1, 0, false, 8, 0, 0, 1 } }, 1 },
         /* One level, no pool. */
         { "empty_count64", &empty_count64_dxil, 1, { { 0 } }, 0 },
+        /* Entry (grid 1) -> Reader (grid 2, MaxRecords 2 of 16 bytes) and Tapped (grid 3, NodeShareInputOf Reader,
+         * MaxRecords 8 of 64 bytes): W of pool 2 is the W of the shared reader, and the bound adds both readers. */
+        { "pool_shared_reader", &pool_shared_reader_dxil, 3,
+                { { 1, 0, false, 1, 4, 0, 1 }, { 2, 1, false, 2, 16, 0, 2 }, { 2, 2, false, 8, 64, 0, 3, 2 } }, 3 },
     };
     static const struct
     {
         unsigned int graph;
         const char *limits;
         uint32_t records, stride;
-        bool valid;
+        bool valid, max_is_min, output_override;
     }
     tests[] =
     {
         { 0, NULL, 0, 0, true }, { 1, NULL, 0, 0, true }, { 2, NULL, 0, 0, true }, { 3, NULL, 0, 0, true },
         { 4, NULL, 0, 0, true }, { 5, NULL, 0, 0, true }, { 6, NULL, 0, 0, true }, { 7, NULL, 0, 0, true },
         { 8, NULL, 0, 0, true },
-        /* 2^52 payload bytes in each pool: Min is above the requirement of today, so Max is Min. */
-        { 0, "pool_records=4294967295,pool_stride=1048576", 4294967295u, 1048576, true },
-        { 6, "pool_records=4294967295,pool_stride=1048576", 4294967295u, 1048576, true },
+        /* One record per output: the unrolled offsets take 4 bytes, so the next region needs its alignment. */
+        { 0, "pool_records=1", 1, 0, true },
+        /* 256 MiB and 768 MiB payload regions: Min is above the requirement of today, so Max is Min. */
+        { 0, "pool_records=4096,pool_stride=65536", 4096, 65536, true, true },
+        { 6, "pool_records=4096,pool_stride=65536", 4096, 65536, true, true },
+        /* 4 GiB for one output: the payload region and its sink exceed the 32-bit limit. */
+        { 0, "pool_records=65536,pool_stride=65536", 65536, 65536, false },
         /* About 2^64 payload bytes for one output: the pools do not fit in 64 bits, for a group and for a wave. */
         { 0, "pool_records=4294967295,pool_stride=4294967280", 4294967295u, 4294967280u, false },
         { 2, "pool_records=4294967295,pool_stride=4294967280", 4294967295u, 4294967280u, false },
+        { 9, NULL, 0, 0, true },
+        /* The engine does not apply node output overrides: its metadata does not describe this graph, so the pools
+         * are not valid while the state object is. */
+        { 9, "output override", 0, 0, false, false, true },
     };
     uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS], exact[WG_POOL_LEVELS][WG_POOL_COMPONENTS];
+    uint64_t bound[WG_POOL_LEVELS][WG_POOL_COMPONENTS], exact_bound[WG_POOL_LEVELS][WG_POOL_COMPONENTS];
     D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs, default_reqs[ARRAY_SIZE(graphs)];
     struct test_context_workgraph context;
     ID3D12WorkGraphProperties *props;
@@ -5969,9 +6168,16 @@ void test_workgraph_drain_layout(void)
         if (tests[i].limits && !frame)
             continue;
         vkd3d_test_set_context("%s, %s", graph->name, limits);
-        workgraph_set_limits(tests[i].limits);
-        hr = try_create_workgraph_pso(&context, *graph->code, NULL, &pso);
-        workgraph_set_limits(NULL);
+        if (tests[i].output_override)
+        {
+            hr = workgraph_create_output_override_pso(&context, *graph->code, &pso);
+        }
+        else
+        {
+            workgraph_set_limits(tests[i].limits);
+            hr = try_create_workgraph_pso(&context, *graph->code, NULL, &pso);
+            workgraph_set_limits(NULL);
+        }
         ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
         if (!pso)
             continue;
@@ -5984,7 +6190,7 @@ void test_workgraph_drain_layout(void)
         /* The pools do not change the requirements: the default rows of each graph come first. */
         if (!tests[i].limits)
             default_reqs[tests[i].graph] = wg_reqs;
-        else
+        else if (!tests[i].output_override)
             ok(wg_reqs.MinSizeInBytes == default_reqs[tests[i].graph].MinSizeInBytes &&
                     wg_reqs.MaxSizeInBytes == default_reqs[tests[i].graph].MaxSizeInBytes,
                     "The hooks changed the requirements to %#"PRIx64" to %#"PRIx64".\n",
@@ -6007,14 +6213,16 @@ void test_workgraph_drain_layout(void)
             continue;
         }
         ok(pools->pools == graph->levels, "Expected %u levels, got %u.\n", graph->levels, pools->pools);
+        ok(!pools->execution, "Execution uses the pools.\n");
+        ok(pools->sink_size >= 65536 && !(pools->sink_size % 16), "Got sink size %#"PRIx64".\n", pools->sink_size);
         if (pools->pools != graph->levels)
         {
             ID3D12StateObject_Release(pso);
             continue;
         }
 
-        workgraph_pool_oracle(graph, false, tests[i].records, tests[i].stride, w);
-        workgraph_pool_oracle(graph, true, tests[i].records, tests[i].stride, exact);
+        workgraph_pool_oracle(graph, false, tests[i].records, tests[i].stride, w, bound);
+        workgraph_pool_oracle(graph, true, tests[i].records, tests[i].stride, exact, exact_bound);
         for (level = 0; level < WG_POOL_LEVELS; level++)
         {
             for (c = 0; c < WG_POOL_COMPONENTS; c++)
@@ -6023,14 +6231,18 @@ void test_workgraph_drain_layout(void)
                         level, c, w[level][c], pools->w[level][c]);
                 ok(w[level][c] >= exact[level][c], "Pool %u component %u: W %"PRIu64" is below the spec bound %"
                         PRIu64".\n", level, c, w[level][c], exact[level][c]);
+                ok(pools->bound[level][c] == bound[level][c], "Pool %u component %u: expected record bound %"PRIu64
+                        ", got %"PRIu64".\n", level, c, bound[level][c], pools->bound[level][c]);
             }
         }
 
         /* Min is a multiple of 64 KiB, and Max is the requirement of today, or Min if it is larger. */
         ok(pools->min_size && !(pools->min_size % 65536), "Got Min %#"PRIx64".\n", pools->min_size);
+        ok(pools->min_size == workgraph_pool_min(graph, pools, w), "Expected Min %#"PRIx64", got %#"PRIx64".\n",
+                workgraph_pool_min(graph, pools, w), pools->min_size);
         ok(pools->max_size == max(pools->min_size, (uint64_t)wg_reqs.MaxSizeInBytes),
                 "Got Max %#"PRIx64", requirement %#"PRIx64".\n", pools->max_size, (uint64_t)wg_reqs.MaxSizeInBytes);
-        if (tests[i].limits)
+        if (tests[i].max_is_min)
             ok(pools->max_size == pools->min_size, "Expected Max = Min, got %#"PRIx64".\n", pools->max_size);
         trace("%s, %s: Min %#"PRIx64", Max %#"PRIx64", requirements %#"PRIx64" to %#"PRIx64".\n", graph->name, limits,
                 pools->min_size, pools->max_size, (uint64_t)wg_reqs.MinSizeInBytes, (uint64_t)wg_reqs.MaxSizeInBytes);
