@@ -117,6 +117,7 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/empty_entry.h"
 #include "shaders/workgraph/headers/track_rw_entry.h"
 #include "shaders/workgraph/headers/multi_input_count.h"
+#include "shaders/workgraph/headers/level_count.h"
 #include "shaders/workgraph/headers/empty_count64.h"
 
 /* is_vkd3d_proton_device() is always false in the Windows build of the tests, also with the vkd3d-proton DLLs next
@@ -2314,6 +2315,143 @@ out:
     destroy_workgraph_test_context(&context);
 }
 
+/* amdgpu-wddm fork, lab flavour: GetPrivateData of a work graph state object with this GUID gives the
+ * struct workgraph_lost_records of all its executions so far. The engine has the same GUID
+ * (AMDGPU_WDDM_WG_STATUS_GUID in libs/vkd3d/workgraphs.c). */
+static const GUID workgraph_status_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x05 } };
+
+struct workgraph_lost_records
+{
+    uint64_t events; /* DispatchGraph calls that lost records. */
+    uint64_t records; /* Records that these calls did not launch. */
+};
+
+void test_workgraph_multi_gpu_input_lost_records(void)
+{
+    /* The merge slot of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT has a fixed staging range in the backing memory.
+     * Records that do not fit are not launched. The amdgpu-wddm engine must then report the loss: an ERR line,
+     * and in the lab flavour the counts through GetPrivateData. With "staging=4096", 16 records of 256 bytes fit.
+     * The cases launch at most 200 records. Native drivers launch all records, so only the sums are checked
+     * there. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"EntryA", 0 }, { u"EntryB", 0 } };
+    static const struct
+    {
+        const char *name;
+        unsigned int inputs; /* Inputs of one record each, to EntryA. */
+        uint64_t lost_events, lost_records;
+    }
+    tests[] =
+    {
+        { "16 records fit", 16, 0, 0 },
+        { "100 records, 84 lost", 100, 1, 84 },
+        { "200 records, 184 lost", 200, 2, 268 },
+    };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct workgraph_count_input inputs[200];
+    D3D12_NODE_GPU_INPUT node_inputs[200];
+    struct workgraph_multi_input multi;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct workgraph_lost_records lost;
+    uint32_t expected[8], values[8];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *scratch;
+    ID3D12Resource *records;
+    ID3D12Resource *output;
+    UINT entry_index[2];
+    ID3D12StateObject *pso;
+    unsigned int i, j;
+    bool is_engine;
+    UINT size;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    is_engine = workgraph_is_vkd3d_proton(context.device);
+
+    workgraph_set_multi_input_config("staging=4096");
+    hr = try_create_workgraph_pso(&context, multi_input_count_dxil, NULL, &pso);
+    workgraph_set_multi_input_config(NULL);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        goto out_pso;
+
+    records = workgraph_create_count_records(&context, ARRAY_SIZE(inputs), WG_COUNT_RECORD_SIZE, 1);
+    for (i = 0; i < ARRAY_SIZE(inputs); i++)
+    {
+        inputs[i].entry = 0;
+        inputs[i].first = i;
+        inputs[i].count = 1;
+        inputs[i].repeat = false;
+        node_inputs[i].EntrypointIndex = entry_index[0];
+        node_inputs[i].NumRecords = 1;
+        node_inputs[i].Records.StartAddress = ID3D12Resource_GetGPUVirtualAddress(records) +
+                (UINT64)i * WG_COUNT_RECORD_SIZE;
+        node_inputs[i].Records.StrideInBytes = WG_COUNT_RECORD_SIZE;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("%s", tests[i].name);
+
+        memset(expected, 0, sizeof(expected));
+        for (j = 0; j < tests[i].inputs; j++)
+            workgraph_count_expected(&inputs[j], 1, 1, expected);
+        workgraph_create_multi_input(&context, node_inputs, tests[i].inputs, tests[i].inputs, 32, &multi);
+
+        scratch = workgraph_create_backing_memory(&context, &wg_reqs);
+        output = create_default_buffer(context.context.device, 4 * 1024,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+        dispatch_desc.MultiNodeGPUInput = multi.va;
+        workgraph_record_dispatch(&context, context.context.list, &ident, scratch, wg_reqs.MinSizeInBytes,
+                output, &dispatch_desc);
+        workgraph_read_output(&context, output, values, ARRAY_SIZE(values));
+
+        memset(&lost, 0, sizeof(lost));
+        size = sizeof(lost);
+        hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_status_guid, &size, &lost);
+        if (is_engine)
+        {
+            /* The engine launches the records that fit, and reports the others. */
+            ok(hr == S_OK && size == sizeof(lost), "The engine does not report lost records, hr #%x.\n", (int)hr);
+            ok(lost.events == tests[i].lost_events, "Expected %"PRIu64" events with lost records, got %"PRIu64".\n",
+                    tests[i].lost_events, lost.events);
+            ok(lost.records == tests[i].lost_records, "Expected %"PRIu64" lost records, got %"PRIu64".\n",
+                    tests[i].lost_records, lost.records);
+            ok(values[0] + (uint32_t)(lost.records - (i ? tests[i - 1].lost_records : 0)) == expected[0],
+                    "Expected %u launched and lost records, got %u launched.\n", expected[0], values[0]);
+        }
+        else
+        {
+            for (j = 0; j < ARRAY_SIZE(values); j++)
+                ok(values[j] == expected[j], "Value %u: expected %u, got %u.\n", j, expected[j], values[j]);
+        }
+
+        if (scratch)
+            ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+        ID3D12Resource_Release(multi.buffer);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    ID3D12Resource_Release(records);
+out_pso:
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
 void test_workgraph_multi_gpu_input_two_queues(void)
 {
     /* Two queues execute the same work graph at the same time, each with its own backing memory, inputs and
@@ -2442,6 +2580,144 @@ void test_workgraph_multi_gpu_input_two_queues(void)
             ID3D12Resource_Release(scratch[i]);
         ID3D12Resource_Release(multi[i].buffer);
         ID3D12Resource_Release(records[i]);
+        ID3D12GraphicsCommandList_Release(lists[i]);
+        ID3D12CommandAllocator_Release(allocators[i]);
+        ID3D12CommandQueue_Release(queues[i]);
+    }
+out_pso:
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+/* Fills count records of WG_COUNT_RECORD_SIZE bytes in CPU memory: record i has the value (i % 7) + 1 in its first
+ * dword and tail in its last dword, as workgraph_create_count_records() does in GPU memory. */
+static uint8_t *workgraph_create_cpu_count_records(unsigned int count, uint32_t tail)
+{
+    uint8_t *data;
+    unsigned int i;
+
+    data = calloc(count, WG_COUNT_RECORD_SIZE);
+    for (i = 0; i < count; i++)
+    {
+        uint32_t value = (i % 7) + 1;
+
+        memcpy(data + (size_t)i * WG_COUNT_RECORD_SIZE, &value, sizeof(value));
+        memcpy(data + (size_t)i * WG_COUNT_RECORD_SIZE + WG_COUNT_RECORD_SIZE - 4, &tail, sizeof(tail));
+    }
+    return data;
+}
+
+void test_workgraph_two_queues_levels(void)
+{
+    /* Two queues execute the same work graph at the same time, each with its own backing memory, inputs and
+     * output (WorkGraphs.md: each set of backing memory is an independent state of work graph execution, and
+     * command lists on parallel queues can use the same work graph with different backing memory). The graph has
+     * two levels: each entry point sends its record to a node of the second level, which counts it. So the records
+     * of the second level are in the payload memory of the execution. The records of the two executions have
+     * different tail values, so that records that one execution takes from the other change the sums. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"EntryA", 0 }, { u"EntryB", 0 } };
+    static const struct workgraph_count_input inputs[2] = { { 0, 0, 1500 }, { 1, 1500, 700 } };
+    static const uint32_t tails[2] = { 1, 3 };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    ID3D12CommandAllocator *allocators[2];
+    ID3D12GraphicsCommandList *lists[2];
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    D3D12_NODE_CPU_INPUT cpu_inputs[2][2];
+    ID3D12Resource *scratch[2], *output[2];
+    ID3D12CommandQueue *queues[2];
+    uint32_t expected[8], values[8];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    unsigned int i, j, k, iter;
+    uint8_t *records[2];
+    ID3D12StateObject *pso;
+    UINT entry_index[2];
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    hr = try_create_workgraph_pso(&context, level_count_dxil, NULL, &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        goto out_pso;
+
+    for (i = 0; i < 2; i++)
+    {
+        queues[i] = create_command_queue(context.context.device, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                D3D12_COMMAND_QUEUE_PRIORITY_NORMAL);
+        hr = ID3D12Device_CreateCommandAllocator(context.context.device, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                &IID_ID3D12CommandAllocator, (void **)&allocators[i]);
+        ok(hr == S_OK, "Failed to create command allocator, hr #%x.\n", (int)hr);
+        hr = ID3D12Device_CreateCommandList(context.context.device, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                allocators[i], NULL, &IID_ID3D12GraphicsCommandList, (void **)&lists[i]);
+        ok(hr == S_OK, "Failed to create command list, hr #%x.\n", (int)hr);
+
+        records[i] = workgraph_create_cpu_count_records(2200, tails[i]);
+        for (j = 0; j < ARRAY_SIZE(inputs); j++)
+        {
+            cpu_inputs[i][j].EntrypointIndex = entry_index[inputs[j].entry];
+            cpu_inputs[i][j].NumRecords = inputs[j].count;
+            cpu_inputs[i][j].pRecords = records[i] + (size_t)inputs[j].first * WG_COUNT_RECORD_SIZE;
+            cpu_inputs[i][j].RecordStrideInBytes = WG_COUNT_RECORD_SIZE;
+        }
+        scratch[i] = workgraph_create_backing_memory(&context, &wg_reqs);
+    }
+
+    for (iter = 0; iter < 4; iter++)
+    {
+        vkd3d_test_set_context("Iteration %u", iter);
+
+        for (i = 0; i < 2; i++)
+        {
+            output[i] = create_default_buffer(context.context.device, 4 * 1024,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+            dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_CPU_INPUT;
+            dispatch_desc.MultiNodeCPUInput.NumNodeInputs = ARRAY_SIZE(inputs);
+            dispatch_desc.MultiNodeCPUInput.pNodeInputs = cpu_inputs[i];
+            dispatch_desc.MultiNodeCPUInput.NodeInputStrideInBytes = sizeof(cpu_inputs[i][0]);
+            workgraph_record_dispatch(&context, lists[i], &ident, scratch[i], wg_reqs.MinSizeInBytes,
+                    output[i], &dispatch_desc);
+            hr = ID3D12GraphicsCommandList_Close(lists[i]);
+            ok(hr == S_OK, "Failed to close command list, hr #%x.\n", (int)hr);
+        }
+
+        /* Both executions are submitted before either is waited for. */
+        for (i = 0; i < 2; i++)
+            exec_command_list(queues[i], lists[i]);
+        for (i = 0; i < 2; i++)
+            wait_queue_idle(context.context.device, queues[i]);
+
+        for (i = 0; i < 2; i++)
+        {
+            memset(expected, 0, sizeof(expected));
+            for (j = 0; j < ARRAY_SIZE(inputs); j++)
+                workgraph_count_expected(&inputs[j], 1, tails[i], expected);
+
+            workgraph_read_output(&context, output[i], values, ARRAY_SIZE(values));
+            for (k = 0; k < ARRAY_SIZE(values); k++)
+                ok(values[k] == expected[k], "Queue %u, value %u: expected %u, got %u.\n", i, k, expected[k], values[k]);
+
+            ID3D12Resource_Release(output[i]);
+            reset_command_list(lists[i], allocators[i]);
+        }
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    for (i = 0; i < 2; i++)
+    {
+        if (scratch[i])
+            ID3D12Resource_Release(scratch[i]);
+        free(records[i]);
         ID3D12GraphicsCommandList_Release(lists[i]);
         ID3D12CommandAllocator_Release(allocators[i]);
         ID3D12CommandQueue_Release(queues[i]);
