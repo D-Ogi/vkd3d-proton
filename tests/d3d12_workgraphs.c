@@ -104,6 +104,11 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/rw_entry_input.h"
 #include "shaders/workgraph/headers/depth_limit_32.h"
 #include "shaders/workgraph/headers/depth_limit_33.h"
+#include "shaders/workgraph/headers/lrat_order.h"
+#include "shaders/workgraph/headers/sparse_self_recursion.h"
+#include "shaders/workgraph/headers/scalar_self_recursion.h"
+#include "shaders/workgraph/headers/empty_entry.h"
+#include "shaders/workgraph/headers/track_rw_entry.h"
 
 /* The stride 0 cases are skipped on AMD because they hang the GPU with AMD's own driver. A different driver with
  * the AMD vendor ID can run them: set VKD3D_TEST_WORKGRAPH_AMD_STRIDE_0=1. */
@@ -1286,6 +1291,352 @@ void test_workgraph_create_failure(void)
         ID3D12StateObject_Release(pso);
 
     destroy_workgraph_test_context(&context);
+}
+
+static HRESULT create_workgraph_pso_nodes(struct test_context_workgraph *context, D3D12_SHADER_BYTECODE code,
+        const D3D12_NODE *nodes, unsigned int nodes_count, ID3D12StateObject **pso)
+{
+    D3D12_GLOBAL_ROOT_SIGNATURE grs_desc;
+    D3D12_STATE_SUBOBJECT subobjects[3];
+    D3D12_STATE_OBJECT_DESC pso_desc;
+    D3D12_WORK_GRAPH_DESC wg_desc;
+    D3D12_DXIL_LIBRARY_DESC dxil;
+
+    memset(&pso_desc, 0, sizeof(pso_desc));
+    memset(subobjects, 0, sizeof(subobjects));
+    memset(&dxil, 0, sizeof(dxil));
+    memset(&wg_desc, 0, sizeof(wg_desc));
+    pso_desc.NumSubobjects = ARRAY_SIZE(subobjects);
+    pso_desc.pSubobjects = subobjects;
+    pso_desc.Type = D3D12_STATE_OBJECT_TYPE_EXECUTABLE;
+    grs_desc.pGlobalRootSignature = context->default_root_uav_rs;
+
+    subobjects[0].pDesc = &dxil;
+    subobjects[0].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    subobjects[1].pDesc = &wg_desc;
+    subobjects[1].Type = D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH;
+    subobjects[2].pDesc = &grs_desc;
+    subobjects[2].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+
+    dxil.DXILLibrary = code;
+    wg_desc.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
+    wg_desc.ProgramName = u"Dummy";
+    wg_desc.NumExplicitlyDefinedNodes = nodes_count;
+    wg_desc.pExplicitlyDefinedNodes = nodes;
+
+    *pso = NULL;
+    return ID3D12Device5_CreateStateObject(context->device, &pso_desc, &IID_ID3D12StateObject, (void **)pso);
+}
+
+/* Runs one DispatchGraph with CPU input to entry point 0 and reads back the first 16 values of the output UAV. */
+static void workgraph_run_cpu_input(struct test_context_workgraph *context, ID3D12StateObject *pso,
+        const void *records, size_t stride, size_t count,
+        const D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE *local_root_table, uint32_t *values)
+{
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    ID3D12StateObjectProperties1 *props1;
+    ID3D12WorkGraphProperties *props;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *scratch = NULL;
+    struct resource_readback rb;
+    ID3D12Resource *output;
+    unsigned int i;
+    HRESULT hr;
+
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12StateObjectProperties1, (void **)&props1);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12StateObjectProperties1, hr #%x.\n", (int)hr);
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+    ident = ID3D12StateObjectProperties1_GetProgramIdentifier(props1, u"Dummy");
+    ID3D12WorkGraphProperties_GetWorkGraphMemoryRequirements(props, 0, &wg_reqs);
+    ID3D12WorkGraphProperties_Release(props);
+    ID3D12StateObjectProperties1_Release(props1);
+
+    ID3D12GraphicsCommandList_SetComputeRootSignature(context->context.list, context->default_root_uav_rs);
+    output = create_default_buffer(context->context.device, 4 * 1024,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(context->context.list, 0,
+            ID3D12Resource_GetGPUVirtualAddress(output));
+
+    execute_workgraph_pso_simple(context, pso, &ident, &wg_reqs, records, stride, count, local_root_table, &scratch);
+
+    transition_resource_state(context->context.list, output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    get_buffer_readback_with_command_list(output, DXGI_FORMAT_R32_UINT, &rb,
+            context->context.queue, context->context.list);
+    reset_command_list(context->context.list, context->context.allocator);
+    for (i = 0; i < 16; i++)
+        values[i] = get_readback_uint(&rb, i, 0, 0);
+
+    release_resource_readback(&rb);
+    if (scratch)
+        ID3D12Resource_Release(scratch);
+    ID3D12Resource_Release(output);
+}
+
+void test_workgraph_lrat_order(void)
+{
+    /* Default local root arguments table indices are given in the order of graph population: the explicitly
+     * defined nodes first, then the listed entry points, then INCLUDE_ALL_AVAILABLE_NODES in export order
+     * (WorkGraphs.md, D3D12_WORK_GRAPH_DESC and [NodeLocalRootArgumentsTableIndex]). C has the explicit index 0.
+     * The explicitly defined nodes are B, then A, so B gets 1 and A gets 2. Each table record holds a different
+     * constant, and each node adds its constant to its own UAV element. */
+    static const uint32_t local_data[3][4] = { { 100 }, { 200 }, { 300 } };
+    static const struct
+    {
+        const WCHAR *name;
+        uint32_t index;
+        uint32_t uav;
+    } expected[] =
+    {
+        { u"A", 2, 0 },
+        { u"B", 1, 1 },
+        { u"C", 0, 2 },
+    };
+    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE local_table;
+    D3D12_THREAD_LAUNCH_OVERRIDES overrides;
+    struct test_context_workgraph context;
+    ID3D12WorkGraphProperties *props;
+    D3D12_NODE nodes[2];
+    ID3D12StateObject *pso;
+    ID3D12Resource *local;
+    uint32_t values[16];
+    D3D12_NODE_ID id;
+    unsigned int i;
+    UINT index;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    memset(&overrides, 0, sizeof(overrides));
+    memset(nodes, 0, sizeof(nodes));
+    for (i = 0; i < ARRAY_SIZE(nodes); i++)
+    {
+        nodes[i].NodeType = D3D12_NODE_TYPE_SHADER;
+        nodes[i].Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_THREAD_LAUNCH;
+        nodes[i].Shader.pThreadLaunchOverrides = &overrides;
+    }
+    nodes[0].Shader.Shader = u"B";
+    nodes[1].Shader.Shader = u"A";
+
+    hr = create_workgraph_pso_nodes(&context, lrat_order_dxil, nodes, ARRAY_SIZE(nodes), &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+    for (i = 0; i < ARRAY_SIZE(expected); i++)
+    {
+        id.Name = expected[i].name;
+        id.ArrayIndex = 0;
+        index = ID3D12WorkGraphProperties_GetNodeIndex(props, 0, id);
+        index = ID3D12WorkGraphProperties_GetNodeLocalRootArgumentsTableIndex(props, 0, index);
+        ok(index == expected[i].index, "Node %u: expected table index %u, got %u.\n", i, expected[i].index, index);
+    }
+    ID3D12WorkGraphProperties_Release(props);
+
+    local = create_upload_buffer(context.context.device, sizeof(local_data), local_data);
+    local_table.StartAddress = ID3D12Resource_GetGPUVirtualAddress(local);
+    local_table.StrideInBytes = sizeof(local_data[0]);
+    local_table.SizeInBytes = sizeof(local_data);
+    workgraph_run_cpu_input(&context, pso, NULL, 0, 1, &local_table, values);
+
+    for (i = 0; i < ARRAY_SIZE(expected); i++)
+    {
+        ok(values[expected[i].uav] == local_data[expected[i].index][0], "Node %u: expected %u, got %u.\n",
+                i, local_data[expected[i].index][0], values[expected[i].uav]);
+    }
+
+    ID3D12Resource_Release(local);
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+void test_workgraph_array_self_recursion(void)
+{
+    /* N[1] is the only element of the node array N and has NodeMaxRecursionDepth(1). It recurses through
+     * element 1 of a sparse output array of N (element 0 is a hole), or through a scalar output to N[1]. A node
+     * may target itself, but not another node of its own array (WorkGraphs.md, Node array constraints).
+     * Depth 0 adds GetRemainingRecursionLevels() + 1 = 2 to RWBuf[0], depth 1 adds 1 to RWBuf[1]. */
+    static const uint32_t record = 0;
+    static const struct
+    {
+        const char *name;
+        D3D12_SHADER_BYTECODE code;
+    } tests[] =
+    {
+        { "sparse output array", { sparse_self_recursion_code_dxil, sizeof(sparse_self_recursion_code_dxil) } },
+        { "scalar output", { scalar_self_recursion_code_dxil, sizeof(scalar_self_recursion_code_dxil) } },
+    };
+    struct test_context_workgraph context;
+    ID3D12StateObject *pso;
+    uint32_t values[16];
+    unsigned int i;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("%s", tests[i].name);
+        hr = try_create_workgraph_pso(&context, tests[i].code, NULL, &pso);
+        ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+        if (FAILED(hr))
+            continue;
+
+        workgraph_run_cpu_input(&context, pso, &record, sizeof(record), 1, NULL, values);
+        ok(values[0] == 2, "Depth 0: expected 2, got %u.\n", values[0]);
+        ok(values[1] == 1, "Depth 1: expected 1, got %u.\n", values[1]);
+        ok(values[2] == 0, "Depth 2: expected 0, got %u.\n", values[2]);
+        ID3D12StateObject_Release(pso);
+    }
+    vkd3d_test_set_context(NULL);
+
+    destroy_workgraph_test_context(&context);
+}
+
+void test_workgraph_empty_cpu_input(void)
+{
+    /* For an empty input record, pRecords and RecordStrideInBytes of D3D12_NODE_CPU_INPUT are ignored
+     * (WorkGraphs.md, D3D12_NODE_CPU_INPUT). With pRecords NULL and each stride, the entry point must run once
+     * for each record. */
+    static const uint32_t strides[] = { 0, 4, 16, 4096 };
+    struct test_context_workgraph context;
+    ID3D12StateObject *pso;
+    uint32_t values[16];
+    unsigned int i;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    hr = try_create_workgraph_pso(&context, empty_entry_dxil, NULL, &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(strides); i++)
+    {
+        vkd3d_test_set_context("stride %u", strides[i]);
+        workgraph_run_cpu_input(&context, pso, NULL, strides[i], 37, NULL, values);
+        ok(values[0] == 37, "Expected 37 launches, got %u.\n", values[0]);
+    }
+    vkd3d_test_set_context(NULL);
+
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+void test_workgraph_cpu_input_extent(void)
+{
+    /* The CPU input of an entry point must read only the application's record bytes. The last record is at the
+     * end of a page, and the next page is not accessible.
+     * rw_entry_input has a 4-byte record. With a stride of 16, the last record has no padding after it.
+     * track_rw_entry has a 4-byte record with [NodeTrackRWInputSharing]. The internal word of an implementation is
+     * not part of the application's record, so GetEntrypointRecordSizeInBytes() must report 4. Native NVIDIA
+     * refuses this state object with E_INVALIDARG; the cases then do not run. */
+#ifdef _WIN32
+    static const struct
+    {
+        const char *name;
+        bool tracked;
+        uint32_t stride;
+        uint32_t count;
+    } tests[] =
+    {
+        { "record, stride 4", false, 4, 3 },
+        { "record, stride 16", false, 16, 2 },
+        { "tracked record, stride 4", true, 4, 3 },
+        { "tracked record, stride 16", true, 16, 2 },
+        { "tracked record, stride 0", true, 0, 5 },
+    };
+    struct test_context_workgraph context;
+    ID3D12StateObject *pso[2] = { NULL };
+    uint32_t values[16], *records;
+    ID3D12WorkGraphProperties *props;
+    SYSTEM_INFO info;
+    DWORD old_protect;
+    unsigned int i, j;
+    uint8_t *pages;
+    size_t span;
+    UINT size;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    GetSystemInfo(&info);
+    pages = VirtualAlloc(NULL, 2 * info.dwPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ok(!!pages, "Failed to allocate pages.\n");
+    if (!pages)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    VirtualProtect(pages + info.dwPageSize, info.dwPageSize, PAGE_NOACCESS, &old_protect);
+
+    hr = try_create_workgraph_pso(&context, rw_entry_input_dxil, NULL, &pso[0]);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+
+    hr = try_create_workgraph_pso(&context, track_rw_entry_dxil, NULL, &pso[1]);
+    if (is_vkd3d_proton_device((ID3D12Device *)context.device))
+        ok(hr == S_OK, "Failed to create the tracked state object, hr #%x.\n", (int)hr);
+    else
+        ok(hr == S_OK || hr == E_INVALIDARG, "Tracked state object: unexpected hr #%x.\n", (int)hr);
+    if (pso[1])
+    {
+        hr = ID3D12StateObject_QueryInterface(pso[1], &IID_ID3D12WorkGraphProperties, (void **)&props);
+        ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+        size = ID3D12WorkGraphProperties_GetEntrypointRecordSizeInBytes(props, 0, 0);
+        ok(size == 4, "Expected record size 4, got %u.\n", size);
+        ID3D12WorkGraphProperties_Release(props);
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        if (!pso[tests[i].tracked])
+            continue;
+        vkd3d_test_set_context("%s", tests[i].name);
+
+        span = tests[i].stride ? (tests[i].count - 1) * tests[i].stride + 4 : 4;
+        records = (uint32_t *)(pages + info.dwPageSize - span);
+        for (j = 0; j < (tests[i].stride ? tests[i].count : 1); j++)
+            records[j * tests[i].stride / 4] = 3 + j;
+
+        workgraph_run_cpu_input(&context, pso[tests[i].tracked], records, tests[i].stride, tests[i].count,
+                NULL, values);
+        for (j = 0; j < 16; j++)
+        {
+            uint32_t expected = 0;
+
+            if (tests[i].stride && j >= 3 && j < 3 + tests[i].count)
+                expected = 1;
+            else if (!tests[i].stride && j == 3)
+                expected = tests[i].count;
+            ok(values[j] == expected, "Value %u: expected %u, got %u.\n", j, expected, values[j]);
+        }
+    }
+    vkd3d_test_set_context(NULL);
+
+    for (i = 0; i < ARRAY_SIZE(pso); i++)
+    {
+        if (pso[i])
+            ID3D12StateObject_Release(pso[i]);
+    }
+    VirtualFree(pages, 0, MEM_RELEASE);
+    destroy_workgraph_test_context(&context);
+#else
+    skip("The CPU input extent test needs VirtualAlloc.\n");
+#endif
 }
 
 void test_workgraph_broadcast_input(void)
