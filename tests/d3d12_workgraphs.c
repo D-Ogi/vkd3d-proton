@@ -4102,6 +4102,157 @@ void test_workgraph_canary_admission(void)
     ok(!workgraph_canaries_are_valid(S_OK, sizeof(c), &c, backing), "A canary apart from its sink was accepted.\n");
 }
 
+#define WG_PREDICATE_NONE (~0u)
+
+struct workgraph_predicate_step
+{
+    /* Byte offset of the predicate in the predicate buffer (0: value 0, 8: value 1), or WG_PREDICATE_NONE for
+     * SetPredication(NULL). */
+    unsigned int predicate;
+    D3D12_PREDICATION_OP op;
+};
+
+void test_workgraph_predication(void)
+{
+    /* SetPredication applies to DispatchGraph as to Dispatch. vkd3d begins the predicate of SetPredication only at
+     * the next action command when SetPredication is the first action command of a list (render pass resume).
+     * Each case runs with SetPredication as the first command after the reset ("deferred") and after a copy
+     * ("direct"); the two must give the same result. 37 launches add 37. */
+    static const struct
+    {
+        const char *name;
+        struct workgraph_predicate_step steps[4];
+        unsigned int step_count;
+        uint32_t expected;
+    }
+    tests[] =
+    {
+        {"none", {{WG_PREDICATE_NONE, D3D12_PREDICATION_OP_EQUAL_ZERO}}, 1, 37},
+        {"equal zero, value 0", {{0, D3D12_PREDICATION_OP_EQUAL_ZERO}}, 1, 0},
+        {"equal zero, value 1", {{8, D3D12_PREDICATION_OP_EQUAL_ZERO}}, 1, 37},
+        {"not equal zero, value 1", {{8, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO}}, 1, 0},
+        {"not equal zero, value 0", {{0, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO}}, 1, 37},
+        /* One DispatchGraph per step in one list: skipped, launched, skipped, then without predication. */
+        {"false true false none", {{0, D3D12_PREDICATION_OP_EQUAL_ZERO}, {8, D3D12_PREDICATION_OP_EQUAL_ZERO},
+                {8, D3D12_PREDICATION_OP_NOT_EQUAL_ZERO}, {WG_PREDICATE_NONE, D3D12_PREDICATION_OP_EQUAL_ZERO}}, 4, 74},
+    };
+    static const uint64_t predicate_values[2] = {0, 1};
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    ID3D12Resource *predicates, *copy_src, *copy_dst;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct test_context_workgraph context;
+    ID3D12GraphicsCommandList10 *list10;
+    D3D12_SET_PROGRAM_DESC program_desc;
+    ID3D12GraphicsCommandList *list;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    unsigned int i, j, direct;
+    ID3D12Resource *scratch;
+    ID3D12Resource *output;
+    ID3D12StateObject *pso;
+    uint32_t values[16];
+    UINT entry_index;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    list = context.context.list;
+
+    hr = try_create_workgraph_pso(&context, empty_entry_dxil, NULL, &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    {
+        static const D3D12_NODE_ID entry_id = {u"EmptyEntry", 0};
+
+        if (!workgraph_get_program(pso, &ident, &wg_reqs, &entry_index, &entry_id, 1))
+        {
+            ID3D12StateObject_Release(pso);
+            destroy_workgraph_test_context(&context);
+            return;
+        }
+    }
+
+    hr = ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList10, (void **)&list10);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12GraphicsCommandList10, hr #%x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        ID3D12StateObject_Release(pso);
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+
+    predicates = create_upload_buffer(context.context.device, sizeof(predicate_values), predicate_values);
+    copy_src = create_default_buffer(context.context.device, 256,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    copy_dst = create_default_buffer(context.context.device, 256,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    scratch = workgraph_create_backing_memory(&context, &wg_reqs);
+
+    memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+    dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+    dispatch_desc.NodeCPUInput.EntrypointIndex = entry_index;
+    dispatch_desc.NodeCPUInput.NumRecords = 37;
+
+    memset(&program_desc, 0, sizeof(program_desc));
+    program_desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+    if (scratch)
+    {
+        program_desc.WorkGraph.BackingMemory.SizeInBytes = wg_reqs.MinSizeInBytes;
+        program_desc.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(scratch);
+    }
+    program_desc.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+    program_desc.WorkGraph.ProgramIdentifier = ident;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        for (direct = 0; direct < 2; direct++)
+        {
+            vkd3d_test_set_context("%s, %s", tests[i].name, direct ? "direct" : "deferred");
+            output = create_default_buffer(context.context.device, sizeof(values),
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+            /* The list was reset just before. A copy is an action command, so SetPredication after it begins
+             * the predicate at once. */
+            if (direct)
+                ID3D12GraphicsCommandList_CopyBufferRegion(list, copy_dst, 0, copy_src, 0, 256);
+
+            for (j = 0; j < tests[i].step_count; j++)
+            {
+                if (tests[i].steps[j].predicate == WG_PREDICATE_NONE)
+                    ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                else
+                    ID3D12GraphicsCommandList_SetPredication(list, predicates, tests[i].steps[j].predicate,
+                            tests[i].steps[j].op);
+
+                ID3D12GraphicsCommandList_SetComputeRootSignature(list, context.default_root_uav_rs);
+                ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0,
+                        ID3D12Resource_GetGPUVirtualAddress(output));
+                ID3D12GraphicsCommandList10_SetProgram(list10, &program_desc);
+                ID3D12GraphicsCommandList10_DispatchGraph(list10, &dispatch_desc);
+                uav_barrier(list, NULL);
+            }
+            ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+
+            workgraph_read_output(&context, output, values, ARRAY_SIZE(values));
+            ok(values[0] == tests[i].expected, "Expected %u launches, got %u.\n", tests[i].expected, values[0]);
+            ID3D12Resource_Release(output);
+        }
+    }
+    vkd3d_test_set_context(NULL);
+
+    if (scratch)
+        ID3D12Resource_Release(scratch);
+    ID3D12Resource_Release(copy_dst);
+    ID3D12Resource_Release(copy_src);
+    ID3D12Resource_Release(predicates);
+    ID3D12GraphicsCommandList10_Release(list10);
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
 void test_workgraph_dispatch_failure(void)
 {
     /* The lab flavour of the amdgpu-wddm engine reads AMDGPU_WDDM_WG_FAIL at each scratch memory allocation of a
