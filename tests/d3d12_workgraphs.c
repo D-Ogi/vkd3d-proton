@@ -118,6 +118,7 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/track_rw_entry.h"
 #include "shaders/workgraph/headers/multi_input_count.h"
 #include "shaders/workgraph/headers/level_count.h"
+#include "shaders/workgraph/headers/output_bounds.h"
 #include "shaders/workgraph/headers/empty_count64.h"
 
 /* is_vkd3d_proton_device() is always false in the Windows build of the tests, also with the vkd3d-proton DLLs next
@@ -3004,6 +3005,270 @@ void test_workgraph_level_output_limits(void)
     ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
 
     free(records);
+    destroy_workgraph_test_context(&context);
+}
+
+/* The lab flavour of the amdgpu-wddm engine gives the canary ranges of a work graph (AMDGPU_WDDM_WG_LIMITS=canary=1)
+ * through GetPrivateData with this GUID (amdgpu_wddm_wg_canary_guid in libs/vkd3d/workgraphs.c). */
+static const GUID workgraph_canary_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x06 } };
+
+struct workgraph_canaries
+{
+    uint32_t count;
+    uint32_t pattern;
+    struct
+    {
+        uint64_t offset;
+        uint64_t size;
+    } ranges[3];
+};
+
+/* Reads size bytes at offset of a buffer in the COMMON state. */
+static void workgraph_read_buffer_range(struct test_context_workgraph *context, ID3D12Resource *buffer,
+        UINT64 offset, UINT64 size, uint32_t *data)
+{
+    ID3D12Resource *readback;
+    D3D12_RANGE range;
+    void *ptr;
+    HRESULT hr;
+
+    readback = create_readback_buffer(context->context.device, size);
+    ID3D12GraphicsCommandList_CopyBufferRegion(context->context.list, readback, 0, buffer, offset, size);
+    hr = ID3D12GraphicsCommandList_Close(context->context.list);
+    ok(SUCCEEDED(hr), "Failed to close command list, hr #%x.\n", (int)hr);
+    exec_command_list(context->context.queue, context->context.list);
+    wait_queue_idle(context->context.device, context->context.queue);
+    reset_command_list(context->context.list, context->context.allocator);
+
+    range.Begin = 0;
+    range.End = size;
+    hr = ID3D12Resource_Map(readback, 0, &range, &ptr);
+    ok(SUCCEEDED(hr), "Failed to map readback buffer, hr #%x.\n", (int)hr);
+    if (SUCCEEDED(hr))
+    {
+        memcpy(data, ptr, size);
+        range.End = 0;
+        ID3D12Resource_Unmap(readback, 0, &range);
+    }
+    else
+    {
+        memset(data, 0, size);
+    }
+    ID3D12Resource_Release(readback);
+}
+
+/* The number of words of size bytes at offset of a buffer that are not pattern. */
+static unsigned int workgraph_count_damaged_words(struct test_context_workgraph *context, ID3D12Resource *buffer,
+        UINT64 offset, UINT64 size, uint32_t pattern)
+{
+    unsigned int i, damaged = 0;
+    uint32_t *data;
+
+    data = malloc(size);
+    workgraph_read_buffer_range(context, buffer, offset, size, data);
+    for (i = 0; i < size / sizeof(uint32_t); i++)
+        damaged += data[i] != pattern;
+    free(data);
+    return damaged;
+}
+
+void test_workgraph_output_bounds(void)
+{
+    /* The node output allocations of a level must stay inside the payload memory, also when they do not fit.
+     * 64 thread groups of 64 threads each allocate group records (one allocation of 16 KiB per group) and one
+     * thread record per thread (one allocation per wave), concurrently. The consumers check the contents of each
+     * record and set one bit per record id, so that a record with wrong contents, a record that arrives twice and
+     * a record that should not exist are seen. The amdgpu-wddm engine drops the allocations that do not fit (lab
+     * switch AMDGPU_WDDM_WG_LIMITS) and counts their records. For it the test checks:
+     * - every record that arrives is correct, and arrives once;
+     * - arrived records plus lost records are the records that the groups asked for;
+     * - an allocation arrives completely or not at all (the records of a group, or of a wave);
+     * - the exact boundary: allocations that end at the capacity fit, one 16-byte granule less does not;
+     * - counts above the 64 KiB sink are dropped without a wrap of count * stride, with a 64-bit lost count;
+     * - the canary ranges after the sinks and after the given backing memory are not written.
+     * Native drivers launch all records; for them only the cases with valid counts run, and the results and the
+     * canary after the backing memory are checked. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"Producer", 0 } };
+    static const struct
+    {
+        const char *limits;
+        uint32_t group_count, thread_count;
+        bool engine_only; /* Counts above the declared MaxRecords. */
+        int group_fit; /* Group allocations that fit, -1 when the result depends on the order. */
+        int thread_fit; /* Lanes whose records fit, -1 when the result depends on the order. */
+        uint64_t requested; /* Records that the groups ask for. */
+    }
+    tests[] =
+    {
+        { "canary=1", 64, 1, false, 64, 4096, 8192 },
+        /* 10 allocations of 16384 bytes end at the capacity. */
+        { "ring=163840,canary=1", 64, 0, false, 10, 0, 4096 },
+        { "ring=163824,canary=1", 64, 0, false, 9, 0, 4096 },
+        { "packed=10,canary=1", 64, 0, false, 10, 0, 4096 },
+        /* Group and wave allocations race at the boundary. */
+        { "ring=262144,canary=1", 64, 1, false, -1, -1, 8192 },
+        /* Nothing fits: all allocations go to the sinks at the same time. */
+        { "ring=64,canary=1", 64, 1, false, 0, 0, 8192 },
+        /* 0x10000001 records of 256 bytes would wrap to 256 bytes. 64 of them are more than 2^32 records. */
+        { "canary=1", 0x10000001, 0, true, 0, 0, 64ull * 0x10000001 },
+        /* The sum of 64 lane counts of 0x04000001 would wrap. A lane count above the sink limit of 1023 records
+         * of 64 bytes counts as 1024, so the lost count is 4096 * 1024. */
+        { "canary=1", 0, 0x04000001, true, 0, 0, 4096ull * 1024 },
+    };
+    unsigned int group_bits[64], thread_bits[64], wave_size, damaged, w;
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct workgraph_canaries canaries;
+    struct workgraph_lost_records lost;
+    uint32_t values[16 + 256], params[2];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    unsigned int i, j, k, group_ok;
+    ID3D12Resource *scratch;
+    ID3D12Resource *output;
+    ID3D12StateObject *pso;
+    uint32_t *tail_pattern;
+    UINT64 scratch_size;
+    UINT entry_index;
+    bool is_engine;
+    UINT size;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    is_engine = workgraph_is_vkd3d_proton(context.device);
+
+    tail_pattern = malloc(64 * 1024);
+    for (i = 0; i < 64 * 1024 / sizeof(uint32_t); i++)
+        tail_pattern[i] = 0x7a11c0deu;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        if (tests[i].engine_only && !is_engine)
+            continue;
+        vkd3d_test_set_context("Test %u, %s, counts %#x %#x", i, tests[i].limits, tests[i].group_count,
+                tests[i].thread_count);
+
+        workgraph_set_limits(tests[i].limits);
+        hr = try_create_workgraph_pso(&context, output_bounds_dxil, NULL, &pso);
+        workgraph_set_limits(NULL);
+        ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+        if (!pso)
+            continue;
+        if (!workgraph_get_program(pso, &ident, &wg_reqs, &entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        {
+            ID3D12StateObject_Release(pso);
+            continue;
+        }
+
+        /* 64 KiB more than the backing memory that the graph gets, with a pattern that nothing may write. */
+        scratch_size = wg_reqs.MinSizeInBytes;
+        scratch = create_default_buffer(context.context.device, scratch_size + 64 * 1024,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        upload_buffer_data(scratch, scratch_size, 64 * 1024, tail_pattern, context.context.queue,
+                context.context.list);
+        reset_command_list(context.context.list, context.context.allocator);
+
+        output = create_default_buffer(context.context.device, sizeof(values),
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        params[0] = tests[i].group_count;
+        params[1] = tests[i].thread_count;
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+        dispatch_desc.NodeCPUInput.EntrypointIndex = entry_index;
+        dispatch_desc.NodeCPUInput.NumRecords = 1;
+        dispatch_desc.NodeCPUInput.pRecords = params;
+        dispatch_desc.NodeCPUInput.RecordStrideInBytes = sizeof(params);
+        workgraph_record_dispatch(&context, context.context.list, &ident, scratch, scratch_size, output,
+                &dispatch_desc);
+        workgraph_read_output(&context, output, values, ARRAY_SIZE(values));
+
+        ok(values[2] == 0, "%u records have wrong contents.\n", values[2]);
+        ok(values[3] == 0, "%u records arrived more than once.\n", values[3]);
+        wave_size = values[4];
+
+        /* The records of an allocation arrive together: all 64 of a group, all lanes of a wave. */
+        group_ok = 0;
+        for (j = 0; j < 64; j++)
+        {
+            group_bits[j] = vkd3d_popcount(values[16 + 2 * j]) + vkd3d_popcount(values[16 + 2 * j + 1]);
+            thread_bits[j] = vkd3d_popcount(values[16 + 128 + 2 * j]) + vkd3d_popcount(values[16 + 128 + 2 * j + 1]);
+            ok(group_bits[j] == 0 || group_bits[j] == min(tests[i].group_count, 64u),
+                    "Group %u: %u of its group records arrived.\n", j, group_bits[j]);
+            group_ok += group_bits[j] != 0;
+            if (wave_size == 32 || wave_size == 64)
+            {
+                for (k = 0; k < 64; k += wave_size)
+                {
+                    uint64_t lanes = ((uint64_t)values[16 + 128 + 2 * j + 1] << 32) | values[16 + 128 + 2 * j];
+                    uint64_t mask = wave_size == 64 ? ~0ull : (0xffffffffull << k);
+
+                    lanes &= mask;
+                    ok(!lanes || lanes == mask, "Group %u, wave at %u: thread records %#"PRIx64" arrived.\n",
+                            j, k, lanes);
+                }
+            }
+        }
+        ok(wave_size == 32 || wave_size == 64, "Unexpected wave size %u.\n", wave_size);
+
+        /* Nothing is written past the backing memory that the graph got. */
+        damaged = workgraph_count_damaged_words(&context, scratch, scratch_size, 64 * 1024, 0x7a11c0deu);
+        ok(!damaged, "%u words after the backing memory were written.\n", damaged);
+
+        if (is_engine)
+        {
+            memset(&lost, 0, sizeof(lost));
+            size = sizeof(lost);
+            hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_status_guid, &size, &lost);
+            ok(hr == S_OK && size == sizeof(lost), "The engine does not report lost records, hr #%x.\n", (int)hr);
+            ok(values[0] + values[1] + lost.records == tests[i].requested,
+                    "%u group and %u thread records arrived and %"PRIu64" were lost, expected %"PRIu64" in total.\n",
+                    values[0], values[1], lost.records, tests[i].requested);
+            ok(lost.events == (lost.records ? 1 : 0), "Got %"PRIu64" events with lost records.\n", lost.events);
+            if (tests[i].group_fit >= 0)
+                ok(group_ok == (unsigned int)tests[i].group_fit, "Expected %d group allocations, got %u.\n",
+                        tests[i].group_fit, group_ok);
+            if (tests[i].thread_fit >= 0)
+                ok(values[1] == (unsigned int)tests[i].thread_fit, "Expected %d thread records, got %u.\n",
+                        tests[i].thread_fit, values[1]);
+            if (tests[i].group_fit < 0)
+                ok(values[0] + values[1] && lost.records, "Expected a partial result, got %u + %u, lost %"PRIu64".\n",
+                        values[0], values[1], lost.records);
+
+            /* The canary ranges after the payload sinks and after the unrolled offsets. */
+            memset(&canaries, 0, sizeof(canaries));
+            size = sizeof(canaries);
+            hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_canary_guid, &size, &canaries);
+            ok(hr == S_OK && size == sizeof(canaries), "The engine does not report canaries, hr #%x.\n", (int)hr);
+            ok(canaries.count == 3, "Expected 3 canary ranges, got %u.\n", canaries.count);
+            for (w = 0; w < canaries.count && w < ARRAY_SIZE(canaries.ranges); w++)
+            {
+                damaged = workgraph_count_damaged_words(&context, scratch, canaries.ranges[w].offset,
+                        canaries.ranges[w].size, canaries.pattern);
+                ok(!damaged, "Canary range %u at %#"PRIx64": %u words were written.\n",
+                        w, canaries.ranges[w].offset, damaged);
+            }
+        }
+        else
+        {
+            ok(values[0] == 64 * min(tests[i].group_count, 64u), "Expected %u group records, got %u.\n",
+                    64 * min(tests[i].group_count, 64u), values[0]);
+            ok(values[1] == (tests[i].thread_count ? 4096u : 0u), "Expected %u thread records, got %u.\n",
+                    tests[i].thread_count ? 4096u : 0u, values[1]);
+        }
+
+        ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+        ID3D12StateObject_Release(pso);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    free(tail_pattern);
     destroy_workgraph_test_context(&context);
 }
 
