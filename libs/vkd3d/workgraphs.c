@@ -3347,7 +3347,9 @@ static void d3d12_command_list_workgraph_execute_entry_level(
             break;
 
         default:
-            FIXME("Unimplemented mode %u\n", desc->Mode);
+            /* amdgpu-wddm fork: an error, not a FIXME. The release flavour removes FIXME lines, and this graph
+             * then does not run, which a log must show. D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT comes here. */
+            ERR("Unimplemented mode %u, the graph does not run.\n", desc->Mode);
             break;
     }
 }
