@@ -102,6 +102,8 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/coalesce_custom_input.h"
 #include "shaders/workgraph/headers/two_entry.h"
 #include "shaders/workgraph/headers/rw_entry_input.h"
+#include "shaders/workgraph/headers/depth_limit_32.h"
+#include "shaders/workgraph/headers/depth_limit_33.h"
 
 /* The stride 0 cases are skipped on AMD because they hang the GPU with AMD's own driver. A different driver with
  * the AMD vendor ID can run them: set VKD3D_TEST_WORKGRAPH_AMD_STRIDE_0=1. */
@@ -1141,6 +1143,148 @@ void test_workgraph_rw_entry_input(void)
     vkd3d_test_set_context(NULL);
 
     ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+static HRESULT try_create_workgraph_pso(struct test_context_workgraph *context, D3D12_SHADER_BYTECODE code,
+        LPCWSTR entry_point, ID3D12StateObject **pso)
+{
+    D3D12_NODE_ID entry_point_id;
+    D3D12_GLOBAL_ROOT_SIGNATURE grs_desc;
+    D3D12_STATE_SUBOBJECT subobjects[3];
+    D3D12_STATE_OBJECT_DESC pso_desc;
+    D3D12_WORK_GRAPH_DESC wg_desc;
+    D3D12_DXIL_LIBRARY_DESC dxil;
+
+    memset(&pso_desc, 0, sizeof(pso_desc));
+    memset(subobjects, 0, sizeof(subobjects));
+    memset(&dxil, 0, sizeof(dxil));
+    memset(&wg_desc, 0, sizeof(wg_desc));
+    pso_desc.NumSubobjects = ARRAY_SIZE(subobjects);
+    pso_desc.pSubobjects = subobjects;
+    pso_desc.Type = D3D12_STATE_OBJECT_TYPE_EXECUTABLE;
+    grs_desc.pGlobalRootSignature = context->default_root_uav_rs;
+
+    subobjects[0].pDesc = &dxil;
+    subobjects[0].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    subobjects[1].pDesc = &wg_desc;
+    subobjects[1].Type = D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH;
+    subobjects[2].pDesc = &grs_desc;
+    subobjects[2].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+
+    dxil.DXILLibrary = code;
+    wg_desc.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
+    wg_desc.ProgramName = u"Dummy";
+    if (entry_point)
+    {
+        entry_point_id.Name = entry_point;
+        entry_point_id.ArrayIndex = 0;
+        wg_desc.NumEntrypoints = 1;
+        wg_desc.pEntrypoints = &entry_point_id;
+    }
+
+    *pso = NULL;
+    return ID3D12Device5_CreateStateObject(context->device, &pso_desc, &IID_ID3D12StateObject, (void **)pso);
+}
+
+void test_workgraph_depth_limit(void)
+{
+    /* The longest chain of nodes is at most 32 (D3D12_WORK_GRAPHS_MAX_NODE_DEPTH), and a recursive node counts
+     * by its declared recursion depth (WorkGraphs.md, Node count limits). depth_limit_32 has a chain of 32 nodes,
+     * depth_limit_33 a chain of 33. A graph that is too deep, or that names a missing entry point, must fail with
+     * E_INVALIDARG (as on native NVIDIA) after the engine has started to build its program, without a crash, and
+     * the device must stay usable. */
+    struct test_context_workgraph context;
+    ID3D12StateObject *pso;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    hr = try_create_workgraph_pso(&context, depth_limit_32_dxil, NULL, &pso);
+    ok(hr == S_OK, "Chain of 32 nodes: expected S_OK, got hr #%x.\n", (int)hr);
+    if (pso)
+        ID3D12StateObject_Release(pso);
+
+    hr = try_create_workgraph_pso(&context, depth_limit_33_dxil, NULL, &pso);
+    ok(hr == E_INVALIDARG, "Chain of 33 nodes: expected E_INVALIDARG, got hr #%x.\n", (int)hr);
+    if (pso)
+        ID3D12StateObject_Release(pso);
+
+    /* An entry point in the work graph description that names no node of the library. */
+    hr = try_create_workgraph_pso(&context, depth_limit_32_dxil, u"NoSuchNode", &pso);
+    ok(hr == E_INVALIDARG, "Missing entry point: expected E_INVALIDARG, got hr #%x.\n", (int)hr);
+    if (pso)
+        ID3D12StateObject_Release(pso);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    hr = try_create_workgraph_pso(&context, depth_limit_32_dxil, NULL, &pso);
+    ok(hr == S_OK, "Chain of 32 nodes after the failure: expected S_OK, got hr #%x.\n", (int)hr);
+    if (pso)
+        ID3D12StateObject_Release(pso);
+
+    destroy_workgraph_test_context(&context);
+}
+
+static void workgraph_set_fault(const char *value)
+{
+#ifdef _WIN32
+    SetEnvironmentVariableA("AMDGPU_WDDM_WG_FAIL", value);
+#else
+    if (value)
+        setenv("AMDGPU_WDDM_WG_FAIL", value, 1);
+    else
+        unsetenv("AMDGPU_WDDM_WG_FAIL");
+#endif
+}
+
+void test_workgraph_create_failure(void)
+{
+    /* The lab flavour of the amdgpu-wddm engine reads AMDGPU_WDDM_WG_FAIL at each work graph creation and fails
+     * it at the named point as if an allocation failed there. Each point must give E_OUTOFMEMORY without a crash,
+     * and the device must stay usable. depth_limit_32 has 2 nodes and 30 recursion depth slots (2 to 31); slot 31
+     * is in the last level, so "pipeline:31" fails after the pipelines of all earlier levels were created.
+     * Set VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1 to run this test; other engines ignore the variable. */
+    static const char *points[] = { "slots", "program", "pipeline:0", "pipeline:31" };
+    struct test_context_workgraph context;
+    const char *env;
+    ID3D12StateObject *pso;
+    unsigned int i;
+    HRESULT hr;
+
+    env = getenv("VKD3D_TEST_WORKGRAPH_FAULT_INJECTION");
+    if (!env || env[0] != '1')
+    {
+        skip("Set VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1 to run the fault injection test.\n");
+        return;
+    }
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(points); i++)
+    {
+        vkd3d_test_set_context("%s", points[i]);
+        workgraph_set_fault(points[i]);
+        hr = try_create_workgraph_pso(&context, depth_limit_32_dxil, NULL, &pso);
+        workgraph_set_fault(NULL);
+        ok(hr == E_OUTOFMEMORY, "Expected E_OUTOFMEMORY, got hr #%x.\n", (int)hr);
+        ok(!pso, "Expected no state object.\n");
+        if (pso)
+            ID3D12StateObject_Release(pso);
+
+        hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+        ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = try_create_workgraph_pso(&context, depth_limit_32_dxil, NULL, &pso);
+    ok(hr == S_OK, "After the injected failures: expected S_OK, got hr #%x.\n", (int)hr);
+    if (pso)
+        ID3D12StateObject_Release(pso);
+
     destroy_workgraph_test_context(&context);
 }
 

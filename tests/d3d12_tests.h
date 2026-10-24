@@ -474,6 +474,8 @@ decl_test(test_workgraph_basic);
 decl_test(test_workgraph_gpu_input_stride);
 decl_test(test_workgraph_multi_node_gpu_input_entries);
 decl_test(test_workgraph_rw_entry_input);
+decl_test(test_workgraph_depth_limit);
+decl_test(test_workgraph_create_failure);
 decl_test(test_workgraph_broadcast_input);
 decl_test(test_workgraph_thread_input);
 decl_test(test_workgraph_coalesced_input);
