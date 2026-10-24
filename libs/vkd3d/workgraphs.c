@@ -3343,10 +3343,14 @@ static void d3d12_command_list_workgraph_execute_node_gpu(
         vk_primary_indirect_offset += offsetof(struct vkd3d_workgraph_gpu_input_indirect, primary_indirect);
         vk_secondary_indirect_offset += offsetof(struct vkd3d_workgraph_gpu_input_indirect, secondary_indirect);
 
-        primary_linear_offset_bda =
-                indirect_scratch->va + offsetof(struct vkd3d_workgraph_gpu_input_indirect, primary_linear_offset);
-        secondary_linear_offset_bda =
-                indirect_scratch->va + offsetof(struct vkd3d_workgraph_gpu_input_indirect, secondary_linear_offset);
+        /* amdgpu-wddm fork: the linear offsets of this node's own indirect command, as for the dispatch offsets
+         * above. They differ from 0 only when the primary execution is used. */
+        primary_linear_offset_bda = indirect_scratch->va +
+                node_index * sizeof(struct vkd3d_workgraph_gpu_input_indirect) +
+                offsetof(struct vkd3d_workgraph_gpu_input_indirect, primary_linear_offset);
+        secondary_linear_offset_bda = indirect_scratch->va +
+                node_index * sizeof(struct vkd3d_workgraph_gpu_input_indirect) +
+                offsetof(struct vkd3d_workgraph_gpu_input_indirect, secondary_linear_offset);
 
         VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer,
                 VK_PIPELINE_BIND_POINT_COMPUTE,
