@@ -1,5 +1,8 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "cs_workgraph_multi_gpu_input_math.h"
 
 layout(local_size_x = 32) in;
 layout(constant_id = 0) const bool REQUIRE_WG_DIVIDER = true;
@@ -60,7 +63,7 @@ void main()
 
 			if (divider > 1)
 				// amdgpu-wddm fork: count + divider - 1 wraps for counts near 2^32.
-				wg_count = count / uint(divider) + (count % uint(divider) != 0u ? 1u : 0u);
+				wg_count = wg_math_div_round_up(count, uint(divider));
 			else
 				wg_count = count;
 

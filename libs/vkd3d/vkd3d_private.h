@@ -5581,7 +5581,9 @@ struct vkd3d_workgraph_setup_gpu_input_args
  * Each entry point has VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS direct slots, for large inputs that are read in place,
  * and one merge slot, for the records of all other inputs, copied into the staging range of the backing memory.
  * An input is large if its records take more than VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE bytes in the staging range.
- * The shaders have the same constants. The state buffer (per DispatchGraph call) holds a 16-byte header with the
+ * The shaders have the same number of direct slots. The large size, the staging size and the number of groups are
+ * values of the program, so that the lab flavour can make them small for tests (AMDGPU_WDDM_WG_MULTI_INPUT).
+ * The count arithmetic is in cs_workgraph_multi_gpu_input_math.h. The state buffer (per DispatchGraph call) holds a 16-byte header with the
  * overflow word, one vkd3d_workgraph_multi_gpu_input_entry per entry point, the input index of each direct slot
  * (aligned to 16 bytes), then the slots: (DIRECT_SLOTS + 1) D3D12_NODE_GPU_INPUT per entry point, the merge slot
  * last. Meta push data is limited to 64 bytes. */
@@ -5617,6 +5619,8 @@ struct vkd3d_workgraph_multi_gpu_input_prepare_args
     VkDeviceSize staging_capacity;
     uint32_t num_entry_points;
     uint32_t mode;
+    uint32_t large_size;
+    uint32_t padding;
 };
 
 struct vkd3d_workgraph_multi_gpu_input_copy_args

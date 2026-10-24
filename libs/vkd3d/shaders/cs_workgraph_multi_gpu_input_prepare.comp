@@ -1,6 +1,8 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "cs_workgraph_multi_gpu_input_math.h"
 
 // amdgpu-wddm fork: the preparation passes of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT.
 // The number of inputs and their record counts are only in GPU memory. Each entry point gets
@@ -22,9 +24,8 @@ layout(local_size_x = 64) in;
 const uint MODE_INIT = 0u;
 const uint MODE_CLASSIFY = 1u;
 const uint MODE_LAYOUT = 2u;
-// VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS and VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE.
+// VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS.
 const uint DIRECT_SLOTS = 4u;
-const uint64_t LARGE_SIZE = 512ul * 1024ul;
 
 // D3D12_NODE_GPU_INPUT, 24 bytes.
 struct GPUInput
@@ -94,6 +95,8 @@ layout(push_constant) uniform Registers
 	uint64_t staging_capacity;
 	uint num_entry_points;
 	uint mode;
+	uint large_size;
+	uint padding;
 } registers;
 
 uint64_t slot_sources_va()
@@ -107,21 +110,13 @@ uint64_t slots_va()
 	return slot_sources_va() + size;
 }
 
-// An input is large if its records would take more than LARGE_SIZE bytes in the staging range.
-// An empty record counts as 4 bytes here, so that very large counts of empty records take a direct slot.
-bool is_large(uint num_records, uint record_stride)
-{
-	return uint64_t(num_records) * uint64_t(max(record_stride, 4u)) > LARGE_SIZE;
-}
-
 // Adds a 64-bit value with two 32-bit atomics. The sum of all additions is exact.
 void add_merged(State state, uint e, uint64_t value)
 {
 	uint lo = uint(value);
 	uint hi = uint(value >> 32);
 	uint old = atomicAdd(state.entries[e].merged_lo, lo);
-	if (old + lo < old)
-		hi += 1u;
+	hi += wg_math_add_carry(old, lo);
 	if (hi != 0u)
 		atomicAdd(state.entries[e].merged_hi, hi);
 }
@@ -179,7 +174,7 @@ void classify(State state)
 		if (e >= num_entries || node_input.num_records == 0u)
 			continue;
 
-		if (is_large(node_input.num_records, registers.record_strides.data[e]))
+		if (wg_math_is_large(node_input.num_records, registers.record_strides.data[e], registers.large_size))
 		{
 			uint rank = DIRECT_SLOTS;
 
@@ -225,25 +220,10 @@ void layout_merge_slots(State state)
 	{
 		uint stride = registers.record_strides.data[e];
 		uint64_t merged = (uint64_t(state.entries[e].merged_hi) << 32) | uint64_t(state.entries[e].merged_lo);
-		uint64_t count = merged;
+		uint64_t count = wg_math_merge_count(merged, stride, wg_math_room(registers.staging_capacity, offset));
 
-		// NumRecords of the merge slot is 32 bits.
-		if (count > 0xfffffffful)
-		{
-			count = 0xfffffffful;
+		if (count < merged)
 			overflow = 1u;
-		}
-
-		if (stride != 0u)
-		{
-			uint64_t room = registers.staging_capacity > offset ? registers.staging_capacity - offset : 0ul;
-			uint64_t fit = room / uint64_t(stride);
-			if (count > fit)
-			{
-				count = fit;
-				overflow = 1u;
-			}
-		}
 
 		state.entries[e].fit = uint(count);
 		state.entries[e].cursor = 0u;
@@ -255,7 +235,7 @@ void layout_merge_slots(State state)
 		merge.records_stride = uint64_t(stride);
 		slots.data[e * (DIRECT_SLOTS + 1u) + DIRECT_SLOTS] = merge;
 
-		offset = (offset + count * uint64_t(stride) + 15ul) & ~15ul;
+		offset = wg_math_next_offset(offset, count, stride);
 	}
 
 	state.overflow = overflow;

@@ -62,6 +62,56 @@ static inline bool d3d12_wg_fault_injected(const char *point, unsigned int index
 }
 #endif
 
+/* amdgpu-wddm fork, lab flavour only: AMDGPU_WDDM_WG_MULTI_INPUT=staging=<bytes>,large=<bytes>,groups=<n> sets the
+ * staging size, the large input size and the number of classify and copy workgroups of
+ * D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT for the work graphs created after it is set. Each part is optional.
+ * Small values let a test cross every limit of these passes with a few thousand records. */
+struct d3d12_wg_multi_input_config
+{
+    VkDeviceSize staging_size;
+    uint32_t large_size;
+    uint32_t groups;
+};
+
+static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *config)
+{
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    char value[128], *p, *next;
+    unsigned long long n;
+#endif
+
+    config->staging_size = VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE;
+    config->large_size = VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE;
+    config->groups = VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS;
+
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    if (!vkd3d_get_env_var("AMDGPU_WDDM_WG_MULTI_INPUT", value, sizeof(value)))
+        return;
+
+    for (p = value; p && *p; p = next)
+    {
+        if ((next = strchr(p, ',')))
+            *next++ = '\0';
+
+        /* The merge slots start at 16-byte offsets. Values out of range keep the default. */
+        if (!strncmp(p, "staging=", 8) && (n = strtoull(p + 8, NULL, 0)) >= 16
+                && n <= VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE)
+            config->staging_size = n & ~15ull;
+        else if (!strncmp(p, "large=", 6) && (n = strtoull(p + 6, NULL, 0)) >= 4
+                && n <= VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE)
+            config->large_size = n;
+        else if (!strncmp(p, "groups=", 7) && (n = strtoull(p + 7, NULL, 0)) >= 1
+                && n <= VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS)
+            config->groups = n;
+        else
+            WARN("Ignoring %s in AMDGPU_WDDM_WG_MULTI_INPUT.\n", p);
+    }
+
+    WARN("Multi GPU input: staging %"PRIu64" bytes, large %u bytes, %u groups.\n",
+            config->staging_size, config->large_size, config->groups);
+#endif
+}
+
 /* amdgpu-wddm fork: "scratch:<n>" fails scratch allocation n (counted from 0) of a DispatchGraph call. Fault injection
  * is for tests that record on one thread, so one counter for all command lists is enough. */
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
@@ -193,6 +243,8 @@ struct d3d12_wg_state_object_program
      * so each execution context has its own. */
     VkDeviceSize multi_input_staging_scratch_offset;
     VkDeviceSize multi_input_staging_scratch_size;
+    uint32_t multi_input_large_size;
+    uint32_t multi_input_groups;
     VkDeviceSize required_scratch_size;
 
     int32_t *coalesce_dividers_or_amp;
@@ -2385,6 +2437,7 @@ static HRESULT d3d12_wg_state_object_compile_program(
         struct d3d12_wg_state_object_data *data,
         struct d3d12_wg_state_object_program *program)
 {
+    struct d3d12_wg_multi_input_config multi_input_config;
     struct d3d12_wg_state_object_spec_constant_tmp tmp;
     VkDeviceSize scratch_offset = 0;
     unsigned int level;
@@ -2506,8 +2559,12 @@ static HRESULT d3d12_wg_state_object_compile_program(
     alloc_scratch(dividers_scratch, program->num_pipelines * sizeof(uint32_t));
     alloc_scratch(share_mapping_scratch, program->num_pipelines * sizeof(uint32_t));
     alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
-    alloc_scratch(multi_input_staging_scratch, VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE);
+    d3d12_wg_get_multi_input_config(&multi_input_config);
+    alloc_scratch(multi_input_staging_scratch, multi_input_config.staging_size);
 #undef alloc_scratch
+
+    program->multi_input_large_size = multi_input_config.large_size;
+    program->multi_input_groups = multi_input_config.groups;
 
     program->required_scratch_size = scratch_offset;
     program->indirect_commands_scratch_node_offset =
@@ -3755,6 +3812,7 @@ static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
     prepare_args.record_strides_va = strides_scratch.va;
     prepare_args.state_va = state_scratch.va;
     prepare_args.num_entry_points = num_entries;
+    prepare_args.large_size = program->multi_input_large_size;
     if (list->wg_state.BackingMemory.SizeInBytes >= program->required_scratch_size)
     {
         prepare_args.staging_va = list->wg_state.BackingMemory.StartAddress + program->multi_input_staging_scratch_offset;
@@ -3771,7 +3829,7 @@ static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
     d3d12_command_list_workgraph_multi_gpu_input_pass(list, program, &prepare_args,
             VKD3D_WORKGRAPH_MULTI_INPUT_MODE_INIT, 1, "multi-gpu-input-init");
     d3d12_command_list_workgraph_multi_gpu_input_pass(list, program, &prepare_args,
-            VKD3D_WORKGRAPH_MULTI_INPUT_MODE_CLASSIFY, VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS, "multi-gpu-input-classify");
+            VKD3D_WORKGRAPH_MULTI_INPUT_MODE_CLASSIFY, program->multi_input_groups, "multi-gpu-input-classify");
     d3d12_command_list_workgraph_multi_gpu_input_pass(list, program, &prepare_args,
             VKD3D_WORKGRAPH_MULTI_INPUT_MODE_LAYOUT, 1, "multi-gpu-input-layout");
 
@@ -3793,7 +3851,7 @@ static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
         if (list->device->vk_info.EXT_debug_utils)
             d3d12_command_list_debug_mark_label(list, "Multi GPU Input Copy", 1.0f, 0.8f, 0.8f, 1.0f);
 
-        VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS, 1, 1));
+        VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, program->multi_input_groups, 1, 1));
         VKD3D_BREADCRUMB_TAG("multi-gpu-input-copy");
         VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
 

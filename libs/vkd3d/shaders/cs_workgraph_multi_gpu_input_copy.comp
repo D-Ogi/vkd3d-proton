@@ -1,6 +1,8 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "cs_workgraph_multi_gpu_input_math.h"
 
 // amdgpu-wddm fork: the copy pass of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT, after the passes of
 // cs_workgraph_multi_gpu_input_prepare.comp. Each workgroup takes batches of 64 inputs in turn.
@@ -101,9 +103,9 @@ uint reserve(State state, uint e, uint num, out uint first)
 		uint count;
 
 		first = old;
-		if (old >= fit)
+		count = wg_math_reserve_count(old, fit, num);
+		if (count == 0u)
 			return 0u;
-		count = min(num, fit - old);
 		uint seen = atomicCompSwap(state.entries[e].cursor, old, old + count);
 		if (seen == old)
 			return count;
