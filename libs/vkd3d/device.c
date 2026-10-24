@@ -10243,9 +10243,12 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
          * - Long vector (hnnnnng)
          * - Shader Execution Reordering
          * - 16/64-bit is{inf,nan,normal} etc
+         *
+         * Opacity micromaps are not required (fork change). They belong to raytracing tier 1.2, and SM 6.9 at
+         * tier 1.1 is valid: the SM 6.9 OMM flags have no effect when no acceleration structure has an OMM.
+         * SER is still required, because SM 6.9 needs it on every device with raytracing.
          */
         if (device->d3d12_caps.max_shader_model == D3D_SHADER_MODEL_6_8 &&
-            device->device_info.opacity_micromap_features.micromap &&
             /* For maint9 bitops which support 16-bit / 64-bit. Needed for vector version of these. */
             device->device_info.maintenance_9_features.maintenance9 &&
             device->device_info.long_vector_features.longVector &&
