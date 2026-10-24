@@ -44,7 +44,10 @@
 /* The node output allocator computes payload offsets in 32 bits. */
 STATIC_ASSERT(VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE <= UINT32_MAX);
 STATIC_ASSERT(sizeof(struct vkd3d_workgraph_lost_records) <= VKD3D_WORKGRAPH_ABANDONED_OFFSET);
-STATIC_ASSERT(sizeof(struct vkd3d_workgraph_drain_control) == 72 * sizeof(uint32_t));
+STATIC_ASSERT(sizeof(struct vkd3d_workgraph_drain_control) == 76 * sizeof(uint32_t));
+STATIC_ASSERT(sizeof(struct vkd3d_workgraph_pool_level_args) == 144);
+STATIC_ASSERT(sizeof(struct vkd3d_workgraph_pool_admission) == 32);
+STATIC_ASSERT(sizeof(struct vkd3d_workgraph_workgroups_args) <= 64 && sizeof(struct vkd3d_workgraph_drain_args) <= 64);
 STATIC_ASSERT(sizeof(struct vkd3d_workgraph_abandoned) == 20 * sizeof(uint32_t));
 /* The packed offsets of the payloads, after the required scratch memory: their size with MinSizeInBytes and with
  * MaxSizeInBytes of backing memory. The sizes are arbitrary. */
@@ -145,9 +148,10 @@ static const GUID amdgpu_wddm_wg_canary_guid =
 
 /* amdgpu-wddm fork, lab flavour only: GetPrivateData with this GUID gives struct amdgpu_wddm_wg_drain of the first
  * program, for test_workgraph_drain_rounds. control_offset is the offset of struct vkd3d_workgraph_drain_control in
- * the backing memory, valid only if rounds is not 0. */
+ * the backing memory, valid only if rounds is not 0. The last byte is the version of the struct (7: the round frame,
+ * 10: with abandoned_records, 11: with the pool states). */
 static const GUID amdgpu_wddm_wg_drain_guid =
-        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x07 } };
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x0b } };
 
 struct amdgpu_wddm_wg_drain
 {
@@ -160,6 +164,14 @@ struct amdgpu_wddm_wg_drain
     uint32_t abandoned_flags;
     uint32_t hook_calls;
     uint32_t violations;
+    /* The records that the record pools held at close, for all executions (whole records, struct
+     * vkd3d_workgraph_abandoned). Entry losses are in the lost records, not here. */
+    uint64_t abandoned_records;
+    /* The pool states in the backing memory: pool_states of struct vkd3d_workgraph_pool_state, one for each level,
+     * pool_state_stride bytes apart. Valid only if rounds is not 0. */
+    uint64_t pool_state_offset;
+    uint32_t pool_state_stride;
+    uint32_t pool_states;
 };
 
 /* amdgpu-wddm fork, lab flavour only: GetPrivateData with this GUID gives struct amdgpu_wddm_wg_pools of the first
@@ -246,6 +258,8 @@ struct d3d12_wg_multi_input_config
      * the record pools, so that a test reaches the 64-bit bounds and Max = Min. Execution does not use the pools. */
     uint32_t pool_records;
     uint32_t pool_stride;
+    /* pools=0: the extra rounds run on the payload rings, also if the record pools are valid. */
+    bool pools;
     uint32_t large_size;
     uint32_t groups;
 };
@@ -266,6 +280,7 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
     config->drain_pending = 0;
     config->pool_records = 0;
     config->pool_stride = 0;
+    config->pools = true;
     config->large_size = VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE;
     config->groups = VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS;
 
@@ -293,14 +308,16 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
                 config->pool_records = n;
             else if (!strncmp(p, "pool_stride=", 12) && (n = strtoull(p + 12, NULL, 0)) <= UINT32_MAX)
                 config->pool_stride = n;
+            else if (!strcmp(p, "pools=0"))
+                config->pools = false;
             else
                 WARN("Ignoring %s in AMDGPU_WDDM_WG_LIMITS.\n", p);
         }
 
         WARN("Work graph limits: payload ring %"PRIu64" bytes, packed offset limit %u, canaries %u, "
-                "extra rounds %u, pending hook %u, pool records %u, pool stride %u.\n", config->ring_size,
+                "extra rounds %u, pending hook %u, pool records %u, pool stride %u, pools %u.\n", config->ring_size,
                 config->packed_limit, config->canaries, config->drain_rounds, config->drain_pending, config->pool_records,
-                config->pool_stride);
+                config->pool_stride, config->pools);
     }
 
     if (!vkd3d_get_env_var("AMDGPU_WDDM_WG_MULTI_INPUT", value, sizeof(value)))
@@ -496,6 +513,17 @@ struct d3d12_wg_state_object_program
      * new name) is set: the metadata then does not describe the graph of the application, and the pools are not valid. */
     bool pool_valid;
     bool pool_ignored_overrides;
+    /* pool_execution: the lab drain mode runs on the pools. The backing memory then has the pool layout, and the
+     * requirements are the Min and Max of the pools. pool_admission is the admission of each slot, pool_state and
+     * pool_admit are the pool states and the admitted counts in the fixed bookkeeping. */
+    bool pool_execution;
+    struct vkd3d_workgraph_pool_admission *pool_admission;
+    VkDeviceSize pool_state_scratch_offset;
+    VkDeviceSize pool_state_scratch_size;
+    VkDeviceSize pool_admit_scratch_offset;
+    VkDeviceSize pool_admit_scratch_size;
+    uint32_t pool_state_stride;
+    struct vkd3d_workgraph_meta_pipeline_info pool_pass;
     uint32_t pool_test_records;
     uint32_t pool_test_stride;
     uint64_t pool_w[MAX_WORKGRAPH_LEVELS][D3D12_WG_POOL_COMPONENT_COUNT];
@@ -618,6 +646,7 @@ static void d3d12_wg_state_object_free_programs(
         vkd3d_free(programs[i].coalesce_dividers_or_amp);
         vkd3d_free(programs[i].share_mapping);
         vkd3d_free(programs[i].payload_expander_meta);
+        vkd3d_free(programs[i].pool_admission);
         vkd3d_free(programs[i].local_root_table_indices);
         vkd3d_free(programs[i].slot_entry);
         vkd3d_free(programs[i].slot_depth);
@@ -2013,10 +2042,11 @@ static void d3d12_wg_state_object_report_abandoned(struct d3d12_wg_state_object 
     exhausted = !!(reasons & (1u << VKD3D_WORKGRAPH_DRAIN_REASON_EXHAUSTED));
     fault = !!(reasons & (1u << VKD3D_WORKGRAPH_DRAIN_REASON_FAULT));
     ERR("Work graph %p: %u times work was abandoned when the rounds ended (%s%s%s). Waiting work: %s, %s, %s, "
-            "input records not taken %"PRIu64".\n", (void *)state_object, events,
-            exhausted ? "the last round had waiting work" : "", exhausted && fault ? ", " : "",
+            "input records not taken %"PRIu64", abandoned %"PRIu64" records in the record pools.\n", (void *)state_object,
+            events, exhausted ? "the last round had waiting work" : "", exhausted && fault ? ", " : "",
             fault ? "a round made no progress" : "",
-            items[0], items[1], items[2], ((uint64_t)abandoned->inputs_hi << 32) | abandoned->inputs_lo);
+            items[0], items[1], items[2], ((uint64_t)abandoned->inputs_hi << 32) | abandoned->inputs_lo,
+            ((uint64_t)abandoned->records_hi << 32) | abandoned->records_lo);
 }
 
 static void d3d12_wg_state_object_dec_ref(struct d3d12_wg_state_object *state_object)
@@ -2148,6 +2178,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
                 drain.rounds = state_object->programs[0].drain_rounds;
                 drain.pending_rounds = state_object->programs[0].drain_pending;
                 drain.control_offset = state_object->programs[0].drain_control_scratch_offset;
+                drain.pool_state_offset = state_object->programs[0].pool_state_scratch_offset;
+                drain.pool_state_stride = state_object->programs[0].pool_state_stride;
+                drain.pool_states = state_object->programs[0].num_levels;
             }
             if (abandoned)
             {
@@ -2155,6 +2188,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
                 drain.abandoned_reasons = abandoned->reasons;
                 drain.abandoned_last_reason = abandoned->last_reason;
                 drain.abandoned_flags = abandoned->flags;
+                drain.abandoned_records = ((uint64_t)abandoned->records_hi << 32) | abandoned->records_lo;
             }
             drain.hook_calls = vkd3d_atomic_uint32_load_explicit(&state_object->drain_hook_calls,
                     vkd3d_memory_order_relaxed);
@@ -2188,6 +2222,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
                 program = &state_object->programs[0];
                 pools->valid = 1;
                 pools->pools = program->num_levels;
+                pools->execution = program->pool_execution;
                 pools->fixed_size = program->pool_fixed_size;
                 pools->staging_size = program->pool_staging_size;
                 pools->sink_size = program->pool_sink_size;
@@ -3163,7 +3198,9 @@ static uint64_t d3d12_wg_mul_div(uint64_t a, uint64_t b, uint64_t c)
 
 /* The isolated size of each region that gets a part of the arena: index 0 the packed entries and 1 the unrolled
  * offsets, each for the largest W of the pools, then 2 + 2 x (L - 1) + half the payload of pool L, its W rounded up to
- * 16 bytes. */
+ * 16 bytes. The entry level is not throttled, so the guard of pool 1 limits its records to one for each 4 bytes of
+ * the unrolled offsets (d3d12_wg_pool_capacity). The unrolled offsets are therefore at least as large as a payload
+ * half of pool 1: in each layout, the guard of pool 1 then allows its full payload half. */
 static bool d3d12_wg_drain_isolated_sizes(const struct d3d12_wg_state_object_program *program,
         VkDeviceSize *isolated, unsigned int *count)
 {
@@ -3174,15 +3211,17 @@ static bool d3d12_wg_drain_isolated_sizes(const struct d3d12_wg_state_object_pro
     {
         entries = max(entries, program->pool_w[level][D3D12_WG_POOL_ENTRIES]);
         offsets = max(offsets, program->pool_w[level][D3D12_WG_POOL_OFFSETS]);
+        if (program->pool_w[level][D3D12_WG_POOL_PAYLOAD] > UINT64_MAX - 15)
+            return false;
     }
     if (!d3d12_wg_pool_bytes(D3D12_WG_POOL_ENTRIES, entries, &isolated[0]) ||
             !d3d12_wg_pool_bytes(D3D12_WG_POOL_OFFSETS, offsets, &isolated[1]))
         return false;
+    if (program->num_levels > 1)
+        isolated[1] = max(isolated[1], align64(program->pool_w[1][D3D12_WG_POOL_PAYLOAD], 16));
     *count = 2;
     for (level = 1; level < program->num_levels; level++)
     {
-        if (program->pool_w[level][D3D12_WG_POOL_PAYLOAD] > UINT64_MAX - 15)
-            return false;
         for (half = 0; half < 2; half++)
             isolated[(*count)++] = align64(program->pool_w[level][D3D12_WG_POOL_PAYLOAD], 16);
     }
@@ -3421,6 +3460,168 @@ static void d3d12_wg_state_object_program_compute_pools(struct d3d12_wg_state_ob
             program->num_levels, program->pool_min_size, program->pool_max_size);
 }
 
+/* amdgpu-wddm fork: the required scratch memory of a program, each range 64-byte aligned, the output guard last, so
+ * that it ends where the packed offsets start. With rings, the payload rings and the unrolled offsets are in it (the
+ * layout of today). Without rings, it is the fixed bookkeeping of the pool layout, and the pools, the packed entries
+ * and the unrolled offsets follow it (d3d12_wg_drain_layout). Returns the size. */
+static VkDeviceSize d3d12_wg_state_object_program_layout_scratch(struct d3d12_wg_state_object_program *program,
+        const struct d3d12_wg_multi_input_config *config, bool rings)
+{
+    VkDeviceSize canary_size = config->canaries ? VKD3D_WORKGRAPH_CANARY_SIZE : 0;
+    VkDeviceSize scratch_offset = 0;
+
+#define alloc_scratch(member, size) \
+    scratch_offset = align64(scratch_offset, 64); \
+    program->member##_offset = scratch_offset; \
+    program->member##_size = (size); \
+    scratch_offset += program->member##_size
+#define no_scratch(member) \
+    program->member##_offset = 0; \
+    program->member##_size = 0
+
+    alloc_scratch(counters_scratch, (2 + program->num_pipelines) * sizeof(uint32_t));
+    alloc_scratch(indirect_commands_scratch_base,
+            program->num_pipelines * sizeof(struct d3d12_workgraph_indirect_command) + WG_INDIRECT_COMMAND_OFFSET);
+    alloc_scratch(dividers_scratch, program->num_pipelines * sizeof(uint32_t));
+    alloc_scratch(share_mapping_scratch, program->num_pipelines * sizeof(uint32_t));
+    alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
+    if (rings)
+    {
+        /* A canary range follows each sink and the unrolled offsets directly, when the lab switch asks for it. */
+        alloc_scratch(payload0_scratch, config->ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size);
+        alloc_scratch(payload1_scratch, config->ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size);
+        /* One offset of 4 bytes per record, and a record takes at least 4 bytes of the payload capacity. */
+        alloc_scratch(unrolled_offsets_scratch, config->ring_size + canary_size);
+    }
+    else
+    {
+        no_scratch(payload0_scratch);
+        no_scratch(payload1_scratch);
+        no_scratch(unrolled_offsets_scratch);
+    }
+    if (program->drain_rounds)
+    {
+        alloc_scratch(drain_control_scratch, sizeof(struct vkd3d_workgraph_drain_control));
+        alloc_scratch(pool_state_scratch, (VkDeviceSize)program->num_levels * program->pool_state_stride);
+        alloc_scratch(pool_admit_scratch, program->num_pipelines * sizeof(uint32_t));
+    }
+    alloc_scratch(output_guard_scratch, sizeof(struct vkd3d_workgraph_output_guard));
+#undef no_scratch
+#undef alloc_scratch
+
+    return scratch_offset;
+}
+
+/* amdgpu-wddm fork: the lab drain mode runs on the record pools if they are valid. The admission of each slot that
+ * reads records of a level with outputs: u is the smallest number of records that one group of a reader takes (1 for
+ * a broadcasting reader, the coalesce factor, 32 for a thread launch reader), and the demand is the demand of one
+ * record on the next pool, all its readers and groups (d3d12_wg_state_object_program_record_demand). Admitting k
+ * records charges ceil(k / u) x demand, which is at least the sum of ceil(k / u_r) x demand_r over the readers. The
+ * other slots admit every record. The retention pass copies whole words, so each payload stride must be a multiple of
+ * 4 bytes. If a value does not fit, the lab drain mode keeps the payload rings. */
+static void d3d12_wg_state_object_program_init_pool_execution(struct d3d12_wg_state_object *object,
+        const struct d3d12_wg_state_object_data *data, struct d3d12_wg_state_object_program *program)
+{
+    const struct d3d12_workgraph_level_execution *exec;
+    const struct vkd3d_shader_node_input_data *input;
+    struct d3d12_wg_multi_input_config config;
+    struct vkd3d_workgraph_pool_admission *admission;
+    unsigned int level, i, j, slot, reader, u;
+
+    program->pool_execution = false;
+    if (!program->drain_rounds || !program->pool_valid)
+        return;
+    /* The test hook of pool_records replaces the bounds of the metadata, so the pools do not hold the records. */
+    d3d12_wg_get_multi_input_config(&config);
+    if (!config.pools || program->pool_test_records)
+    {
+        WARN("Work graph pools: the extra rounds run on the payload rings (pools %u, pool records %u).\n",
+                config.pools, program->pool_test_records);
+        return;
+    }
+
+    for (i = 0; i < program->num_pipelines; i++)
+    {
+        input = data->entry_points[program->slot_entry[i]].node_input;
+        if (input && (input->payload_stride & 3))
+        {
+            WARN("Work graph pools: slot %u has a payload stride of %u bytes, keeping the payload rings.\n",
+                    i, input->payload_stride);
+            return;
+        }
+    }
+
+    if (!(admission = vkd3d_calloc(program->num_pipelines, sizeof(*admission))))
+        return;
+    for (i = 0; i < program->num_pipelines; i++)
+        admission[i].u = 1;
+
+    for (level = 1; level + 1 < program->num_levels; level++)
+    {
+        exec = &program->levels[level];
+        for (i = 0; i < exec->nodes_count; i++)
+        {
+            slot = exec->nodes[i];
+            if (!d3d12_wg_state_object_program_record_demand(program, data, level, slot, admission[slot].demand))
+            {
+                WARN("Work graph pools: the demand of slot %u does not fit in 64 bits, keeping the payload rings.\n",
+                        slot);
+                vkd3d_free(admission);
+                return;
+            }
+
+            u = UINT32_MAX;
+            for (j = 0; j <= exec->shared_nodes_count; j++)
+            {
+                if (j == exec->shared_nodes_count)
+                    reader = slot;
+                else if (exec->shared_nodes[j].node_payload_index == slot)
+                    reader = exec->shared_nodes[j].node_pipeline_index;
+                else
+                    continue;
+                input = data->entry_points[program->slot_entry[reader]].node_input;
+                if (input->launch_type == VKD3D_SHADER_NODE_LAUNCH_TYPE_COALESCING)
+                    u = min(u, input->coalesce_factor);
+                else if (input->launch_type == VKD3D_SHADER_NODE_LAUNCH_TYPE_THREAD)
+                    u = min(u, THREAD_COALESCE_COUNT);
+                else
+                    u = min(u, 1);
+            }
+            if (!u)
+            {
+                WARN("Work graph pools: slot %u has a coalesce factor of 0, keeping the payload rings.\n", slot);
+                vkd3d_free(admission);
+                return;
+            }
+            admission[slot].u = u;
+            TRACE("Work graph pools: slot %u of level %u, u %u, demand %"PRIu64", %"PRIu64", %"PRIu64".\n", slot, level, u,
+                    admission[slot].demand[0], admission[slot].demand[1], admission[slot].demand[2]);
+        }
+    }
+
+    /* The fixed bookkeeping is the required scratch memory, so the output guard ends where the packed entries of the
+     * pool layout start. The canaries are for the payload rings. */
+    program->required_scratch_size = d3d12_wg_state_object_program_layout_scratch(program, &config, false);
+    if (program->required_scratch_size != program->pool_fixed_size)
+    {
+        ERR("Work graph pools: the fixed bookkeeping is %#"PRIx64" bytes, expected %#"PRIx64".\n",
+                program->required_scratch_size, program->pool_fixed_size);
+        program->required_scratch_size = d3d12_wg_state_object_program_layout_scratch(program, &config, true);
+        vkd3d_free(admission);
+        return;
+    }
+    program->indirect_commands_scratch_node_offset =
+            program->indirect_commands_scratch_base_offset + WG_INDIRECT_COMMAND_OFFSET;
+    program->canary_count = 0;
+    program->min_backing_size = program->pool_min_size;
+    program->max_backing_size = program->pool_max_size;
+    program->pool_admission = admission;
+    vkd3d_meta_get_workgraph_pool_pipeline(&object->device->meta_ops, &program->pool_pass);
+    program->pool_execution = true;
+    TRACE("Work graph pools: execution on the pools, Min %#"PRIx64", Max %#"PRIx64".\n",
+            program->pool_min_size, program->pool_max_size);
+}
+
 static HRESULT d3d12_wg_state_object_compile_program(
         struct d3d12_wg_state_object *object,
         struct d3d12_wg_state_object_data *data,
@@ -3451,7 +3652,22 @@ static HRESULT d3d12_wg_state_object_compile_program(
     for (i = 0; i < program->num_pipelines; i++)
         program->share_mapping[i] = UINT32_MAX;
 
-    program->compact_broadcast_nodes_with_max_grid =
+    d3d12_wg_get_multi_input_config(&multi_input_config);
+    canary_size = multi_input_config.canaries ? VKD3D_WORKGRAPH_CANARY_SIZE : 0;
+    /* The extra rounds are conditional rendering blocks. Without conditional rendering there is only round 1. */
+    program->drain_rounds = multi_input_config.drain_rounds;
+    program->drain_pending = multi_input_config.drain_pending;
+    if (program->drain_rounds && !object->device->device_info.conditional_rendering_features.conditionalRendering)
+    {
+        WARN("No conditional rendering, ignoring %u extra rounds.\n", program->drain_rounds);
+        program->drain_rounds = 0;
+    }
+    if (program->drain_rounds)
+        vkd3d_meta_get_workgraph_drain_pipeline(&object->device->meta_ops, &program->drain);
+
+    /* amdgpu-wddm fork: compaction counts the groups of every record of a level, also of the records that the lab
+     * drain mode does not admit, so the drain mode does not compact. */
+    program->compact_broadcast_nodes_with_max_grid = !program->drain_rounds &&
             d3d12_wg_state_object_program_can_compact_broadcast_nodes(object, data, program);
 
     for (i = 0; i < program->num_pipelines; i++)
@@ -3537,25 +3753,14 @@ static HRESULT d3d12_wg_state_object_compile_program(
     vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(&object->device->meta_ops,
             &program->multi_gpu_input_prepare, &program->multi_gpu_input_copy);
 
-#define alloc_scratch(member, size) \
-    scratch_offset = align64(scratch_offset, 64); \
-    program->member##_offset = scratch_offset; \
-    program->member##_size = (size); \
-    scratch_offset += program->member##_size
+    program->payload_ring_size = multi_input_config.ring_size;
+    program->packed_limit = multi_input_config.packed_limit;
+    program->pool_state_stride = align(16 + 8 * program->num_pipelines, 16);
 
-    alloc_scratch(counters_scratch, (2 + program->num_pipelines) * sizeof(uint32_t));
-    alloc_scratch(indirect_commands_scratch_base,
-            program->num_pipelines * sizeof(struct d3d12_workgraph_indirect_command) + WG_INDIRECT_COMMAND_OFFSET);
-    alloc_scratch(dividers_scratch, program->num_pipelines * sizeof(uint32_t));
-    alloc_scratch(share_mapping_scratch, program->num_pipelines * sizeof(uint32_t));
-    alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
-    d3d12_wg_get_multi_input_config(&multi_input_config);
-    /* A canary range follows each sink and the unrolled offsets directly, when the lab switch asks for it. */
-    canary_size = multi_input_config.canaries ? VKD3D_WORKGRAPH_CANARY_SIZE : 0;
-    alloc_scratch(payload0_scratch, multi_input_config.ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size);
-    alloc_scratch(payload1_scratch, multi_input_config.ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size);
-    /* One offset of 4 bytes per record, and a record takes at least 4 bytes of the payload capacity. */
-    alloc_scratch(unrolled_offsets_scratch, multi_input_config.ring_size + canary_size);
+    /* amdgpu-wddm fork: the fixed bookkeeping of the pool layout is the required scratch memory without the payload
+     * rings and the unrolled offsets. The ring layout comes after it, so that its offsets are the ones in use. */
+    program->pool_fixed_size = d3d12_wg_state_object_program_layout_scratch(program, &multi_input_config, false);
+    scratch_offset = d3d12_wg_state_object_program_layout_scratch(program, &multi_input_config, true);
     program->canary_count = 0;
     if (canary_size)
     {
@@ -3565,25 +3770,6 @@ static HRESULT d3d12_wg_state_object_compile_program(
                 program->unrolled_offsets_scratch_size - canary_size;
         program->canary_count = VKD3D_WORKGRAPH_CANARY_COUNT;
     }
-    /* The extra rounds are conditional rendering blocks. Without conditional rendering there is only round 1. Without
-     * extra rounds the layout does not change. */
-    program->drain_rounds = multi_input_config.drain_rounds;
-    program->drain_pending = multi_input_config.drain_pending;
-    if (program->drain_rounds && !object->device->device_info.conditional_rendering_features.conditionalRendering)
-    {
-        WARN("No conditional rendering, ignoring %u extra rounds.\n", program->drain_rounds);
-        program->drain_rounds = 0;
-    }
-    if (program->drain_rounds)
-    {
-        alloc_scratch(drain_control_scratch, sizeof(struct vkd3d_workgraph_drain_control));
-        vkd3d_meta_get_workgraph_drain_pipeline(&object->device->meta_ops, &program->drain);
-    }
-    /* The output guard ends where the packed offsets start. */
-    alloc_scratch(output_guard_scratch, sizeof(struct vkd3d_workgraph_output_guard));
-    program->payload_ring_size = multi_input_config.ring_size;
-    program->packed_limit = multi_input_config.packed_limit;
-#undef alloc_scratch
 
     program->multi_input_large_size = multi_input_config.large_size;
     program->multi_input_groups = multi_input_config.groups;
@@ -3601,25 +3787,12 @@ static HRESULT d3d12_wg_state_object_compile_program(
     program->indirect_commands_scratch_node_offset =
             program->indirect_commands_scratch_base_offset + WG_INDIRECT_COMMAND_OFFSET;
 
-    /* amdgpu-wddm fork: the fixed bookkeeping of the pool layout is the required scratch memory without the payload
-     * rings and the unrolled offsets, each range 64-byte aligned as above. */
-#define add_fixed(member) \
-    program->pool_fixed_size = align64(program->pool_fixed_size, 64) + program->member##_size
-    program->pool_fixed_size = 0;
-    add_fixed(counters_scratch);
-    add_fixed(indirect_commands_scratch_base);
-    add_fixed(dividers_scratch);
-    add_fixed(share_mapping_scratch);
-    add_fixed(payload_expander_scratch);
-    if (program->drain_rounds)
-        add_fixed(drain_control_scratch);
-    add_fixed(output_guard_scratch);
-#undef add_fixed
     program->pool_staging_size = program->multi_input_staging_min_size;
     program->pool_sink_size = VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size;
     program->pool_test_records = multi_input_config.pool_records;
     program->pool_test_stride = multi_input_config.pool_stride;
     d3d12_wg_state_object_program_compute_pools(program, data);
+    d3d12_wg_state_object_program_init_pool_execution(object, data, program);
 
     for (level = 0; level < program->num_levels; level++)
     {
@@ -3995,12 +4168,73 @@ static void d3d12_command_list_workgraph_multi_input_staging(const struct d3d12_
 
 /* amdgpu-wddm fork: struct vkd3d_workgraph_output_guard. The packed offsets have the memory from the end of the
  * required scratch memory to the staging range of the multi GPU input (8 bytes per entry). */
+/* amdgpu-wddm fork: the pool layout of the backing memory of the list. False without pool execution, or if the
+ * backing memory is less than Min of the pools. */
+static bool d3d12_wg_list_pool_layout(const struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program, struct d3d12_wg_drain_layout *layout)
+{
+    return program->pool_execution &&
+            d3d12_wg_drain_layout(program, list->wg_state.BackingMemory.SizeInBytes, layout);
+}
+
+/* amdgpu-wddm fork: the unrolled offsets of the execution: a region of the pool layout, or of the required scratch. */
+static VkDeviceAddress d3d12_wg_offsets_va(const struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program)
+{
+    struct d3d12_wg_drain_layout layout;
+
+    if (d3d12_wg_list_pool_layout(list, program, &layout))
+        return list->wg_state.BackingMemory.StartAddress + layout.offsets.offset;
+    return list->wg_state.BackingMemory.StartAddress + program->unrolled_offsets_scratch_offset;
+}
+
+/* amdgpu-wddm fork: the capacities of one half of a pool: the payload bytes and the packed entries of the output
+ * guard of its producers, and the unrolled offsets in records. The admission keeps the records of a throttled level
+ * inside all three capacities. The entry level, which writes pool 1, is not throttled. A record takes at least 4 bytes
+ * of the payload capacity (an empty record 4 bytes, a record with a payload its stride, which is a multiple of 4 bytes)
+ * and one unrolled offset. So the payload capacity of pool 1 is at most 4 bytes for each unrolled offset: its records
+ * then fit in the unrolled offsets. The layout makes the unrolled offsets at least as large as a payload half of
+ * pool 1 (d3d12_wg_drain_isolated_sizes), so this limit does not reduce it. */
+static void d3d12_wg_pool_capacity(const struct d3d12_wg_state_object_program *program,
+        const struct d3d12_wg_drain_layout *layout, unsigned int pool, unsigned int half, uint32_t caps[3])
+{
+    VkDeviceSize offsets = min(layout->offsets.size / sizeof(uint32_t), (VkDeviceSize)UINT32_MAX);
+    VkDeviceSize payload = layout->payload[pool][half].size;
+
+    if (pool == 1)
+        payload = min(payload, 4 * offsets);
+
+    caps[D3D12_WG_POOL_PAYLOAD] = min(payload, (VkDeviceSize)UINT32_MAX) & ~(VkDeviceSize)15;
+    caps[D3D12_WG_POOL_ENTRIES] = min(min(layout->entries.size / (2 * sizeof(uint32_t)),
+            (VkDeviceSize)program->packed_limit), (VkDeviceSize)UINT32_MAX);
+    caps[D3D12_WG_POOL_OFFSETS] = offsets;
+}
+
 static void d3d12_command_list_workgraph_init_output_guard(struct d3d12_command_list *list,
         const struct d3d12_wg_state_object_program *program, const struct vkd3d_unique_resource *resource)
 {
     struct vkd3d_workgraph_output_guard guard;
+    struct d3d12_wg_drain_layout layout;
     VkDeviceAddress packed_va, staging_va;
     VkDeviceSize packed_size, staging_size;
+    uint32_t caps[3];
+
+    /* With record pools, the retention pass of each level writes the guard of the next pool; this is the guard of
+     * pool 1, half 0, for the entry level. */
+    if (d3d12_wg_list_pool_layout(list, program, &layout))
+    {
+        memset(&guard, 0, sizeof(guard));
+        if (program->num_levels > 1)
+        {
+            d3d12_wg_pool_capacity(program, &layout, 1, 0, caps);
+            guard.payload_capacity = caps[D3D12_WG_POOL_PAYLOAD];
+            guard.packed_capacity = caps[D3D12_WG_POOL_ENTRIES];
+        }
+        d3d12_command_list_update_buffer(list, resource->vk_buffer,
+                list->wg_state.BackingMemory.StartAddress - resource->va + program->output_guard_scratch_offset,
+                sizeof(guard), &guard);
+        return;
+    }
 
     packed_va = list->wg_state.BackingMemory.StartAddress + program->required_scratch_size;
     d3d12_command_list_workgraph_multi_input_staging(list, program, &staging_va, &staging_size);
@@ -4365,7 +4599,7 @@ static void d3d12_command_list_workgraph_barrier(struct d3d12_command_list *list
 
 static void d3d12_command_list_emit_distribute_workgroups(struct d3d12_command_list *list,
         const struct d3d12_wg_state_object *state,
-        const struct d3d12_wg_state_object_program *program)
+        const struct d3d12_wg_state_object_program *program, VkDeviceAddress admit_va)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
     struct vkd3d_workgraph_workgroups_args args;
@@ -4382,6 +4616,7 @@ static void d3d12_command_list_emit_distribute_workgroups(struct d3d12_command_l
     args.node_share_mapping_va = program->share_mapping_scratch_offset + list->wg_state.BackingMemory.StartAddress;
     args.output_guard_va = program->output_guard_scratch_offset + list->wg_state.BackingMemory.StartAddress;
     args.lost_records_va = state->lost_records.va;
+    args.admit_va = admit_va;
     args.num_nodes = program->num_pipelines;
 
     d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
@@ -4422,7 +4657,7 @@ static void d3d12_command_list_emit_distribute_payload_offsets(struct d3d12_comm
     args.commands = list->wg_state.BackingMemory.StartAddress + program->indirect_commands_scratch_base_offset;
     args.meta = list->wg_state.BackingMemory.StartAddress + program->payload_expander_scratch_offset;
     args.payload = payload_va;
-    args.unrolled_offsets = list->wg_state.BackingMemory.StartAddress + program->unrolled_offsets_scratch_offset;
+    args.unrolled_offsets = d3d12_wg_offsets_va(list, program);
     args.packed_offset_counts = list->wg_state.BackingMemory.StartAddress + program->required_scratch_size;
 
     d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
@@ -4553,8 +4788,7 @@ static void d3d12_command_list_workgraph_execute_node_gpu(
                 list->wg_state.BackingMemory.StartAddress + program->indirect_commands_scratch_node_offset +
                 sizeof(struct d3d12_workgraph_indirect_command) * node_index;
 
-        push.node_payload_stride_or_offsets_bda =
-                list->wg_state.BackingMemory.StartAddress + program->unrolled_offsets_scratch_offset;
+        push.node_payload_stride_or_offsets_bda = d3d12_wg_offsets_va(list, program);
         push.node_payload_bda = input_va;
 
         primary_linear_offset_bda = indirect_va + offsetof(struct d3d12_workgraph_indirect_command, primary_linear_offset);
@@ -4623,16 +4857,150 @@ static void d3d12_command_list_workgraph_execute_node_gpu(
     VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_NODE);
 }
 
+/* amdgpu-wddm fork: the record pools of one DispatchGraph call. level_args_va has struct
+ * vkd3d_workgraph_pool_level_args for each half and level: half x num_levels + level. */
+struct d3d12_wg_pool_dispatch
+{
+    struct d3d12_wg_drain_layout layout;
+    VkDeviceAddress level_args_va;
+};
+
+static VkDeviceAddress d3d12_wg_pool_level_va(const struct d3d12_wg_state_object_program *program,
+        const struct d3d12_wg_pool_dispatch *pools, unsigned int level, unsigned int half)
+{
+    return pools->level_args_va + (half * program->num_levels + level) * sizeof(struct vkd3d_workgraph_pool_level_args);
+}
+
+static VkDeviceAddress d3d12_wg_pool_payload_va(const struct d3d12_command_list *list,
+        const struct d3d12_wg_pool_dispatch *pools, unsigned int pool, unsigned int half)
+{
+    return list->wg_state.BackingMemory.StartAddress + pools->layout.payload[pool][half].offset;
+}
+
+/* Uploads the admission table and the level arguments of the pools for the backing memory of the list. */
+static bool d3d12_command_list_workgraph_prepare_pools(struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program, struct d3d12_wg_pool_dispatch *pools)
+{
+    VkDeviceAddress base = list->wg_state.BackingMemory.StartAddress;
+    struct vkd3d_workgraph_pool_level_args *args;
+    struct vkd3d_scratch_allocation table, levels;
+    unsigned int level, half;
+
+    if (!d3d12_wg_list_pool_layout(list, program, &pools->layout))
+        return false;
+
+    if (!d3d12_command_list_workgraph_allocate_scratch(list, VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
+            program->num_pipelines * sizeof(struct vkd3d_workgraph_pool_admission), 64, &table))
+        return false;
+    memcpy(table.host_ptr, program->pool_admission, program->num_pipelines * sizeof(struct vkd3d_workgraph_pool_admission));
+
+    if (!d3d12_command_list_workgraph_allocate_scratch(list, VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
+            2 * program->num_levels * sizeof(*args), 64, &levels))
+        return false;
+    pools->level_args_va = levels.va;
+
+    for (half = 0; half < 2; half++)
+    {
+        for (level = 0; level < program->num_levels; level++)
+        {
+            args = (struct vkd3d_workgraph_pool_level_args *)levels.host_ptr + half * program->num_levels + level;
+            memset(args, 0, sizeof(*args));
+            args->commands_va = base + program->indirect_commands_scratch_base_offset;
+            args->offsets_va = base + pools->layout.offsets.offset;
+            if (level)
+            {
+                args->source_va = base + pools->layout.payload[level][half].offset;
+                args->target_va = base + pools->layout.payload[level][half ^ 1].offset;
+            }
+            args->meta_va = base + program->payload_expander_scratch_offset;
+            args->share_mapping_va = base + program->share_mapping_scratch_offset;
+            args->pool_states_va = base + program->pool_state_scratch_offset;
+            args->atomics_va = base + program->counters_scratch_offset;
+            args->entries_va = base + pools->layout.entries.offset;
+            args->guard_va = base + program->output_guard_scratch_offset;
+            args->table_va = table.va;
+            args->admit_va = base + program->pool_admit_scratch_offset;
+            args->admitted_va = base + program->drain_control_scratch_offset +
+                    offsetof(struct vkd3d_workgraph_drain_control, admitted);
+            args->pool_state_stride = program->pool_state_stride;
+            args->level = level;
+            args->num_nodes = program->num_pipelines;
+            if (level + 1 < program->num_levels)
+            {
+                args->inject_level = level + 1;
+                d3d12_wg_pool_capacity(program, &pools->layout, level + 1, half, args->caps);
+                args->payload_capacity = args->caps[D3D12_WG_POOL_PAYLOAD];
+                args->packed_capacity = args->caps[D3D12_WG_POOL_ENTRIES];
+            }
+        }
+    }
+
+    return true;
+}
+
+/* One admission or retention pass. The barrier before it orders it after every earlier write of the execution, and
+ * makes them visible to its reads and writes: the retention pass overwrites the packed entries that the expander read,
+ * and writes the counters that the nodes add to. */
+static void d3d12_command_list_workgraph_emit_pool_pass(struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program, VkDeviceAddress level_va,
+        enum vkd3d_workgraph_pool_mode mode, unsigned int level)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    struct vkd3d_workgraph_pool_args args;
+
+    d3d12_command_list_workgraph_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    memset(&args, 0, sizeof(args));
+    args.level_va = level_va;
+    args.mode = mode;
+
+    VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            program->pool_pass.vk_pipeline));
+    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer, program->pool_pass.vk_pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT, sizeof(args), &args);
+
+    if (list->device->vk_info.EXT_debug_utils)
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Pool %s - level %u", mode == VKD3D_WORKGRAPH_POOL_MODE_ADMIT ? "admit" : "retain",
+                level);
+        d3d12_command_list_debug_mark_label(list, buf, 1.0f, 0.8f, 0.8f, 1.0f);
+    }
+
+    /* The admission is one serial loop over the slots. The retention copies with up to 64 groups. */
+    VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, mode == VKD3D_WORKGRAPH_POOL_MODE_ADMIT ? 1 : 64, 1, 1));
+    VKD3D_BREADCRUMB_TAG("pool");
+    VKD3D_BREADCRUMB_AUX32(mode);
+    VKD3D_BREADCRUMB_AUX32(level);
+    VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
+
+    /* The nodes read the injected entries and counters and add to them, and the distributor reads the admitted
+     * counts. */
+    d3d12_command_list_workgraph_barrier(list,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+}
+
+/* With record pools (pool_level_va is not 0), a level with outputs admits the records that fit the next pool before
+ * the distributor, and retains the others after the expander. */
 static void d3d12_command_list_workgraph_execute_level(struct d3d12_command_list *list,
         const struct d3d12_wg_state_object *state,
         const struct d3d12_wg_state_object_program *program,
         uint32_t level, VkDeviceAddress output_payload, VkDeviceAddress input_payload,
-        VkDeviceAddress vk_root_parameter_buffer_va)
+        VkDeviceAddress vk_root_parameter_buffer_va, VkDeviceAddress pool_level_va)
 {
+    bool throttled = pool_level_va && level + 1 < program->num_levels;
     uint32_t i;
 
-    d3d12_command_list_emit_distribute_workgroups(list, state, program);
+    if (throttled)
+        d3d12_command_list_workgraph_emit_pool_pass(list, program, pool_level_va, VKD3D_WORKGRAPH_POOL_MODE_ADMIT, level);
+    d3d12_command_list_emit_distribute_workgroups(list, state, program, throttled ?
+            list->wg_state.BackingMemory.StartAddress + program->pool_admit_scratch_offset : 0);
     d3d12_command_list_emit_distribute_payload_offsets(list, state, program, level, input_payload);
+    if (throttled)
+        d3d12_command_list_workgraph_emit_pool_pass(list, program, pool_level_va, VKD3D_WORKGRAPH_POOL_MODE_RETAIN, level);
 
     /* Execute nodes */
     for (i = 0; i < program->levels[level].nodes_count; i++)
@@ -4798,6 +5166,17 @@ static VkDeviceAddress d3d12_wg_payload_va(const struct d3d12_command_list *list
             (index ? program->payload1_scratch_offset : program->payload0_scratch_offset);
 }
 
+/* amdgpu-wddm fork: the output payload of the entry level: payload ring 0, or half 0 of pool 1. */
+static VkDeviceAddress d3d12_wg_entry_output_va(const struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program)
+{
+    struct d3d12_wg_drain_layout layout;
+
+    if (d3d12_wg_list_pool_layout(list, program, &layout))
+        return program->num_levels > 1 ? list->wg_state.BackingMemory.StartAddress + layout.payload[1][0].offset : 0;
+    return d3d12_wg_payload_va(list, program, 0);
+}
+
 static bool d3d12_command_list_workgraph_execute_entry_gpu(
         struct d3d12_command_list *list, struct d3d12_wg_state_object *state,
         const struct d3d12_wg_state_object_program *program, D3D12_GPU_VIRTUAL_ADDRESS va,
@@ -4816,7 +5195,7 @@ static bool d3d12_command_list_workgraph_execute_entry_gpu(
     for (i = 0; i < program->levels[0].nodes_count; i++)
     {
         d3d12_command_list_workgraph_execute_node_gpu(
-                list, state, program, d3d12_wg_payload_va(list, program, 0), va, 0, program->levels[0].nodes[i],
+                list, state, program, d3d12_wg_entry_output_va(list, program), va, 0, program->levels[0].nodes[i],
                 &indirect_scratch, vk_root_param_buffer_va);
     }
 
@@ -4824,7 +5203,7 @@ static bool d3d12_command_list_workgraph_execute_entry_gpu(
     for (i = 0; i < program->levels[0].shared_nodes_count; i++)
     {
         d3d12_command_list_workgraph_execute_node_gpu(
-                list, state, program, d3d12_wg_payload_va(list, program, 0), va, 0, program->levels[0].shared_nodes[i].node_pipeline_index,
+                list, state, program, d3d12_wg_entry_output_va(list, program), va, 0, program->levels[0].shared_nodes[i].node_pipeline_index,
                 &indirect_scratch, vk_root_param_buffer_va);
     }
 
@@ -4840,10 +5219,22 @@ static void d3d12_command_list_workgraph_multi_input_staging(const struct d3d12_
         const struct d3d12_wg_state_object_program *program, VkDeviceAddress *va, VkDeviceSize *size)
 {
     VkDeviceSize backing_size = list->wg_state.BackingMemory.SizeInBytes;
+    struct d3d12_wg_drain_layout layout;
     VkDeviceSize used, staging;
 
     *va = 0;
     *size = 0;
+
+    /* amdgpu-wddm fork: with record pools, the staging range is the one of the pool layout. */
+    if (program->pool_execution)
+    {
+        if (d3d12_wg_list_pool_layout(list, program, &layout))
+        {
+            *va = list->wg_state.BackingMemory.StartAddress + layout.staging.offset;
+            *size = layout.staging.size;
+        }
+        return;
+    }
 
     if (backing_size >= program->min_backing_size)
     {
@@ -5021,14 +5412,14 @@ static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
         slot_indirect.offset = indirect_scratch.offset + s * indirect_size;
         slot_indirect.va = indirect_scratch.va + s * indirect_size;
 
-        d3d12_command_list_workgraph_execute_node_gpu(list, state, program, d3d12_wg_payload_va(list, program, 0), slot_va,
+        d3d12_command_list_workgraph_execute_node_gpu(list, state, program, d3d12_wg_entry_output_va(list, program), slot_va,
                 0, node_index, &slot_indirect, vk_root_param_buffer_va);
 
         for (j = 0; j < program->levels[0].shared_nodes_count; j++)
         {
             if (program->levels[0].shared_nodes[j].node_payload_index == node_index)
             {
-                d3d12_command_list_workgraph_execute_node_gpu(list, state, program, d3d12_wg_payload_va(list, program, 0),
+                d3d12_command_list_workgraph_execute_node_gpu(list, state, program, d3d12_wg_entry_output_va(list, program),
                         slot_va, 0, program->levels[0].shared_nodes[j].node_pipeline_index,
                         &slot_indirect, vk_root_param_buffer_va);
             }
@@ -5080,7 +5471,7 @@ static bool d3d12_command_list_workgraph_execute_entry_cpu(
         memcpy(payload_scratch.host_ptr, desc->pRecords, payload_size);
 
     if (!d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program, node_index, desc,
-            d3d12_wg_payload_va(list, program, 0), payload_scratch.va,
+            d3d12_wg_entry_output_va(list, program), payload_scratch.va,
             vk_root_param_buffer_va))
         return false;
 
@@ -5091,7 +5482,7 @@ static bool d3d12_command_list_workgraph_execute_entry_cpu(
         {
             if (!d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program,
                     program->levels[0].shared_nodes[i].node_pipeline_index, desc,
-                    d3d12_wg_payload_va(list, program, 0), payload_scratch.va,
+                    d3d12_wg_entry_output_va(list, program), payload_scratch.va,
                     vk_root_param_buffer_va))
                 return false;
         }
@@ -5205,6 +5596,12 @@ static void d3d12_command_list_workgraph_emit_drain(struct d3d12_command_list *l
     args.pending_rounds = program->drain_pending;
     /* "drain-stall:<r>" makes round r a round without progress. */
     args.stall = mode == VKD3D_WORKGRAPH_DRAIN_MODE_PENDING && d3d12_wg_fault_injected("drain-stall", round);
+    if (program->pool_execution)
+    {
+        args.pool_states_va = list->wg_state.BackingMemory.StartAddress + program->pool_state_scratch_offset;
+        args.pools = program->num_levels;
+        args.pool_state_words = program->pool_state_stride / sizeof(uint32_t);
+    }
 
     VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
             program->drain.vk_pipeline));
@@ -5255,13 +5652,15 @@ static void d3d12_command_list_workgraph_drain_end(struct d3d12_command_list *li
 
 /* The end of round 1 and the extra rounds, then close. Round r (round 1 is r = 0) ends with the pending dispatch
  * that writes pending[r]. Extra round r runs levels 1 to num_levels - 1 under pending[r - 1]; the entry level runs only
- * in round 1. */
+ * in round 1. With record pools, round r uses half r & 1 of every pool, and an extra round begins with the injection
+ * of the records of pool 1 that round r - 1 retained. */
 static void d3d12_command_list_workgraph_drain_rounds(struct d3d12_command_list *list,
         struct d3d12_wg_state_object *state, const struct d3d12_wg_state_object_program *program,
-        const struct vkd3d_unique_resource *backing, VkDeviceAddress vk_root_parameter_buffer_va, bool *block)
+        const struct vkd3d_unique_resource *backing, VkDeviceAddress vk_root_parameter_buffer_va,
+        const struct d3d12_wg_pool_dispatch *pools, bool *block)
 {
     VkDeviceSize control_offset;
-    uint32_t r, i;
+    uint32_t r, i, half;
 
     control_offset = list->wg_state.BackingMemory.StartAddress - backing->va + program->drain_control_scratch_offset;
 
@@ -5279,11 +5678,27 @@ static void d3d12_command_list_workgraph_drain_rounds(struct d3d12_command_list 
         d3d12_command_list_workgraph_drain_begin(list, state, backing->vk_buffer,
                 control_offset + offsetof(struct vkd3d_workgraph_drain_control, pending) +
                 (r - 1) * sizeof(uint32_t));
+        half = r & 1;
+        if (pools && program->num_levels > 1)
+        {
+            d3d12_command_list_workgraph_emit_pool_pass(list, program, d3d12_wg_pool_level_va(program, pools, 0, half),
+                    VKD3D_WORKGRAPH_POOL_MODE_RETAIN, 0);
+        }
         for (i = 1; i < program->num_levels; i++)
         {
-            d3d12_command_list_workgraph_execute_level(list, state, program, i,
-                    d3d12_wg_payload_va(list, program, i & 1), d3d12_wg_payload_va(list, program, (i & 1) ^ 1),
-                    vk_root_parameter_buffer_va);
+            if (pools)
+            {
+                d3d12_command_list_workgraph_execute_level(list, state, program, i,
+                        i + 1 < program->num_levels ? d3d12_wg_pool_payload_va(list, pools, i + 1, half) : 0,
+                        d3d12_wg_pool_payload_va(list, pools, i, half), vk_root_parameter_buffer_va,
+                        d3d12_wg_pool_level_va(program, pools, i, half));
+            }
+            else
+            {
+                d3d12_command_list_workgraph_execute_level(list, state, program, i,
+                        d3d12_wg_payload_va(list, program, i & 1), d3d12_wg_payload_va(list, program, (i & 1) ^ 1),
+                        vk_root_parameter_buffer_va, 0);
+            }
         }
         d3d12_command_list_workgraph_emit_drain(list, state, program, VKD3D_WORKGRAPH_DRAIN_MODE_PENDING, r);
         d3d12_command_list_workgraph_drain_end(list);
@@ -5300,6 +5715,8 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
 {
     struct d3d12_wg_drain_predication drain_predication;
     const struct vkd3d_unique_resource *backing = NULL;
+    struct d3d12_wg_pool_dispatch pool_dispatch;
+    const struct d3d12_wg_pool_dispatch *pools = NULL;
     const struct d3d12_wg_state_object_program *program;
     struct vkd3d_scratch_allocation root_param_scratch;
     struct d3d12_wg_state_object *wg_state;
@@ -5342,6 +5759,20 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
         goto out;
     }
 
+    /* amdgpu-wddm fork: with record pools, the backing memory must have a pool layout (Min of the pools). */
+    if (program->pool_execution)
+    {
+        if (list->wg_state.BackingMemory.SizeInBytes < program->pool_min_size)
+        {
+            ERR("Backing memory is less than Min of the record pools (%"PRIu64" < %"PRIu64"), the graph does not run.\n",
+                    list->wg_state.BackingMemory.SizeInBytes, program->pool_min_size);
+            goto out;
+        }
+        if (!d3d12_command_list_workgraph_prepare_pools(list, program, &pool_dispatch))
+            goto out;
+        pools = &pool_dispatch;
+    }
+
     if (!d3d12_command_list_workgraph_allocate_scratch(list,
             VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
             sizeof(union vkd3d_root_parameter_data), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
@@ -5354,6 +5785,12 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
     if (program->drain_rounds && !(backing = vkd3d_va_map_deref(&list->device->memory_allocator.va_map,
             list->wg_state.BackingMemory.StartAddress)))
         WARN("No resource at the backing memory, running round 1 only.\n");
+    /* The pools need the round frame: its init clears the pool states. */
+    if (pools && !backing)
+    {
+        ERR("No resource at the backing memory, the graph does not run on the record pools.\n");
+        goto out;
+    }
 
     if (backing)
     {
@@ -5369,19 +5806,37 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
         }
     }
 
+    /* With record pools, the injection pass of the entry level writes the output guard of pool 1, half 0. Nothing is
+     * retained before round 1, so it injects no records. */
+    if (pools && program->num_levels > 1)
+    {
+        d3d12_command_list_workgraph_emit_pool_pass(list, program, d3d12_wg_pool_level_va(program, pools, 0, 0),
+                VKD3D_WORKGRAPH_POOL_MODE_RETAIN, 0);
+    }
+
     if (!d3d12_command_list_workgraph_execute_entry_level(list, wg_state, program, desc,
             root_param_scratch.va))
         goto out;
 
     for (i = 1; i < program->num_levels; i++)
     {
-        d3d12_command_list_workgraph_execute_level(list, wg_state, program, i,
-                d3d12_wg_payload_va(list, program, i & 1), d3d12_wg_payload_va(list, program, (i & 1) ^ 1),
-                root_param_scratch.va);
+        if (pools)
+        {
+            d3d12_command_list_workgraph_execute_level(list, wg_state, program, i,
+                    i + 1 < program->num_levels ? d3d12_wg_pool_payload_va(list, pools, i + 1, 0) : 0,
+                    d3d12_wg_pool_payload_va(list, pools, i, 0), root_param_scratch.va,
+                    d3d12_wg_pool_level_va(program, pools, i, 0));
+        }
+        else
+        {
+            d3d12_command_list_workgraph_execute_level(list, wg_state, program, i,
+                    d3d12_wg_payload_va(list, program, i & 1), d3d12_wg_payload_va(list, program, (i & 1) ^ 1),
+                    root_param_scratch.va, 0);
+        }
     }
 
     if (backing)
-        d3d12_command_list_workgraph_drain_rounds(list, wg_state, program, backing, root_param_scratch.va, &block);
+        d3d12_command_list_workgraph_drain_rounds(list, wg_state, program, backing, root_param_scratch.va, pools, &block);
 
 out:
     /* After a failure the list does not execute; the block still ends, and B6 restores the predicate state. */

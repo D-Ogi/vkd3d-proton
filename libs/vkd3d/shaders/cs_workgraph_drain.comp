@@ -1,16 +1,20 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 // amdgpu-wddm fork: the round frame of the draining work graph scheduler. After round 1, the engine records up to
 // MAX_ROUNDS extra rounds, each in a conditional rendering block on the pending word of the round before. One
 // invocation. The mode selects the pass:
-//   MODE_INIT: clears the control block. It runs outside every conditional block, before round 1.
+//   MODE_INIT: clears the control block and the pool states. It runs outside every conditional block, before round 1.
 //   MODE_PENDING: the last dispatch of round r. It sets bit r of the executed mask and writes pending[r]: 1 if work
-//     is waiting, 0 if not or if the fault word is set. A skipped round writes nothing.
+//     is waiting, 0 if not or if the fault word is set. A skipped round writes nothing. With record pools, work is
+//     waiting if a pool holds retained records. Self-check: if records were waiting at the start of an extra round and
+//     no admission pass of the round admitted a record, the round made no progress and the fault word is set.
 //   MODE_CLOSE: runs outside every conditional block, after the last round. It writes the close reason and counts the
 //     close. If work is left (pending[rounds] is not 0) or the fault word is set, it adds one event to the abandonment
-//     record of the state object.
-// The layouts are struct vkd3d_workgraph_drain_control and struct vkd3d_workgraph_abandoned in vkd3d_private.h.
+//     record of the state object, and the records that the pools still hold to its record count.
+// The layouts are struct vkd3d_workgraph_drain_control, struct vkd3d_workgraph_abandoned and struct
+// vkd3d_workgraph_pool_state in vkd3d_private.h.
 layout(local_size_x = 1) in;
 
 const uint MODE_INIT = 0u;
@@ -31,7 +35,9 @@ layout(buffer_reference, buffer_reference_align = 16, std430) buffer Control
 	uint fault;
 	uint closes;
 	uint close_reason;
-	uint padding;
+	uint admitted;
+	uint waiting;
+	uint reserved[3];
 };
 
 layout(buffer_reference, buffer_reference_align = 16, std430) buffer Abandoned
@@ -43,7 +49,18 @@ layout(buffer_reference, buffer_reference_align = 16, std430) buffer Abandoned
 	uint items[12];
 	uint inputs_lo;
 	uint inputs_hi;
-	uint padding[2];
+	uint records_lo;
+	uint records_hi;
+};
+
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer PoolState
+{
+	uvec4 head;
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) writeonly buffer PoolWords
+{
+	uint data[];
 };
 
 layout(push_constant, std430) uniform Registers
@@ -55,12 +72,51 @@ layout(push_constant, std430) uniform Registers
 	uint rounds;
 	uint pending_rounds;
 	uint stall;
+	uint padding;
+	uint64_t pool_states;
+	uint pools;
+	uint pool_state_words;
 } registers;
+
+PoolState pool_state(uint pool)
+{
+	return PoolState(registers.pool_states + uint64_t(pool) * uint64_t(registers.pool_state_words) * 4ul);
+}
+
+// True if a pool holds a record. The pending word is a Boolean of the pools, not a sum of their records.
+bool pools_hold_records()
+{
+	uint pool;
+
+	for (pool = 1u; pool < registers.pools; pool++)
+	{
+		uvec4 head = pool_state(pool).head;
+		if (head.z != 0u || head.w != 0u)
+			return true;
+	}
+	return false;
+}
+
+// The records that the pools hold: records with a payload and empty records of each pool. There are less than 32
+// pools, each with less than 2^33 records, so the sum fits in 64 bits.
+uint64_t pool_records()
+{
+	uint64_t records = 0ul;
+	uint pool;
+
+	for (pool = 1u; pool < registers.pools; pool++)
+	{
+		uvec4 head = pool_state(pool).head;
+		records += uint64_t(head.z) + uint64_t(head.w);
+	}
+	return records;
+}
 
 void main()
 {
 	Control control = registers.control;
-	uint i, reason, waiting;
+	uint i, reason, waiting, real;
+	uint64_t records;
 
 	if (registers.mode == MODE_INIT)
 	{
@@ -71,6 +127,10 @@ void main()
 		control.fault = 0u;
 		control.closes = 0u;
 		control.close_reason = REASON_COMPLETE;
+		control.admitted = 0u;
+		control.waiting = 0u;
+		for (i = 0u; i < registers.pools * registers.pool_state_words; i++)
+			PoolWords(registers.pool_states).data[i] = 0u;
 	}
 	else if (registers.mode == MODE_PENDING)
 	{
@@ -80,8 +140,14 @@ void main()
 		if (registers.stall != 0u)
 			control.fault = 1u;
 
-		// Until the pools exist, only the lab hook reports waiting work.
-		waiting = registers.round < registers.pending_rounds ? 1u : 0u;
+		// The records in the pools, and the lab hook, which reports waiting work without records.
+		real = pools_hold_records() ? 1u : 0u;
+		if (registers.round != 0u && control.waiting != 0u && control.admitted == 0u)
+			control.fault = 1u;
+		control.waiting = real;
+		control.admitted = 0u;
+
+		waiting = real != 0u || registers.round < registers.pending_rounds ? 1u : 0u;
 		if (control.fault != 0u)
 			waiting = 0u;
 		control.pending[registers.round] = waiting;
@@ -104,6 +170,14 @@ void main()
 			atomicOr(registers.abandoned.reasons, 1u << reason);
 			atomicExchange(registers.abandoned.last_reason, reason);
 			atomicOr(registers.abandoned.flags, ABANDONED);
+
+			records = pool_records();
+			uint lo = uint(records), hi = uint(records >> 32u);
+			uint old = atomicAdd(registers.abandoned.records_lo, lo);
+			if (old + lo < old)
+				hi += 1u;
+			if (hi != 0u)
+				atomicAdd(registers.abandoned.records_hi, hi);
 		}
 	}
 }

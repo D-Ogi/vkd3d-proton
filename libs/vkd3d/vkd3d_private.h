@@ -5564,6 +5564,9 @@ struct vkd3d_workgraph_workgroups_args
      * struct vkd3d_workgraph_lost_records of the state object. */
     VkDeviceAddress output_guard_va;
     VkDeviceAddress lost_records_va;
+    /* amdgpu-wddm fork: the admitted record count of each slot (cs_workgraph_pool.comp, admission), or 0 if every
+     * record is admitted. */
+    VkDeviceAddress admit_va;
     uint32_t num_nodes;
 };
 
@@ -5688,14 +5691,20 @@ struct vkd3d_workgraph_drain_control
     uint32_t fault;
     uint32_t closes;
     uint32_t close_reason;
-    uint32_t padding;
+    /* With record pools: an admission pass of the round admitted a record. The pending dispatch clears it. */
+    uint32_t admitted;
+    /* With record pools: 1 if the pools held records at the pending dispatch of the last round that ran. */
+    uint32_t waiting;
+    uint32_t reserved[3];
 };
 
 /* amdgpu-wddm fork: the work that close abandoned, for all executions of a state object. It is its own record, not
  * part of struct vkd3d_workgraph_lost_records, which counts the records dropped at allocation. reasons has bit
  * 1 << reason of each close that abandoned work. items[] are 128-bit counts of waiting work items per reader kind
  * (groups, coalescing slots, threads), four 32-bit words each, low word first; inputs is the 64-bit count of input
- * records not taken. The memory is host-visible, after struct vkd3d_workgraph_lost_records. */
+ * records not taken. records is the 64-bit count of the records that the record pools still held at close (whole
+ * records, each counted once for all its readers). The memory is host-visible, after struct
+ * vkd3d_workgraph_lost_records. */
 #define VKD3D_WORKGRAPH_ABANDONED 0x1u
 /* The offset of struct vkd3d_workgraph_abandoned in the host-visible allocation. */
 #define VKD3D_WORKGRAPH_ABANDONED_OFFSET 16u
@@ -5709,7 +5718,8 @@ struct vkd3d_workgraph_abandoned
     uint32_t items[3][4];
     uint32_t inputs_lo;
     uint32_t inputs_hi;
-    uint32_t padding[2];
+    uint32_t records_lo;
+    uint32_t records_hi;
 };
 
 enum vkd3d_workgraph_drain_mode
@@ -5729,6 +5739,71 @@ struct vkd3d_workgraph_drain_args
     /* Lab flavour test hooks: the rounds below pending_rounds report waiting work, and stall sets the fault word. */
     uint32_t pending_rounds;
     uint32_t stall;
+    uint32_t padding;
+    /* With record pools: the pool states (struct vkd3d_workgraph_pool_state, pool_state_words words each) of pools 1
+     * to pools - 1, from the state of pool 0. 0 without record pools. */
+    VkDeviceAddress pool_states_va;
+    uint32_t pools;
+    uint32_t pool_state_words;
+};
+
+/* amdgpu-wddm fork: the record pools of the draining scheduler (cs_workgraph_pool.comp). The state of pool L, in the
+ * backing memory: the retained head (payload bytes, packed entries, records with a payload, empty records), then for
+ * each slot the retained records and the offset of their block. The stride is a multiple of 16 bytes. */
+struct vkd3d_workgraph_pool_state
+{
+    uint32_t head[4];
+    uint32_t slots[][2];
+};
+
+/* The admission of a slot: u records per group, and the demand of one group on the next pool (payload bytes,
+ * packed entries, unrolled offsets), the sum over the readers of the slot. */
+struct vkd3d_workgraph_pool_admission
+{
+    uint32_t u;
+    uint32_t padding;
+    uint64_t demand[3];
+};
+
+enum vkd3d_workgraph_pool_mode
+{
+    VKD3D_WORKGRAPH_POOL_MODE_ADMIT = 0,
+    VKD3D_WORKGRAPH_POOL_MODE_RETAIN = 1,
+};
+
+/* The addresses and capacities of one level of one round parity, in upload memory. */
+struct vkd3d_workgraph_pool_level_args
+{
+    VkDeviceAddress commands_va;
+    VkDeviceAddress offsets_va;
+    VkDeviceAddress source_va;
+    VkDeviceAddress target_va;
+    VkDeviceAddress meta_va;
+    VkDeviceAddress share_mapping_va;
+    VkDeviceAddress pool_states_va;
+    VkDeviceAddress atomics_va;
+    VkDeviceAddress entries_va;
+    VkDeviceAddress guard_va;
+    VkDeviceAddress table_va;
+    VkDeviceAddress admit_va;
+    VkDeviceAddress admitted_va;
+    uint32_t pool_state_stride;
+    uint32_t level;
+    uint32_t inject_level;
+    uint32_t num_nodes;
+    /* The output guard of pool inject_level. */
+    uint32_t payload_capacity;
+    uint32_t packed_capacity;
+    /* The admission capacity of pool level + 1: payload bytes, packed entries, unrolled offsets. */
+    uint32_t caps[3];
+    uint32_t padding;
+};
+
+struct vkd3d_workgraph_pool_args
+{
+    VkDeviceAddress level_va;
+    uint32_t mode;
+    uint32_t padding;
 };
 
 struct vkd3d_workgraph_multi_gpu_input_copy_args
@@ -5777,6 +5852,8 @@ struct vkd3d_workgraph_indirect_ops
     VkPipeline vk_multi_gpu_input_copy_pipeline;
     VkPipelineLayout vk_drain_layout;
     VkPipeline vk_drain_pipeline;
+    VkPipelineLayout vk_pool_layout;
+    VkPipeline vk_pool_pipeline;
 };
 
 struct vkd3d_meta_ops
@@ -5877,6 +5954,8 @@ void vkd3d_meta_get_workgraph_complete_compaction_pipeline(struct vkd3d_meta_ops
 void vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_workgraph_meta_pipeline_info *prepare, struct vkd3d_workgraph_meta_pipeline_info *copy);
 void vkd3d_meta_get_workgraph_drain_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *info);
+void vkd3d_meta_get_workgraph_pool_pipeline(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_workgraph_meta_pipeline_info *info);
 
 static inline uint32_t vkd3d_meta_get_workgraph_setup_gpu_input_workgroup_size(void)
