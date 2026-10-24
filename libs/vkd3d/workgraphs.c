@@ -3750,26 +3750,25 @@ static void d3d12_command_list_workgraph_execute_entry_cpu(
     }
 
     node_index = program->levels[0].nodes[desc->EntrypointIndex];
-    /* amdgpu-wddm fork: record_size does not include the internal word of [NodeTrackRWInputSharing], which an
-     * entry point does not use, so only the bytes of the application's records are copied. */
+    /* amdgpu-wddm fork: copy only the bytes of the application's records. record_size does not include the
+     * internal word of [NodeTrackRWInputSharing], which an entry point does not use. The last record needs only
+     * its own size: a full stride for it can read past the end of the application's array. For an empty record,
+     * pRecords and RecordStrideInBytes are ignored (WorkGraphs.md, D3D12_NODE_CPU_INPUT), so nothing is read. */
     record_size = wg_state->entry_points[node_index].node_input->record_size;
-    if (desc->RecordStrideInBytes == 0)
+    if (!record_size)
+        payload_size = 0;
+    else if (desc->RecordStrideInBytes == 0)
         payload_size = record_size;
-    else if (record_size)
-    {
-        /* amdgpu-wddm fork: the last record needs only its own size. A full stride for it can read past the
-         * end of the application's array. */
-        payload_size = (VkDeviceSize)(desc->NumRecords - 1) * desc->RecordStrideInBytes + record_size;
-    }
     else
-        payload_size = (VkDeviceSize)desc->NumRecords * desc->RecordStrideInBytes;
+        payload_size = (VkDeviceSize)(desc->NumRecords - 1) * desc->RecordStrideInBytes + record_size;
 
     if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
-            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, payload_size, 64, ~0u, &payload_scratch))
+            VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, max(payload_size, 4), 64, ~0u, &payload_scratch))
         return;
 
     /* Alternatively use vkCmdUpdateBuffer, but at least for now, just rely on ReBAR doing its thing. */
-    memcpy(payload_scratch.host_ptr, desc->pRecords, payload_size);
+    if (payload_size)
+        memcpy(payload_scratch.host_ptr, desc->pRecords, payload_size);
 
     d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program, node_index, desc,
             wg_state->payload[0].va, payload_scratch.va,
