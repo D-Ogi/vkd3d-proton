@@ -53,6 +53,12 @@ struct vkd3d_instance_application_meta
 static const struct vkd3d_instance_application_meta application_override[] = {
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_EXACT, "GravityMark.exe", VKD3D_CONFIG_FLAG_STATIC(FORCE_MINIMUM_SUBGROUP_SIZE) },
+    /* amdgpu-wddm fork: the DirectX-Graphics-Samples work graph samples, measured with this engine on the BC-250.
+     * Work graphs and the descriptor heap path that they need are on for these executables only. */
+    { VKD3D_STRING_COMPARE_EXACT, "D3D12HelloWorkGraphs.exe",
+            VKD3D_CONFIG_FLAG_INIT_STATIC(.WORKGRAPHS = 1, .DESCRIPTOR_HEAP = 1) },
+    { VKD3D_STRING_COMPARE_EXACT, "D3D12WorkGraphsSandbox.exe",
+            VKD3D_CONFIG_FLAG_INIT_STATIC(.WORKGRAPHS = 1, .DESCRIPTOR_HEAP = 1) },
     /* Halo Infinite (1240440).
      * Game relies on NON_ZEROED committed UAVs to be cleared to zero on allocation.
      * This works okay with zerovram on first game boot, but not later, since this memory is guaranteed to be recycled.

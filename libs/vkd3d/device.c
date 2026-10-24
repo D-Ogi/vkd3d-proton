@@ -594,6 +594,8 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
 #include "config_flag_decl.h"
     {"breadcrumbs_sync", VKD3D_CONFIG_FLAG_INIT_STATIC(.BREADCRUMBS = 1, .BREADCRUMBS_SYNC = 1)},
     {"breadcrumbs_trace", VKD3D_CONFIG_FLAG_INIT_STATIC(.BREADCRUMBS = 1, .BREADCRUMBS_TRACE = 1)},
+    /* amdgpu-wddm fork: work graphs need the descriptor heap path (d3d12_device_supports_workgraphs). */
+    {"workgraphs", VKD3D_CONFIG_FLAG_INIT_STATIC(.WORKGRAPHS = 1, .DESCRIPTOR_HEAP = 1)},
 #undef VKD3D_DECL_CONFIG
 #undef VKD3D_DECL_CONFIG_PLAIN
 };
