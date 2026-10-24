@@ -77,7 +77,29 @@ static inline bool d3d12_wg_fault_injected(const char *point, unsigned int index
  * the DispatchGraph calls that lost records, and the lost records (test_workgraph_multi_gpu_input_lost_records). */
 static const GUID amdgpu_wddm_wg_status_guid =
         { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x05 } };
+
+/* amdgpu-wddm fork, lab flavour only: GetPrivateData with this GUID gives struct amdgpu_wddm_wg_canaries of the
+ * first program, for test_workgraph_output_bounds. The ranges exist only with AMDGPU_WDDM_WG_LIMITS=canary=1. */
+static const GUID amdgpu_wddm_wg_canary_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x06 } };
 #endif
+
+/* amdgpu-wddm fork, lab flavour: the canary ranges of a program, offsets from the start of the backing memory.
+ * Initialization fills them with VKD3D_WORKGRAPH_CANARY_PATTERN. Nothing writes them after that, so a test that
+ * reads the backing memory back finds a write past a sink or past the unrolled offsets. */
+#define VKD3D_WORKGRAPH_CANARY_SIZE (4096u)
+#define VKD3D_WORKGRAPH_CANARY_PATTERN (0xc4a7c0deu)
+#define VKD3D_WORKGRAPH_CANARY_COUNT 3
+struct amdgpu_wddm_wg_canaries
+{
+    uint32_t count;
+    uint32_t pattern;
+    struct
+    {
+        uint64_t offset;
+        uint64_t size;
+    } ranges[VKD3D_WORKGRAPH_CANARY_COUNT];
+};
 
 /* amdgpu-wddm fork, lab flavour only:
  * AMDGPU_WDDM_WG_MULTI_INPUT=staging=<bytes>,staging_max=<bytes>,large=<bytes>,groups=<n> sets the staging size with
@@ -92,6 +114,8 @@ struct d3d12_wg_multi_input_config
      * unrolled offsets, and a smaller limit for the packed offset entries of a level. */
     VkDeviceSize ring_size;
     uint32_t packed_limit;
+    /* canary=1: a canary range after each payload sink and after the unrolled offsets. */
+    bool canaries;
     uint32_t large_size;
     uint32_t groups;
 };
@@ -107,6 +131,7 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
     config->staging_max_size = VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_MAX_SIZE;
     config->ring_size = VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE;
     config->packed_limit = UINT32_MAX;
+    config->canaries = false;
     config->large_size = VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE;
     config->groups = VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS;
 
@@ -124,12 +149,14 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
                 config->ring_size = n & ~15ull;
             else if (!strncmp(p, "packed=", 7) && (n = strtoull(p + 7, NULL, 0)) <= UINT32_MAX)
                 config->packed_limit = n;
+            else if (!strcmp(p, "canary=1"))
+                config->canaries = true;
             else
                 WARN("Ignoring %s in AMDGPU_WDDM_WG_LIMITS.\n", p);
         }
 
-        WARN("Work graph limits: payload ring %"PRIu64" bytes, packed offset limit %u.\n",
-                config->ring_size, config->packed_limit);
+        WARN("Work graph limits: payload ring %"PRIu64" bytes, packed offset limit %u, canaries %u.\n",
+                config->ring_size, config->packed_limit, config->canaries);
     }
 
     if (!vkd3d_get_env_var("AMDGPU_WDDM_WG_MULTI_INPUT", value, sizeof(value)))
@@ -315,6 +342,10 @@ struct d3d12_wg_state_object_program
     VkDeviceSize output_guard_scratch_size;
     VkDeviceSize payload_ring_size;
     uint32_t packed_limit;
+    /* amdgpu-wddm fork, lab flavour: the canary ranges (AMDGPU_WDDM_WG_LIMITS=canary=1), offsets in the backing
+     * memory. canary_count is 0 without them. */
+    uint32_t canary_count;
+    VkDeviceSize canary_offsets[VKD3D_WORKGRAPH_CANARY_COUNT];
     uint32_t multi_input_large_size;
     uint32_t multi_input_groups;
     VkDeviceSize required_scratch_size;
@@ -1773,6 +1804,35 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
         *data_size = sizeof(counts);
         return S_OK;
     }
+
+    /* amdgpu-wddm fork, lab flavour: the canary ranges of the first program, for tests. */
+    if (IsEqualGUID(guid, &amdgpu_wddm_wg_canary_guid))
+    {
+        struct amdgpu_wddm_wg_canaries canaries;
+        unsigned int i;
+
+        if (!data_size)
+            return E_INVALIDARG;
+        if (data && *data_size < sizeof(canaries))
+            return E_INVALIDARG;
+        if (data)
+        {
+            memset(&canaries, 0, sizeof(canaries));
+            canaries.pattern = VKD3D_WORKGRAPH_CANARY_PATTERN;
+            if (state_object->programs_count)
+            {
+                canaries.count = state_object->programs[0].canary_count;
+                for (i = 0; i < canaries.count; i++)
+                {
+                    canaries.ranges[i].offset = state_object->programs[0].canary_offsets[i];
+                    canaries.ranges[i].size = VKD3D_WORKGRAPH_CANARY_SIZE;
+                }
+            }
+            memcpy(data, &canaries, sizeof(canaries));
+        }
+        *data_size = sizeof(canaries);
+        return S_OK;
+    }
 #endif
 
     return vkd3d_get_private_data(&state_object->private_store, guid, data_size, data);
@@ -2546,6 +2606,7 @@ static HRESULT d3d12_wg_state_object_compile_program(
     struct d3d12_wg_multi_input_config multi_input_config;
     struct d3d12_wg_state_object_spec_constant_tmp tmp;
     VkDeviceSize scratch_offset = 0;
+    VkDeviceSize canary_size;
     unsigned int level;
     HRESULT hr = S_OK;
     unsigned int i;
@@ -2666,10 +2727,21 @@ static HRESULT d3d12_wg_state_object_compile_program(
     alloc_scratch(share_mapping_scratch, program->num_pipelines * sizeof(uint32_t));
     alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
     d3d12_wg_get_multi_input_config(&multi_input_config);
-    alloc_scratch(payload0_scratch, multi_input_config.ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE);
-    alloc_scratch(payload1_scratch, multi_input_config.ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE);
+    /* A canary range follows each sink and the unrolled offsets directly, when the lab switch asks for it. */
+    canary_size = multi_input_config.canaries ? VKD3D_WORKGRAPH_CANARY_SIZE : 0;
+    alloc_scratch(payload0_scratch, multi_input_config.ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size);
+    alloc_scratch(payload1_scratch, multi_input_config.ring_size + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE + canary_size);
     /* One offset of 4 bytes per record, and a record takes at least 4 bytes of the payload capacity. */
-    alloc_scratch(unrolled_offsets_scratch, multi_input_config.ring_size);
+    alloc_scratch(unrolled_offsets_scratch, multi_input_config.ring_size + canary_size);
+    program->canary_count = 0;
+    if (canary_size)
+    {
+        program->canary_offsets[0] = program->payload0_scratch_offset + program->payload0_scratch_size - canary_size;
+        program->canary_offsets[1] = program->payload1_scratch_offset + program->payload1_scratch_size - canary_size;
+        program->canary_offsets[2] = program->unrolled_offsets_scratch_offset +
+                program->unrolled_offsets_scratch_size - canary_size;
+        program->canary_count = VKD3D_WORKGRAPH_CANARY_COUNT;
+    }
     /* The output guard ends where the packed offsets start. */
     alloc_scratch(output_guard_scratch, sizeof(struct vkd3d_workgraph_output_guard));
     program->payload_ring_size = multi_input_config.ring_size;
@@ -3099,6 +3171,7 @@ void d3d12_command_list_workgraph_initialize_scratch(struct d3d12_command_list *
     const struct vkd3d_unique_resource *resource;
     struct d3d12_wg_state_object *wg_state;
     uint32_t wg_state_program_index;
+    unsigned int i;
     VkMemoryBarrier2 vk_barrier;
     VkDependencyInfo dep_info;
 
@@ -3165,6 +3238,15 @@ void d3d12_command_list_workgraph_initialize_scratch(struct d3d12_command_list *
 
         /* amdgpu-wddm fork: the output bounds of the levels for the backing memory given here. */
         d3d12_command_list_workgraph_init_output_guard(list, &wg_state->programs[wg_state_program_index], resource);
+
+        /* amdgpu-wddm fork, lab flavour: the canary ranges. */
+        for (i = 0; i < wg_state->programs[wg_state_program_index].canary_count; i++)
+        {
+            VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, resource->vk_buffer,
+                    list->wg_state.BackingMemory.StartAddress - resource->va +
+                            wg_state->programs[wg_state_program_index].canary_offsets[i],
+                    VKD3D_WORKGRAPH_CANARY_SIZE, VKD3D_WORKGRAPH_CANARY_PATTERN));
+        }
     }
 
     vk_barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;

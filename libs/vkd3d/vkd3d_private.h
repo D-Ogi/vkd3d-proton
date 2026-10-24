@@ -5570,17 +5570,19 @@ struct vkd3d_workgraph_workgroups_args
 /* amdgpu-wddm fork: the output bounds of a work graph level, the last 32 bytes of the required scratch memory, just
  * before the packed offsets. The node output allocator of dxil-spirv (build_allocate_node_records and
  * build_increment_node_count) finds it at AllocationOffset - 8 words. An allocation that would take the payload
- * past payload_capacity, or a packed offset entry past packed_capacity, is not counted: its records go to
- * dropped_records, its payload to the sink after the payload ring and its packed offset to sink[]. Empty records
- * count 4 bytes against payload_capacity, so that the records of a level fit in the unrolled offsets.
- * The workgroup distributor reports dropped_records after each level and clears it. */
+ * past payload_capacity, or a packed offset entry past packed_capacity, is not counted: its records go to the
+ * 64-bit count dropped_records_lo/hi, its payload to the sink after the payload ring and its packed offset to
+ * sink[]. An allocation of more records than fit in the sink (VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE) is always dropped,
+ * so that the records of a dropped allocation stay in the sink. Empty records count 4 bytes against
+ * payload_capacity, so that the records of a level fit in the unrolled offsets.
+ * The workgroup distributor reports the dropped records after each level and clears the count. */
 struct vkd3d_workgraph_output_guard
 {
     uint32_t payload_capacity;
     uint32_t packed_capacity;
     uint32_t reserved0[2];
-    uint32_t dropped_records;
-    uint32_t reserved1;
+    uint32_t dropped_records_lo;
+    uint32_t dropped_records_hi;
     uint32_t sink[2];
 };
 

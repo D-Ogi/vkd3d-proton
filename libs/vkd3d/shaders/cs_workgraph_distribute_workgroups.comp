@@ -51,8 +51,8 @@ layout(buffer_reference, buffer_reference_align = 16, std430) buffer OutputGuard
 	uint payload_capacity;
 	uint packed_capacity;
 	uvec2 reserved0;
-	uint dropped_records;
-	uint reserved1;
+	uint dropped_records_lo;
+	uint dropped_records_hi;
 	uvec2 sink;
 };
 
@@ -215,13 +215,17 @@ void main()
 		uint fused = min(registers.atomics.fused_atomic, registers.output_guard.packed_capacity);
 
 		// amdgpu-wddm fork: the records of the previous level that did not fit go to the report of the state object.
-		uint dropped = registers.output_guard.dropped_records;
-		if (dropped != 0u)
+		uint dropped = registers.output_guard.dropped_records_lo;
+		uint dropped_hi = registers.output_guard.dropped_records_hi;
+		if (dropped != 0u || dropped_hi != 0u)
 		{
-			registers.output_guard.dropped_records = 0u;
+			registers.output_guard.dropped_records_lo = 0u;
+			registers.output_guard.dropped_records_hi = 0u;
 			uint old = atomicAdd(registers.lost_records.records_lo, dropped);
 			if (old + dropped < old)
-				atomicAdd(registers.lost_records.records_hi, 1u);
+				dropped_hi += 1u;
+			if (dropped_hi != 0u)
+				atomicAdd(registers.lost_records.records_hi, dropped_hi);
 			atomicAdd(registers.lost_records.events, 1u);
 		}
 
