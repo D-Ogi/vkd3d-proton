@@ -5684,10 +5684,18 @@ struct vkd3d_workgraph_lost_records
 #define VKD3D_WORKGRAPH_DRAIN_REASON_EXHAUSTED 1u
 #define VKD3D_WORKGRAPH_DRAIN_REASON_FAULT 2u
 
+/* The bits of the fault word of struct vkd3d_workgraph_drain_control: a round made no progress (the self-check, or the
+ * lab hook drain-stall), and the admission pass or the injection pass of the record pools found a pool head above a
+ * capacity of the pool, or slots that do not add up to its records. */
+#define VKD3D_WORKGRAPH_DRAIN_FAULT_PROGRESS 0x1u
+#define VKD3D_WORKGRAPH_DRAIN_FAULT_ADMIT_HEAD 0x2u
+#define VKD3D_WORKGRAPH_DRAIN_FAULT_INJECT_HEAD 0x4u
+
 struct vkd3d_workgraph_drain_control
 {
     uint32_t pending[VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS + 1];
     uint32_t executed[3];
+    /* VKD3D_WORKGRAPH_DRAIN_FAULT_*. The fault bits stay set until the next initialization. */
     uint32_t fault;
     uint32_t closes;
     uint32_t close_reason;
@@ -5706,6 +5714,9 @@ struct vkd3d_workgraph_drain_control
  * records, each counted once for all its readers). The memory is host-visible, after struct
  * vkd3d_workgraph_lost_records. */
 #define VKD3D_WORKGRAPH_ABANDONED 0x1u
+/* The record count of struct vkd3d_workgraph_abandoned is a lower bound: a pool with an invalid head lost its
+ * records. */
+#define VKD3D_WORKGRAPH_ABANDONED_LOWER_BOUND 0x2u
 /* The offset of struct vkd3d_workgraph_abandoned in the host-visible allocation. */
 #define VKD3D_WORKGRAPH_ABANDONED_OFFSET 16u
 
@@ -5786,7 +5797,8 @@ struct vkd3d_workgraph_pool_level_args
     VkDeviceAddress guard_va;
     VkDeviceAddress table_va;
     VkDeviceAddress admit_va;
-    VkDeviceAddress admitted_va;
+    /* struct vkd3d_workgraph_drain_control: the admitted word and the fault word. */
+    VkDeviceAddress control_va;
     uint32_t pool_state_stride;
     uint32_t level;
     uint32_t inject_level;
@@ -5796,7 +5808,9 @@ struct vkd3d_workgraph_pool_level_args
     uint32_t packed_capacity;
     /* The admission capacity of pool level + 1: payload bytes, packed entries, unrolled offsets. */
     uint32_t caps[3];
-    uint32_t padding;
+    /* Lab flavour: not 0 if the retention pass writes an invalid head (AMDGPU_WDDM_WG_FAIL=pool-head:<level>: 1,
+     * pool-records:<level>: 2). */
+    uint32_t fault_head;
 };
 
 struct vkd3d_workgraph_pool_args
@@ -5854,6 +5868,9 @@ struct vkd3d_workgraph_indirect_ops
     VkPipeline vk_drain_pipeline;
     VkPipelineLayout vk_pool_layout;
     VkPipeline vk_pool_pipeline;
+    /* amdgpu-wddm fork: the distributor splits the workgroups of a node into a primary dispatch of WG_DIVIDER groups
+     * and a secondary dispatch (REQUIRE_WG_DIVIDER). */
+    bool require_wg_divider;
 };
 
 struct vkd3d_meta_ops

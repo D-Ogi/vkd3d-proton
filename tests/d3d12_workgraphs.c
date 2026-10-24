@@ -4481,6 +4481,116 @@ static const char *workgraph_drain_info_error(HRESULT hr, UINT size, const struc
     return NULL;
 }
 
+/* The largest stride of struct vkd3d_workgraph_pool_state that a test accepts: the head and 2^16 slots. */
+#define WG_POOL_STATE_MAX_STRIDE (16u + 8u * 65536u)
+
+/* Checks the pool state range of a round frame reply with extra rounds against the record pools reply, before a test
+ * reads the pool states. The engine puts the pool states after the control block, in the fixed bookkeeping of the pool
+ * layout, and each backing memory of at least Min holds the fixed bookkeeping. The control block must be valid
+ * (workgraph_drain_info_error). Returns NULL if the range is valid, else the reason. */
+static const char *workgraph_pool_state_error(const struct workgraph_drain_info *info,
+        const struct workgraph_pools *pools)
+{
+    uint64_t bytes;
+
+    if (!pools->valid || !pools->execution)
+        return "no execution on the record pools";
+    if (pools->pools < 2 || pools->pools > WG_POOL_LEVELS || info->pool_states != pools->pools)
+        return "wrong number of pool states";
+    if (info->pool_state_stride < 16 || info->pool_state_stride % 16 ||
+            info->pool_state_stride > WG_POOL_STATE_MAX_STRIDE)
+        return "wrong pool state stride";
+    if (info->pool_state_offset % 16)
+        return "pool states not aligned";
+    if (pools->fixed_size > pools->min_size)
+        return "fixed bookkeeping larger than Min";
+    /* Both factors are below 2^32, so the product does not wrap. A subtraction, because offset + bytes can wrap. */
+    bytes = (uint64_t)info->pool_states * info->pool_state_stride;
+    if (info->pool_state_offset > pools->fixed_size || bytes > pools->fixed_size - info->pool_state_offset)
+        return "pool states not inside the fixed bookkeeping";
+    if (info->control_offset > UINT64_MAX - sizeof(struct workgraph_drain_control) ||
+            info->pool_state_offset < info->control_offset + sizeof(struct workgraph_drain_control))
+        return "pool states not after the control block";
+    return NULL;
+}
+
+/* Negative controls of workgraph_pool_state_error, on the CPU only. They include two replies that the first version of
+ * the retention test accepted: a pool state offset near 2^64, and a stride of 2^31 for 2 pools, whose product is 0 in
+ * 32 bits. */
+static void workgraph_check_pool_state_admission(void)
+{
+    const uint64_t min_size = 0x10000;
+    struct workgraph_drain_info info;
+    struct workgraph_pools *pools;
+
+    pools = calloc(1, sizeof(*pools));
+    pools->valid = 1;
+    pools->execution = 1;
+    pools->pools = 3;
+    pools->min_size = min_size;
+    pools->fixed_size = 0x1000;
+
+    memset(&info, 0, sizeof(info));
+    info.rounds = 1;
+    info.control_offset = 0x100;
+    info.pool_state_offset = 0x300;
+    info.pool_state_stride = 0x40;
+    info.pool_states = 3;
+    ok(!workgraph_drain_info_error(S_OK, sizeof(info), &info, 1, 0, min_size) &&
+            !workgraph_pool_state_error(&info, pools), "A valid reply was refused.\n");
+
+    info.control_offset = UINT64_MAX;
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info), &info, 1, 0, min_size),
+            "A control block offset of 2^64 - 1 was accepted.\n");
+    info.control_offset = 0x100;
+
+    info.pool_state_offset = UINT64_MAX - 15;
+    ok(!!workgraph_pool_state_error(&info, pools), "A pool state offset of 2^64 - 16 was accepted.\n");
+    info.pool_state_offset = 0x1000;
+    ok(!!workgraph_pool_state_error(&info, pools), "Pool states after the fixed bookkeeping were accepted.\n");
+    info.pool_state_offset = min_size + 0x100;
+    ok(!!workgraph_pool_state_error(&info, pools), "Pool states after the backing memory were accepted.\n");
+    info.pool_state_offset = 0x1000 - 0x80;
+    ok(!!workgraph_pool_state_error(&info, pools), "Pool states across the fixed bookkeeping were accepted.\n");
+    info.pool_state_offset = 0x1000 - 0xc0;
+    ok(!workgraph_pool_state_error(&info, pools), "Pool states at the end of the fixed bookkeeping were refused.\n");
+    info.pool_state_offset = 0x308;
+    ok(!!workgraph_pool_state_error(&info, pools), "Pool states that are not aligned were accepted.\n");
+    info.pool_state_offset = 0x100;
+    ok(!!workgraph_pool_state_error(&info, pools), "Pool states in the control block were accepted.\n");
+    info.pool_state_offset = 0x300;
+
+    info.pool_states = 2;
+    info.pool_state_stride = 0x80000000u;
+    ok((uint32_t)(info.pool_states * info.pool_state_stride) == 0, "The 32-bit product does not wrap.\n");
+    ok(!!workgraph_pool_state_error(&info, pools), "A stride of 2^31 for 2 pools was accepted.\n");
+    pools->pools = 2;
+    ok(!!workgraph_pool_state_error(&info, pools), "A stride of 2^31 for 2 pools was accepted.\n");
+    pools->pools = 3;
+    info.pool_states = 3;
+    info.pool_state_stride = 0x48;
+    ok(!!workgraph_pool_state_error(&info, pools), "A stride that is not a multiple of 16 was accepted.\n");
+    info.pool_state_stride = 0;
+    ok(!!workgraph_pool_state_error(&info, pools), "A stride of 0 was accepted.\n");
+    info.pool_state_stride = 0x40;
+
+    info.pool_states = 2;
+    ok(!!workgraph_pool_state_error(&info, pools), "Less pool states than pools were accepted.\n");
+    info.pool_states = 3;
+    pools->pools = WG_POOL_LEVELS + 1;
+    info.pool_states = WG_POOL_LEVELS + 1;
+    ok(!!workgraph_pool_state_error(&info, pools), "%u pools were accepted.\n", WG_POOL_LEVELS + 1);
+    pools->pools = info.pool_states = 3;
+    pools->execution = 0;
+    ok(!!workgraph_pool_state_error(&info, pools), "Pool states without pool execution were accepted.\n");
+    pools->execution = 1;
+    pools->fixed_size = min_size + 0x100;
+    ok(!!workgraph_pool_state_error(&info, pools), "Fixed bookkeeping larger than Min was accepted.\n");
+    pools->fixed_size = 0x1000;
+    ok(!workgraph_pool_state_error(&info, pools), "The valid reply was refused at the end.\n");
+    free(pools);
+}
+
 /* VKD3D_TEST_WORKGRAPH_DRAIN=frame requires the lab diagnostics of the draining scheduler (the round frame and the
  * pools), "none" requires that there are none (the release flavour or a native driver). If it is not set, they are
  * required on the amdgpu-wddm engine. Returns false, after a failure, if the value or the device is wrong. */
@@ -6523,6 +6633,15 @@ enum workgraph_retain_size
                        * of 3. */
 };
 
+/* The replies that a case asks for. A case with a GUID of an older version of a reply gets no reply, and must stop
+ * before any GPU work. */
+enum workgraph_retain_reply
+{
+    WG_RETAIN_REPLIES, /* The GUIDs of the round frame and of the record pools. */
+    WG_RETAIN_NO_ROUND_FRAME, /* The round frame GUID of version 10. */
+    WG_RETAIN_NO_POOLS, /* The record pool GUID of version 8. */
+};
+
 struct workgraph_retain_case
 {
     const char *name;
@@ -6532,38 +6651,63 @@ struct workgraph_retain_case
     unsigned int reason; /* The expected close reason, or WG_RETAIN_ORACLE if the oracle of the graph gives it. */
     uint64_t abandoned; /* The expected abandoned records for WG_DRAIN_REASON_FAULT. */
     bool fewer; /* The rounds are 2 less than the case before used, which must be at least 3. */
+    const char *fault; /* AMDGPU_WDDM_WG_FAIL while the call is recorded, or NULL. */
+    uint32_t fault_word; /* The expected fault word of the control block of a case with a fault. */
+    enum workgraph_retain_reply reply;
 };
 
 #define WG_RETAIN_VALUES 1024
 #define WG_RETAIN_ORACLE (~0u)
+/* The slots of pool 1 that a case can check. */
+#define WG_RETAIN_SLOTS 128
+/* The fault word of the control block: no progress (the self-check or drain-stall), and an invalid head of a pool
+ * that the admission pass and the injection pass found. */
+#define WG_DRAIN_FAULT_PROGRESS 0x1u
+#define WG_DRAIN_FAULT_ADMIT_HEAD 0x2u
+#define WG_DRAIN_FAULT_INJECT_HEAD 0x4u
+/* The abandoned record count of the round frame is a lower bound: a pool with an invalid head lost its records. */
+#define WG_DRAIN_ABANDONED_LOWER_BOUND 0x2u
 
 /* The pool states at the close (struct vkd3d_workgraph_pool_state: the head, then one slot of kept records and block
  * offset for each node). The slots of a pool add up to its record counts, each block begins at a multiple of 16 bytes
- * inside the payload bytes of the pool, and the pools hold the abandoned records. */
-static void workgraph_check_pool_states(struct test_context_workgraph *context, ID3D12Resource *backing,
-        const struct workgraph_drain_info *info)
+ * inside the payload bytes of the pool, and the pools hold the abandoned records. info is the round frame after the
+ * call, before the reply before the call, and its range must be the same and valid before the pool states are read.
+ * kept1 gets the kept records of the first slots of pool 1. Returns false, after a failure, if nothing was read. */
+static bool workgraph_check_pool_states(struct test_context_workgraph *context, ID3D12Resource *backing,
+        const struct workgraph_drain_info *info, const struct workgraph_drain_info *before,
+        const struct workgraph_pools *pools, uint32_t kept1[WG_RETAIN_SLOTS])
 {
     unsigned int pool, slot, slots;
-    uint64_t records = 0, kept;
+    uint64_t records = 0, kept, bytes;
     const uint32_t *state;
+    const char *error;
     uint32_t *words;
 
-    ok(info->pool_state_stride >= 16 && !(info->pool_state_stride % 16) && info->pool_states >= 2 &&
-            info->pool_states <= WG_POOL_LEVELS, "Got %u pool states of %u bytes.\n", info->pool_states,
-            info->pool_state_stride);
-    if (info->pool_state_stride < 16 || info->pool_state_stride % 16 || info->pool_states < 2 ||
-            info->pool_states > WG_POOL_LEVELS)
-        return;
-    words = malloc(info->pool_states * info->pool_state_stride);
-    workgraph_read_buffer_range(context, backing, info->pool_state_offset,
-            info->pool_states * info->pool_state_stride, words);
+    error = workgraph_pool_state_error(info, pools);
+    if (!error && (info->pool_state_offset != before->pool_state_offset ||
+            info->pool_state_stride != before->pool_state_stride || info->pool_states != before->pool_states))
+        error = "the range is not the range before the call";
+    ok(!error, "Pool states: %s (%u of %u bytes at %#"PRIx64").\n", error, info->pool_states,
+            info->pool_state_stride, info->pool_state_offset);
+    if (error)
+        return false;
+    /* At most 32 pool states of at most WG_POOL_STATE_MAX_STRIDE bytes. */
+    bytes = (uint64_t)info->pool_states * info->pool_state_stride;
+    words = malloc((size_t)bytes);
+    ok(!!words, "Failed to allocate %"PRIu64" bytes.\n", bytes);
+    if (!words)
+        return false;
+    workgraph_read_buffer_range(context, backing, info->pool_state_offset, bytes, words);
     slots = (info->pool_state_stride - 16) / 8;
+    memset(kept1, 0, WG_RETAIN_SLOTS * sizeof(*kept1));
     for (pool = 1; pool < info->pool_states; pool++)
     {
         state = words + pool * (info->pool_state_stride / 4);
         for (slot = 0, kept = 0; slot < slots; slot++)
         {
             kept += state[4 + 2 * slot];
+            if (pool == 1 && slot < WG_RETAIN_SLOTS)
+                kept1[slot] = state[4 + 2 * slot];
             ok(!(state[5 + 2 * slot] % 16) && state[5 + 2 * slot] <= state[0],
                     "Pool %u, slot %u: block at %#x, %#x bytes used.\n", pool, slot, state[5 + 2 * slot], state[0]);
         }
@@ -6574,8 +6718,58 @@ static void workgraph_check_pool_states(struct test_context_workgraph *context, 
     ok(records == info->abandoned_records, "The pools hold %"PRIu64" records, %"PRIu64" abandoned.\n", records,
             info->abandoned_records);
     free(words);
+    return true;
 }
 
+/* Gets the record pools and the round frame of a state object for a case with "rounds" extra rounds, before any GPU
+ * work. Returns NULL if both replies are valid, else the reason. */
+static const char *workgraph_retain_reply_error(ID3D12StateObject *pso, const GUID *pool_guid,
+        const GUID *drain_guid, unsigned int rounds, uint64_t min_size, struct workgraph_pools *pools,
+        struct workgraph_drain_info *info)
+{
+    const char *error;
+    UINT size;
+    HRESULT hr;
+
+    memset(pools, 0, sizeof(*pools));
+    size = sizeof(*pools);
+    hr = ID3D12StateObject_GetPrivateData(pso, pool_guid, &size, pools);
+    if (hr != S_OK)
+        return "no record pools";
+    if (size != sizeof(*pools))
+        return "wrong size of the record pools";
+    if (pools->pools > WG_POOL_LEVELS)
+        return "too many pools";
+    if (pools->execution != !!rounds)
+        return "wrong pool execution";
+    if (rounds && !pools->valid)
+        return "record pools not valid";
+    if (rounds && pools->min_size != min_size)
+        return "Min of the record pools is not MinSizeInBytes";
+
+    memset(info, 0, sizeof(*info));
+    size = sizeof(*info);
+    hr = ID3D12StateObject_GetPrivateData(pso, drain_guid, &size, info);
+    if ((error = workgraph_drain_info_error(hr, size, info, rounds, 0, min_size)))
+        return error;
+    if (rounds && (error = workgraph_pool_state_error(info, pools)))
+        return error;
+    return NULL;
+}
+
+/* The state of test_workgraph_drain_retention across its cases. gpu_steps counts the steps of a case that use the GPU:
+ * the first one is the allocation of the backing memory. */
+struct workgraph_retain_run
+{
+    struct test_context_workgraph context;
+    struct workgraph_pools *pools;
+    uint32_t *values;
+    uint32_t *tail_pattern;
+    unsigned int used_rounds;
+    unsigned int gpu_steps;
+    bool frame;
+    bool fault_injection;
+};
 /* The outcome of level_sinks for k Mid records admitted in each round: 8 Mid records, 512 Leaf records each. Pool 2 is
  * the input of the last level, so it holds nothing at the start of a round. Returns the close reason. */
 static unsigned int workgraph_level_sinks_oracle(uint64_t k, unsigned int rounds, unsigned int *mids,
@@ -6603,6 +6797,496 @@ static unsigned int workgraph_level_sinks_oracle(uint64_t k, unsigned int rounds
     return left ? WG_DRAIN_REASON_EXHAUSTED : WG_DRAIN_REASON_COMPLETE;
 }
 
+#include "shaders/workgraph/headers/pool_retain.h"
+#include "shaders/workgraph/headers/pool_wide_pair.h"
+#include "shaders/workgraph/headers/pool_charge.h"
+#include "shaders/workgraph/headers/pool_straddle.h"
+#include "shaders/workgraph/headers/cross_group_sharing.h"
+#include "shaders/workgraph/headers/basic_recursion.h"
+
+static const struct
+{
+    const D3D12_SHADER_BYTECODE *code;
+    const WCHAR *entry;
+    bool input; /* The entry point has an input record of 4 bytes. */
+    unsigned int entry_records; /* The records of the entry level that pool 1 must hold. */
+}
+workgraph_retain_graphs[] =
+{
+    { &level_sinks_dxil, u"Entry", true, 1 },
+    { &pool_retain_dxil, u"Entry", false, 1 },
+    { &basic_recursion_dxil, u"EntryNode", false, 1 },
+    { &cross_group_sharing_dxil, u"EntryNode", false, 1 },
+    { &pool_wide_pair_dxil, u"Entry", false, 1 },
+    { &pool_charge_dxil, u"Entry", false, 1 },
+    { &pool_straddle_dxil, u"A_Entry", false, 1 },
+};
+
+/* pool_straddle: the slots of the owners, and the number of slots. */
+#define WG_STRADDLE_A_OWNER 1
+#define WG_STRADDLE_Y_OWNER 74
+#define WG_STRADDLE_SLOTS 76
+
+/* One case of test_workgraph_drain_retention. index is the index of the case. */
+static void workgraph_run_retain_case(struct workgraph_retain_run *run, unsigned int index,
+        const struct workgraph_retain_case *test)
+{
+    /* pool_charge: the Sink records after each round, at 2 groups of pool 2. Round 1 and 2 admit 8 records of the
+     * first slot, round 3 its last record and 4 records of the other slot, round 4 8 and round 5 5 records. */
+    static const unsigned int charge_admitted[] = { 8, 16, 21, 29, 34 };
+    static const uint32_t recursion_reference[64] = { 0, 7, 13, 17, 25, 34, 46, 59, 71, 76, 68, 47, 23, 7, 1 };
+    static const GUID drain_guid_v10 =
+            { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x0a } };
+    static const GUID pool_guid_v8 =
+            { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x08 } };
+    struct test_context_workgraph *context = &run->context;
+    uint32_t expected_pending[WG_DRAIN_MAX_ROUNDS + 1], expected_executed[3], kept1[WG_RETAIN_SLOTS];
+    struct workgraph_drain_info info, info_after;
+    struct workgraph_pools *pools = run->pools;
+    uint32_t *values = run->values, fault_word;
+    struct workgraph_pool_sizes sizes, check_sizes;
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct workgraph_drain_control control;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    ID3D12GraphicsCommandList10 *list10;
+    D3D12_SET_PROGRAM_DESC program_desc;
+    uint64_t caps[WG_POOL_COMPONENTS], k;
+    unsigned int j, n, reason, mids, rounds, admitted;
+    ID3D12Resource *backing, *output;
+    struct workgraph_lost_records lost;
+    bool frame = run->frame, fits, half, states = false;
+    ID3D12GraphicsCommandList *list;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    uint64_t backing_size, size;
+    D3D12_NODE_ID entry_id;
+    const char *error;
+    ID3D12StateObject *pso;
+    uint32_t params = 0;
+    UINT entry_index;
+    char limits[64];
+    UINT data_size;
+    HRESULT hr;
+
+    list = context->context.list;
+    memset(kept1, 0, sizeof(kept1));
+    /* The case before must have used at least 3 rounds, so that 2 less is at least 1. */
+    rounds = test->rounds;
+    if (test->fewer && frame)
+    {
+        ok(run->used_rounds >= 3, "The case before used %u rounds.\n", run->used_rounds);
+        if (run->used_rounds < 3)
+            return;
+        rounds = run->used_rounds - 2;
+    }
+    else if (test->fewer)
+    {
+        rounds = 1;
+    }
+    if (rounds)
+        sprintf(limits, "rounds=%u,canary=1", rounds);
+    else
+        strcpy(limits, "ring=8388608,canary=1");
+    vkd3d_test_set_context("Test %u (%s), %s", index, test->name, limits);
+
+    /* The hooks and the GUIDs of older replies are for the lab diagnostics. */
+    if ((test->fault || test->reply != WG_RETAIN_REPLIES) && !frame)
+    {
+        skip("The case needs the draining scheduler diagnostics.\n");
+        return;
+    }
+    if (test->fault && !run->fault_injection)
+    {
+        skip("Set VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1 to run the case with AMDGPU_WDDM_WG_FAIL=%s.\n", test->fault);
+        return;
+    }
+
+    workgraph_set_limits(limits);
+    hr = try_create_workgraph_pso(context, *workgraph_retain_graphs[test->graph].code, NULL, &pso);
+    workgraph_set_limits(NULL);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+        return;
+    entry_id.Name = workgraph_retain_graphs[test->graph].entry;
+    entry_id.ArrayIndex = 0;
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, &entry_index, &entry_id, 1))
+    {
+        ID3D12StateObject_Release(pso);
+        return;
+    }
+
+    /* The replies are checked before any GPU work: a missing or bad reply fails the case, and the case stops. Without
+     * the lab diagnostics there is no layout: the case runs at Min, and only the records of a complete run are
+     * checked. */
+    backing_size = wg_reqs.MinSizeInBytes;
+    memset(pools, 0, sizeof(*pools));
+    memset(&info, 0, sizeof(info));
+    if (frame)
+    {
+        error = workgraph_retain_reply_error(pso,
+                test->reply == WG_RETAIN_NO_POOLS ? &pool_guid_v8 : &workgraph_pool_guid,
+                test->reply == WG_RETAIN_NO_ROUND_FRAME ? &drain_guid_v10 : &workgraph_drain_guid,
+                rounds, wg_reqs.MinSizeInBytes, pools, &info);
+        if (test->reply != WG_RETAIN_REPLIES)
+        {
+            ok(!!error, "A reply with an older GUID was accepted.\n");
+            trace("Refused: %s.\n", error ? error : "nothing");
+            ID3D12StateObject_Release(pso);
+            return;
+        }
+        ok(!error, "Replies: %s (pools %u, execution %u, valid %u, rounds %u, control block %#"PRIx64").\n", error,
+                pools->pools, pools->execution, pools->valid, info.rounds, info.control_offset);
+        if (error)
+        {
+            ID3D12StateObject_Release(pso);
+            return;
+        }
+    }
+    if (frame && rounds)
+    {
+        /* The layout of the test must be the layout of the engine at each size of the reply. */
+        for (n = 0; n < WG_POOL_LAYOUTS; n++)
+        {
+            const struct workgraph_pool_layout *layout = &pools->layouts[n];
+
+            fits = workgraph_pool_sizes_at(pools, layout->size, &check_sizes);
+            ok(fits == !!layout->used, "Layout %u: expected a layout %u.\n", n, !!layout->used);
+            if (!fits || !layout->used)
+                continue;
+            ok(check_sizes.entries == layout->entries.size && check_sizes.offsets == layout->offsets.size,
+                    "Layout %u: expected entries %#"PRIx64", offsets %#"PRIx64", got %#"PRIx64", %#"PRIx64".\n",
+                    n, check_sizes.entries, check_sizes.offsets, layout->entries.size, layout->offsets.size);
+            for (j = 1; j < pools->pools; j++)
+            {
+                ok(check_sizes.payload[j] == layout->payload[j][0].size &&
+                        check_sizes.payload[j] == layout->payload[j][1].size,
+                        "Layout %u, pool %u: expected payload %#"PRIx64", got %#"PRIx64", %#"PRIx64".\n", n, j,
+                        check_sizes.payload[j], layout->payload[j][0].size, layout->payload[j][1].size);
+            }
+        }
+
+        backing_size = 0;
+        for (size = pools->min_size; size <= pools->max_size && !backing_size;
+                size += test->size == WG_RETAIN_GROUPS ? 16 : 65536)
+        {
+            if (!workgraph_pool_sizes_at(pools, size, &sizes) ||
+                    !workgraph_pool_fits(pools, &sizes, 1, workgraph_retain_graphs[test->graph].entry_records, 1))
+            {
+                /* Pool 1 must hold the records of the entry level at Min for a case at Min. */
+                if (test->size == WG_RETAIN_MIN)
+                    break;
+                continue;
+            }
+            if (test->size == WG_RETAIN_GROUPS)
+            {
+                workgraph_pool_caps(&sizes, 2, caps);
+                if (workgraph_pool_fits(pools, &sizes, 2, 2, 1) &&
+                        caps[WG_POOL_PAYLOAD] < 3 * pools->bound[2][WG_POOL_PAYLOAD])
+                    backing_size = size;
+                continue;
+            }
+            fits = half = true;
+            for (j = 2; j < pools->pools; j++)
+            {
+                fits = fits && workgraph_pool_fits(pools, &sizes, j, 1, 1);
+                half = half && workgraph_pool_fits(pools, &sizes, j, 1, 2);
+            }
+            if ((test->size == WG_RETAIN_MIN && !fits) || (test->size == WG_RETAIN_FIT && fits) ||
+                    (test->size == WG_RETAIN_HALF && half && !fits))
+                backing_size = size;
+            /* A case at Min runs at Min only. */
+            if (test->size == WG_RETAIN_MIN)
+                break;
+        }
+        ok(backing_size, "No backing size for the case.\n");
+        if (!backing_size)
+        {
+            ID3D12StateObject_Release(pso);
+            return;
+        }
+        trace("Backing size %#"PRIx64" (Min %#"PRIx64").\n", backing_size, pools->min_size);
+    }
+
+    run->gpu_steps++;
+    backing = create_default_buffer(context->context.device, backing_size + 64 * 1024,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    upload_buffer_data(backing, backing_size, 64 * 1024, run->tail_pattern, context->context.queue, list);
+    reset_command_list(list, context->context.allocator);
+    output = create_default_buffer(context->context.device, WG_RETAIN_VALUES * sizeof(*values),
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+    hr = ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList10, (void **)&list10);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12GraphicsCommandList10, hr #%x.\n", (int)hr);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, context->default_root_uav_rs);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0, ID3D12Resource_GetGPUVirtualAddress(output));
+    memset(&program_desc, 0, sizeof(program_desc));
+    program_desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+    program_desc.WorkGraph.BackingMemory.SizeInBytes = backing_size;
+    program_desc.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(backing);
+    program_desc.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+    program_desc.WorkGraph.ProgramIdentifier = ident;
+    ID3D12GraphicsCommandList10_SetProgram(list10, &program_desc);
+    memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+    dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+    dispatch_desc.NodeCPUInput.EntrypointIndex = entry_index;
+    dispatch_desc.NodeCPUInput.NumRecords = 1;
+    dispatch_desc.NodeCPUInput.pRecords = workgraph_retain_graphs[test->graph].input ? &params : NULL;
+    dispatch_desc.NodeCPUInput.RecordStrideInBytes = workgraph_retain_graphs[test->graph].input ? sizeof(params) : 0;
+    /* The engine reads the hook when it records the call. */
+    workgraph_set_fault(test->fault);
+    ID3D12GraphicsCommandList10_DispatchGraph(list10, &dispatch_desc);
+    workgraph_set_fault(NULL);
+    ID3D12GraphicsCommandList10_Release(list10);
+
+    run->gpu_steps++;
+    workgraph_read_output(context, output, values, WG_RETAIN_VALUES);
+    if (test->graph <= 1 || test->graph >= 5)
+    {
+        ok(values[2] == 0, "%u records have wrong contents.\n", values[2]);
+        ok(values[3] == 0, "%u records arrived more than once.\n", values[3]);
+    }
+    n = workgraph_count_damaged_words(context, backing, backing_size, 64 * 1024, 0x7a11c0deu);
+    ok(!n, "%u words after the backing memory were written.\n", n);
+
+    memset(&control, 0, sizeof(control));
+    if (frame && rounds)
+    {
+        /* The range of the control block is checked before the call (workgraph_retain_reply_error). */
+        workgraph_read_buffer_range(context, backing, info.control_offset, sizeof(control), (uint32_t *)&control);
+        for (j = 0, run->used_rounds = 0; j <= WG_DRAIN_MAX_ROUNDS; j++)
+            run->used_rounds += !!(control.executed[j / 32] & (1u << (j % 32)));
+        trace("%u rounds.\n", run->used_rounds);
+    }
+    memset(&info_after, 0, sizeof(info_after));
+    if (frame)
+    {
+        data_size = sizeof(info_after);
+        hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &data_size, &info_after);
+        error = workgraph_drain_info_error(hr, data_size, &info_after, rounds, 0, wg_reqs.MinSizeInBytes);
+        ok(!error, "Round frame after the call: %s (hr #%x, size %u).\n", error, (int)hr, data_size);
+        memset(&lost, 0, sizeof(lost));
+        data_size = sizeof(lost);
+        hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_status_guid, &data_size, &lost);
+        ok(hr == S_OK && data_size == sizeof(lost), "Failed to get the lost records, hr #%x.\n", (int)hr);
+        ok(!lost.events && !lost.records, "Lost %"PRIu64" records in %"PRIu64" events.\n", lost.records,
+                lost.events);
+        if (rounds && !error)
+            states = workgraph_check_pool_states(context, backing, &info_after, &info, pools, kept1);
+        ok(!rounds || states, "The pool states were not read.\n");
+    }
+
+    reason = test->reason;
+    switch (test->graph)
+    {
+        case 0:
+            /* level_sinks: Mid broadcasts (u = 1), and the bound of pool 2 is the demand of one Mid record. */
+            k = 8;
+            if (frame && rounds)
+            {
+                workgraph_pool_sizes_at(pools, backing_size, &sizes);
+                workgraph_pool_caps(&sizes, 2, caps);
+                k = workgraph_pool_admit(8, 1, pools->bound[2], caps);
+                trace("%"PRIu64" Mid records a round.\n", k);
+                reason = workgraph_level_sinks_oracle(k, rounds, &mids, expected_pending, expected_executed);
+                for (j = 0; j <= WG_DRAIN_MAX_ROUNDS; j++)
+                    ok(control.pending[j] == expected_pending[j], "Round %u: expected pending %u, got %u.\n",
+                            j, expected_pending[j], control.pending[j]);
+                for (j = 0; j < 3; j++)
+                    ok(control.executed[j] == expected_executed[j], "Executed word %u: expected %#x, got %#x.\n",
+                            j, expected_executed[j], control.executed[j]);
+                if (test->size == WG_RETAIN_FIT)
+                    ok(k && k < 8, "Expected retention, got %"PRIu64" Mid records a round.\n", k);
+            }
+            else
+            {
+                mids = 8;
+            }
+            ok(values[0] == 512 * mids, "Expected %u Leaf records, got %u.\n", 512 * mids, values[0]);
+            if (frame && rounds)
+                ok(info_after.abandoned_records == 8 - mids, "Expected %u abandoned records, got %"PRIu64".\n",
+                        8 - mids, info_after.abandoned_records);
+            break;
+
+        case 1:
+            /* pool_retain: each admitted Mid record gives 256 Leaf records and 11 records of level 2 (2 Side, 1
+             * Fan, 8 empty). A Side record gives 128 Join records, a Fan record and an empty record one each. The
+             * records that are not in the outputs are the abandoned records: 4 - m Mid records, 11m - s - f - e
+             * records of level 2 and 128s + f + e - j Join records, for s Side records: 4 + 10m + 127s - j. */
+            ok(!(values[0] % 256), "Got %u Leaf records.\n", values[0]);
+            mids = values[0] / 256;
+            ok(values[5] <= 2 * mids && values[1] <= 128 * values[5] + 9 * mids,
+                    "Got %u Side and %u Join records for %u Mid records.\n", values[5], values[1], mids);
+            if (frame && rounds && test->fault)
+            {
+                /* The pool with the invalid head lost its records, so the abandoned records are a lower bound. Only
+                 * round 1 admitted records, and level 2 kept Side records. */
+                ok(mids && values[5] < 2 * mids, "Got %u Mid and %u Side records.\n", mids, values[5]);
+                ok(info_after.abandoned_records <= 4 + 10 * mids + 127 * values[5] - values[1],
+                        "Expected at most %u abandoned records, got %"PRIu64".\n",
+                        4 + 10 * mids + 127 * values[5] - values[1], info_after.abandoned_records);
+            }
+            else if (frame && rounds)
+            {
+                ok(info_after.abandoned_records == 4 + 10 * mids + 127 * values[5] - values[1],
+                        "Expected %u abandoned records, got %"PRIu64".\n",
+                        4 + 10 * mids + 127 * values[5] - values[1], info_after.abandoned_records);
+                /* Pool 3 holds less than 2 Side records, so level 2 keeps Side records across rounds. */
+                workgraph_pool_sizes_at(pools, backing_size, &sizes);
+                ok(!workgraph_pool_fits(pools, &sizes, 3, 2, 1), "Expected pool 3 to hold 1 Side record.\n");
+                if (rounds < WG_DRAIN_MAX_ROUNDS)
+                {
+                    ok(info_after.abandoned_records, "Expected abandoned records.\n");
+                    reason = WG_DRAIN_REASON_EXHAUSTED;
+                }
+                else
+                {
+                    reason = WG_DRAIN_REASON_COMPLETE;
+                    ok(control.pending[0] == 1, "Expected retention in round 1.\n");
+                }
+            }
+            else
+            {
+                reason = WG_DRAIN_REASON_COMPLETE;
+            }
+            if (reason == WG_DRAIN_REASON_COMPLETE)
+            {
+                ok(mids == 4 && values[5] == 8 && values[1] == 1060,
+                        "Expected 1024 Leaf, 8 Side and 1060 Join records, got %u, %u, %u.\n", values[0],
+                        values[5], values[1]);
+                for (j = 0; j < 32; j++)
+                    ok(values[8 + j] == ~0u && values[64 + j] == ~0u, "Leaf word %u: %#x, Side Join word: %#x.\n",
+                            j, values[8 + j], values[64 + j]);
+                ok(values[40] == 0xfu && values[41] == 32 && values[4] == 32, "Fan %#x, Done Join %u, Done %u.\n",
+                        values[40], values[41], values[4]);
+            }
+            break;
+
+        case 2:
+            for (j = 0; j < ARRAY_SIZE(recursion_reference); j++)
+                ok(values[j] == recursion_reference[j], "Value %u: expected %u, got %u.\n", j,
+                        recursion_reference[j], values[j]);
+            break;
+
+        case 3:
+            for (j = 0; j < 128; j++)
+                ok(values[j] == (j < 64 ? 512 * 64 + 9 : 256 * 64 + 11), "Value %u: got %u.\n", j, values[j]);
+            break;
+
+        case 4:
+            /* pool_wide_pair: one record, 8192 records for each reader, or none after a fault. */
+            n = frame && rounds && reason == WG_DRAIN_REASON_FAULT ? 0 : 8192;
+            ok(values[0] == n && values[1] == n && !values[2], "Expected %u records each, got %u, %u, %u bad.\n",
+                    n, values[0], values[1], values[2]);
+            if (frame && rounds)
+                ok(info_after.abandoned_records == (reason == WG_DRAIN_REASON_FAULT ? test->abandoned : 0),
+                        "Expected %"PRIu64" abandoned records, got %"PRIu64".\n", test->abandoned,
+                        info_after.abandoned_records);
+            break;
+
+        case 5:
+            /* pool_charge: each admitted record gives one Sink record, and each group 128 Sink records. With an
+             * invalid head of pool 1 in round 1, only round 1 admits records. */
+            if (frame && rounds && test->fault)
+                n = charge_admitted[0];
+            else
+                n = frame && rounds ? charge_admitted[min(rounds, ARRAY_SIZE(charge_admitted) - 1)] : 34;
+            ok(values[0] == n && !((values[0] + values[1]) % 128), "Expected %u Sink records, got %u and %u.\n",
+                    n, values[0], values[1]);
+            ok(vkd3d_popcount(values[8] & 0x1ffffu) + vkd3d_popcount(values[9] & 0x1ffffu) == n &&
+                    !(values[8] & ~0x1ffffu) && !(values[9] & ~0x1ffffu), "Got ids %#x, %#x.\n", values[8],
+                    values[9]);
+            if (!test->fault)
+                reason = n == 34 ? WG_DRAIN_REASON_COMPLETE : WG_DRAIN_REASON_EXHAUSTED;
+            if (frame && rounds && test->fault)
+            {
+                ok(info_after.abandoned_records <= 34 - n, "Expected at most %u abandoned records, got %"PRIu64".\n",
+                        34 - n, info_after.abandoned_records);
+                ok(run->used_rounds == 2, "Got %u rounds.\n", run->used_rounds);
+            }
+            else if (frame && rounds)
+            {
+                ok(info_after.abandoned_records == 34 - n, "Expected %u abandoned records, got %"PRIu64".\n", 34 - n,
+                        info_after.abandoned_records);
+                ok(run->used_rounds == min(rounds + 1, ARRAY_SIZE(charge_admitted)), "Got %u rounds.\n",
+                        run->used_rounds);
+            }
+            break;
+
+        case 6:
+            /* pool_straddle: each admitted record of level 1 runs 64 groups of its owner and 64 of its reader, each
+             * group 2 Sink records with the ids of the record. A reader runs the groups and the ids of its owner. */
+            ok(!values[1], "%u groups of M ran.\n", values[1]);
+            for (j = 0; j < 4; j++)
+                ok(!(values[4 + j] % 64) && values[4 + j] <= 256, "Reader %u: %u groups.\n", j, values[4 + j]);
+            ok(values[5] == values[4] && values[7] == values[6], "Got %u, %u groups of A_Owner and Z_Reader, %u, %u "
+                    "groups of Y_Owner and B_Reader.\n", values[4], values[5], values[6], values[7]);
+            admitted = (values[4] + values[6]) / 64;
+            ok(values[0] == 2 * (values[4] + values[5] + values[6] + values[7]), "Got %u Sink records.\n", values[0]);
+            for (j = 0; j < 16; j++)
+                ok(values[64 + 16 + j] == values[64 + j] && values[64 + 48 + j] == values[64 + 32 + j],
+                        "Sink word %u: %#x, %#x for A_Owner and Z_Reader, %#x, %#x for Y_Owner and B_Reader.\n", j,
+                        values[64 + j], values[64 + 16 + j], values[64 + 32 + j], values[64 + 48 + j]);
+            for (j = 0, n = 0; j < 64; j++)
+                n += vkd3d_popcount(values[64 + j]);
+            ok(n == values[0], "Got %u Sink ids for %u Sink records.\n", n, values[0]);
+            if (frame && rounds)
+            {
+                ok(info_after.abandoned_records == 8 - admitted, "Expected %u abandoned records, got %"PRIu64".\n",
+                        8 - admitted, info_after.abandoned_records);
+                /* The slots: the reply gives 76 slots, and only the owners keep records. Admission is in slot order,
+                 * so A_Owner (slot 1) gets its records admitted first, and Y_Owner (slot 74) keeps records. */
+                ok(info_after.pool_state_stride == ((16 + 8 * WG_STRADDLE_SLOTS + 15) & ~15u),
+                        "Expected %u slots, got a stride of %u bytes.\n", WG_STRADDLE_SLOTS,
+                        info_after.pool_state_stride);
+                for (j = 0; j < WG_STRADDLE_SLOTS && states; j++)
+                    ok(!kept1[j] || j == WG_STRADDLE_A_OWNER || j == WG_STRADDLE_Y_OWNER, "Slot %u keeps %u records.\n",
+                            j, kept1[j]);
+                if (rounds < WG_DRAIN_MAX_ROUNDS)
+                {
+                    ok(info_after.abandoned_records && (!states || kept1[WG_STRADDLE_Y_OWNER]),
+                            "Expected abandoned records of Y_Owner, got %"PRIu64".\n", info_after.abandoned_records);
+                    reason = WG_DRAIN_REASON_EXHAUSTED;
+                }
+                else
+                {
+                    reason = WG_DRAIN_REASON_COMPLETE;
+                    ok(control.pending[0] == 1, "Expected retention in round 1.\n");
+                }
+            }
+            else
+            {
+                reason = WG_DRAIN_REASON_COMPLETE;
+            }
+            if (reason == WG_DRAIN_REASON_COMPLETE)
+            {
+                ok(admitted == 8 && values[0] == 2048, "Expected 8 records and 2048 Sink records, got %u, %u.\n",
+                        admitted, values[0]);
+                for (j = 0; j < 64; j++)
+                    ok(values[64 + j] == ~0u, "Sink word %u: %#x.\n", j, values[64 + j]);
+            }
+            break;
+    }
+
+    if (frame && rounds)
+    {
+        fault_word = test->fault ? test->fault_word : reason == WG_DRAIN_REASON_FAULT;
+        ok(control.close_reason == reason, "Expected close reason %u, got %u.\n", reason, control.close_reason);
+        ok(control.fault == fault_word, "Expected fault %#x, got %#x.\n", fault_word, control.fault);
+        ok(control.closes == 1, "Expected 1 close, got %u.\n", control.closes);
+        ok(info_after.abandoned_events == (reason != WG_DRAIN_REASON_COMPLETE), "Got %u abandonment events.\n",
+                info_after.abandoned_events);
+        ok(info_after.abandoned_reasons == (reason != WG_DRAIN_REASON_COMPLETE ? 1u << reason : 0),
+                "Got reasons %#x.\n", info_after.abandoned_reasons);
+        ok(info_after.abandoned_flags == ((reason != WG_DRAIN_REASON_COMPLETE ? WG_DRAIN_ABANDONED : 0) |
+                (test->fault ? WG_DRAIN_ABANDONED_LOWER_BOUND : 0)), "Got flags %#x.\n", info_after.abandoned_flags);
+        if (reason == WG_DRAIN_REASON_COMPLETE)
+            ok(!info_after.abandoned_records, "Got %"PRIu64" abandoned records.\n", info_after.abandoned_records);
+    }
+
+    ID3D12Resource_Release(output);
+    ID3D12Resource_Release(backing);
+    ID3D12StateObject_Release(pso);
+}
+
 void test_workgraph_drain_retention(void)
 {
     /* The lab flavour of the amdgpu-wddm engine runs the extra rounds of the draining scheduler on the record pools
@@ -6612,33 +7296,19 @@ void test_workgraph_drain_retention(void)
      * which a pool does not hold one record, which must end in a fault and not in a hang. Each case checks the
      * records, the close reason, the abandoned records, that no record is lost, and 64 KiB after the backing memory.
      * At each close of the lab flavour, the pool states must agree with the abandoned records, and each retained block
-     * must begin at a multiple of 16 bytes.
+     * must begin at a multiple of 16 bytes (an internal contract of the layout). The replies are checked before any
+     * GPU work, and a case with a GUID of an older reply must stop before it.
      * The graphs: level_sinks (a chain with an exact oracle), pool_retain (shared readers, empty and nonempty records
      * in one pool, coalescing readers, a diamond, 256-byte entry records, retention at level 2), basic_recursion (8
      * levels), cross_group_sharing (an RW input, with no throttled level), pool_wide_pair (one record of two readers
-     * with a grid of 512 each) and pool_charge (groups that are not full, blocks of 8-byte records). Other drivers
-     * ignore the switches and give the same records. Each case launches at most 16384 records. */
-#include "shaders/workgraph/headers/basic_recursion.h"
-#include "shaders/workgraph/headers/cross_group_sharing.h"
-#include "shaders/workgraph/headers/pool_retain.h"
-#include "shaders/workgraph/headers/pool_wide_pair.h"
-#include "shaders/workgraph/headers/pool_charge.h"
-    static const struct
-    {
-        const D3D12_SHADER_BYTECODE *code;
-        const WCHAR *entry;
-        bool input; /* The entry point has an input record of 4 bytes. */
-        unsigned int entry_records; /* The records of the entry level that pool 1 must hold. */
-    }
-    graphs[] =
-    {
-        { &level_sinks_dxil, u"Entry", true, 1 },
-        { &pool_retain_dxil, u"Entry", false, 1 },
-        { &basic_recursion_dxil, u"EntryNode", false, 1 },
-        { &cross_group_sharing_dxil, u"EntryNode", false, 1 },
-        { &pool_wide_pair_dxil, u"Entry", false, 1 },
-        { &pool_charge_dxil, u"Entry", false, 1 },
-    };
+     * with a grid of 512 each), pool_charge (groups that are not full, blocks of 8-byte records) and pool_straddle
+     * (shared readers whose owners are in other subgroup-sized chunks of the distributor, in both slot orders).
+     * With VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1, AMDGPU_WDDM_WG_FAIL=pool-head:<level> makes the retention pass of
+     * that level write a head above the capacity of the pool in round 1, and pool-records:<level> a head with one
+     * record more than the slots: the admission and injection passes of round 2 must refuse the pool and set the fault
+     * word, and the abandoned record count is a lower bound. Other drivers ignore the switches and give the same
+     * records.
+     * Each case launches at most 16384 records. */
     static const struct workgraph_retain_case tests[] =
     {
         { "chain", 0, 64, WG_RETAIN_FIT, WG_RETAIN_ORACLE },
@@ -6653,393 +7323,186 @@ void test_workgraph_drain_retention(void)
         { "two readers, each fits but not both", 4, 4, WG_RETAIN_HALF, WG_DRAIN_REASON_FAULT, 1 },
         { "partial groups", 5, 64, WG_RETAIN_GROUPS, WG_RETAIN_ORACLE },
         { "partial groups, too few rounds", 5, 1, WG_RETAIN_GROUPS, WG_RETAIN_ORACLE },
+        { "straddle", 6, 64, WG_RETAIN_FIT, WG_RETAIN_ORACLE },
+        { "straddle, too few rounds", 6, 1, WG_RETAIN_FIT, WG_RETAIN_ORACLE },
+        { "straddle, drain off", 6, 0, WG_RETAIN_MIN, WG_DRAIN_REASON_COMPLETE },
+        /* Round 2: the admission of level 1 and the injection of pool 2 find the invalid head, and level 1 had no
+         * records left, so no admission pass admits a record. */
+        { "shared, empty, diamond, invalid head of pool 2", 1, 64, WG_RETAIN_FIT, WG_DRAIN_REASON_FAULT, 0, false,
+                "pool-head:2", WG_DRAIN_FAULT_PROGRESS | WG_DRAIN_FAULT_ADMIT_HEAD | WG_DRAIN_FAULT_INJECT_HEAD },
+        /* Round 2: the injection of pool 1 finds the invalid head, so level 1 has no records to admit. */
+        { "partial groups, invalid head of pool 1", 5, 64, WG_RETAIN_GROUPS, WG_DRAIN_REASON_FAULT, 0, false,
+                "pool-head:1", WG_DRAIN_FAULT_PROGRESS | WG_DRAIN_FAULT_INJECT_HEAD },
+        /* The head of pool 1 has one record more than its slots: the head is in the capacity, and only the injection
+         * finds the difference. */
+        { "partial groups, records of pool 1 not in its slots", 5, 64, WG_RETAIN_GROUPS, WG_DRAIN_REASON_FAULT, 0,
+                false, "pool-records:1", WG_DRAIN_FAULT_PROGRESS | WG_DRAIN_FAULT_INJECT_HEAD },
+        { "chain, no round frame", 0, 64, WG_RETAIN_FIT, WG_RETAIN_ORACLE, 0, false, NULL, 0,
+                WG_RETAIN_NO_ROUND_FRAME },
+        { "chain, no record pools", 0, 64, WG_RETAIN_FIT, WG_RETAIN_ORACLE, 0, false, NULL, 0, WG_RETAIN_NO_POOLS },
     };
-    /* pool_charge: the Sink records after each round, at 2 groups of pool 2. Round 1 and 2 admit 8 records of the
-     * first slot, round 3 its last record and 4 records of the other slot, round 4 8 and round 5 5 records. */
-    static const unsigned int charge_admitted[] = { 8, 16, 21, 29, 34 };
-    static const uint32_t recursion_reference[64] = { 0, 7, 13, 17, 25, 34, 46, 59, 71, 76, 68, 47, 23, 7, 1 };
-    uint32_t expected_pending[WG_DRAIN_MAX_ROUNDS + 1], expected_executed[3], *values, *tail_pattern;
-    ID3D12Resource *backing, *output;
-    struct workgraph_pool_sizes sizes, check_sizes;
-    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
-    struct workgraph_drain_control control;
-    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
-    struct test_context_workgraph context;
-    ID3D12GraphicsCommandList10 *list10;
-    D3D12_SET_PROGRAM_DESC program_desc;
-    uint64_t caps[WG_POOL_COMPONENTS], k;
-    struct workgraph_lost_records lost;
-    unsigned int i, j, n, reason, mids;
-    struct workgraph_drain_info info;
-    ID3D12GraphicsCommandList *list;
-    D3D12_PROGRAM_IDENTIFIER ident;
-    struct workgraph_pools *pools;
-    uint64_t backing_size, size;
-    D3D12_NODE_ID entry_id;
-    ID3D12StateObject *pso;
-    uint32_t params = 0;
-    UINT entry_index;
-    unsigned int rounds, used_rounds = 0;
-    bool frame, fits, half;
-    char limits[64];
-    UINT data_size;
+    struct workgraph_retain_run run;
+    unsigned int i, steps;
+    const char *env;
     HRESULT hr;
 
     workgraph_check_pool_arithmetic();
+    workgraph_check_pool_state_admission();
 
     if (!workgraph_is_bounded_runner())
     {
         skip("Set VKD3D_TEST_WORKGRAPH_BOUNDED=1 in a runner with a time bound to run the retention cases.\n");
         return;
     }
-    if (!init_workgraph_test_context(&context))
+    memset(&run, 0, sizeof(run));
+    if (!init_workgraph_test_context(&run.context))
         return;
-    if (!workgraph_drain_expected(context.device, &frame))
+    if (!workgraph_drain_expected(run.context.device, &run.frame))
     {
-        destroy_workgraph_test_context(&context);
+        destroy_workgraph_test_context(&run.context);
         return;
     }
+    env = getenv("VKD3D_TEST_WORKGRAPH_FAULT_INJECTION");
+    run.fault_injection = env && !strcmp(env, "1");
 
-    list = context.context.list;
-    pools = malloc(sizeof(*pools));
-    values = malloc(WG_RETAIN_VALUES * sizeof(*values));
-    tail_pattern = malloc(64 * 1024);
+    run.pools = malloc(sizeof(*run.pools));
+    run.values = malloc(WG_RETAIN_VALUES * sizeof(*run.values));
+    run.tail_pattern = malloc(64 * 1024);
     for (i = 0; i < 64 * 1024 / sizeof(uint32_t); i++)
-        tail_pattern[i] = 0x7a11c0deu;
+        run.tail_pattern[i] = 0x7a11c0deu;
 
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
-        const struct workgraph_retain_case *test = &tests[i];
         char name[16];
 
         /* VKD3D_TEST_WORKGRAPH_CASE=case<i>. runs only case i. */
         sprintf(name, "case%u.", i);
         if (!workgraph_case_enabled(name))
             continue;
-        /* The case before must have used at least 3 rounds, so that 2 less is at least 1. */
-        rounds = tests[i].rounds;
-        if (test->fewer && frame)
-        {
-            ok(used_rounds >= 3, "The case before used %u rounds.\n", used_rounds);
-            if (used_rounds < 3)
-                continue;
-            rounds = used_rounds - 2;
-        }
-        else if (test->fewer)
-        {
-            rounds = 1;
-        }
-        if (rounds)
-            sprintf(limits, "rounds=%u,canary=1", rounds);
-        else
-            strcpy(limits, "ring=8388608,canary=1");
-        vkd3d_test_set_context("Test %u (%s), %s", i, test->name, limits);
+        steps = run.gpu_steps;
+        workgraph_run_retain_case(&run, i, &tests[i]);
+        if (tests[i].reply != WG_RETAIN_REPLIES)
+            ok(run.gpu_steps == steps, "The case ran %u GPU steps after a refused reply.\n", run.gpu_steps - steps);
+    }
+    vkd3d_test_set_context(NULL);
 
-        workgraph_set_limits(limits);
-        hr = try_create_workgraph_pso(&context, *graphs[test->graph].code, NULL, &pso);
-        workgraph_set_limits(NULL);
+    hr = ID3D12Device5_GetDeviceRemovedReason(run.context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+    free(run.tail_pattern);
+    free(run.values);
+    free(run.pools);
+    destroy_workgraph_test_context(&run.context);
+}
+
+/* shared_divider: the records of each node, and the words of the output. */
+#define WG_DIVIDER_RECORDS 32868u
+#define WG_DIVIDER_VALUES 2112u
+
+static void workgraph_set_divider(const char *value)
+{
+#ifdef _WIN32
+    SetEnvironmentVariableA("AMDGPU_WDDM_WG_DIVIDER", value);
+#else
+    if (value)
+        setenv("AMDGPU_WDDM_WG_DIVIDER", value, 1);
+    else
+        unsetenv("AMDGPU_WDDM_WG_DIVIDER");
+#endif
+}
+
+void test_workgraph_shared_divider(void)
+{
+    /* A shared reader with 32868 records (shared_divider). The lab flavour of the amdgpu-wddm engine reads
+     * AMDGPU_WDDM_WG_DIVIDER=1 when it creates a device: then the distributor splits the workgroups of each node into a
+     * primary dispatch of 32768 groups and a secondary dispatch, as on a device with a maxComputeWorkGroupCount[0]
+     * below 2^24 - 1. The case runs on a device with the switch, then on a device without it. Each node must run one
+     * group for each of its records, and the reader must read each record of its owner once. Other drivers ignore the
+     * switch. */
+#include "shaders/workgraph/headers/shared_divider.h"
+    static const D3D12_NODE_ID entry_id = { u"Entry", 0 };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct test_context_workgraph context;
+    struct workgraph_lost_records lost;
+    ID3D12Resource *backing, *output;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    unsigned int pass, i, word;
+    ID3D12StateObject *pso;
+    uint32_t *values;
+    UINT entry_index;
+    bool frame;
+    UINT size;
+    HRESULT hr;
+
+    values = malloc(WG_DIVIDER_VALUES * sizeof(*values));
+    for (pass = 0; pass < 2; pass++)
+    {
+        vkd3d_test_set_context("Divider %s", pass ? "off" : "on");
+        /* The engine reads the switch when it creates the device. */
+        workgraph_set_divider(pass ? NULL : "1");
+        if (!init_workgraph_test_context(&context))
+        {
+            workgraph_set_divider(NULL);
+            break;
+        }
+        workgraph_set_divider(NULL);
+        if (!workgraph_drain_expected(context.device, &frame))
+        {
+            destroy_workgraph_test_context(&context);
+            break;
+        }
+
+        hr = try_create_workgraph_pso(&context, shared_divider_dxil, NULL, &pso);
         ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
-        if (!pso)
-            continue;
-        entry_id.Name = graphs[test->graph].entry;
-        entry_id.ArrayIndex = 0;
-        if (!workgraph_get_program(pso, &ident, &wg_reqs, &entry_index, &entry_id, 1))
+        if (!pso || !workgraph_get_program(pso, &ident, &wg_reqs, &entry_index, &entry_id, 1))
         {
-            ID3D12StateObject_Release(pso);
+            if (pso)
+                ID3D12StateObject_Release(pso);
+            destroy_workgraph_test_context(&context);
             continue;
         }
 
-        /* The backing size. Without the lab diagnostics there is no layout: the case runs at Min, and only the records
-         * of a complete run are checked. */
-        backing_size = wg_reqs.MinSizeInBytes;
-        memset(pools, 0, sizeof(*pools));
-        memset(&info, 0, sizeof(info));
-        if (frame)
-        {
-            data_size = sizeof(*pools);
-            hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_pool_guid, &data_size, pools);
-            ok(hr == S_OK && data_size == sizeof(*pools), "Record pools: hr #%x, size %u.\n", (int)hr, data_size);
-            ok(pools->execution == !!rounds, "Expected pool execution %u, got %u.\n", !!rounds,
-                    pools->execution);
-            if (rounds && (!pools->valid || !pools->execution))
-            {
-                ID3D12StateObject_Release(pso);
-                continue;
-            }
-            data_size = sizeof(info);
-            hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &data_size, &info);
-            ok(!workgraph_drain_info_error(hr, data_size, &info, rounds, 0, wg_reqs.MinSizeInBytes),
-                    "Round frame not valid, hr #%x, size %u.\n", (int)hr, data_size);
-        }
-        if (frame && rounds)
-        {
-            ok(pools->min_size == wg_reqs.MinSizeInBytes, "Expected Min %#"PRIx64", got %#"PRIx64".\n",
-                    pools->min_size, (uint64_t)wg_reqs.MinSizeInBytes);
-            /* The layout of the test must be the layout of the engine at each size of the reply. */
-            for (n = 0; n < WG_POOL_LAYOUTS; n++)
-            {
-                const struct workgraph_pool_layout *layout = &pools->layouts[n];
-
-                fits = workgraph_pool_sizes_at(pools, layout->size, &check_sizes);
-                ok(fits == !!layout->used, "Layout %u: expected a layout %u.\n", n, !!layout->used);
-                if (!fits || !layout->used)
-                    continue;
-                ok(check_sizes.entries == layout->entries.size && check_sizes.offsets == layout->offsets.size,
-                        "Layout %u: expected entries %#"PRIx64", offsets %#"PRIx64", got %#"PRIx64", %#"PRIx64".\n",
-                        n, check_sizes.entries, check_sizes.offsets, layout->entries.size, layout->offsets.size);
-                for (j = 1; j < pools->pools; j++)
-                {
-                    ok(check_sizes.payload[j] == layout->payload[j][0].size &&
-                            check_sizes.payload[j] == layout->payload[j][1].size,
-                            "Layout %u, pool %u: expected payload %#"PRIx64", got %#"PRIx64", %#"PRIx64".\n", n, j,
-                            check_sizes.payload[j], layout->payload[j][0].size, layout->payload[j][1].size);
-                }
-            }
-
-            backing_size = 0;
-            for (size = pools->min_size; size <= pools->max_size && !backing_size;
-                    size += test->size == WG_RETAIN_GROUPS ? 16 : 65536)
-            {
-                if (!workgraph_pool_sizes_at(pools, size, &sizes) ||
-                        !workgraph_pool_fits(pools, &sizes, 1, graphs[test->graph].entry_records, 1))
-                {
-                    /* Pool 1 must hold the records of the entry level at Min for a case at Min. */
-                    if (test->size == WG_RETAIN_MIN)
-                        break;
-                    continue;
-                }
-                if (test->size == WG_RETAIN_GROUPS)
-                {
-                    workgraph_pool_caps(&sizes, 2, caps);
-                    if (workgraph_pool_fits(pools, &sizes, 2, 2, 1) &&
-                            caps[WG_POOL_PAYLOAD] < 3 * pools->bound[2][WG_POOL_PAYLOAD])
-                        backing_size = size;
-                    continue;
-                }
-                fits = half = true;
-                for (j = 2; j < pools->pools; j++)
-                {
-                    fits = fits && workgraph_pool_fits(pools, &sizes, j, 1, 1);
-                    half = half && workgraph_pool_fits(pools, &sizes, j, 1, 2);
-                }
-                if ((test->size == WG_RETAIN_MIN && !fits) || (test->size == WG_RETAIN_FIT && fits) ||
-                        (test->size == WG_RETAIN_HALF && half && !fits))
-                    backing_size = size;
-                /* A case at Min runs at Min only. */
-                if (test->size == WG_RETAIN_MIN)
-                    break;
-            }
-            ok(backing_size, "No backing size for the case.\n");
-            if (!backing_size)
-            {
-                ID3D12StateObject_Release(pso);
-                continue;
-            }
-            trace("Backing size %#"PRIx64" (Min %#"PRIx64").\n", backing_size, pools->min_size);
-        }
-
-        backing = create_default_buffer(context.context.device, backing_size + 64 * 1024,
+        backing = workgraph_create_backing_memory(&context, &wg_reqs);
+        output = create_default_buffer(context.context.device, WG_DIVIDER_VALUES * sizeof(*values),
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-        upload_buffer_data(backing, backing_size, 64 * 1024, tail_pattern, context.context.queue, list);
-        reset_command_list(list, context.context.allocator);
-        output = create_default_buffer(context.context.device, WG_RETAIN_VALUES * sizeof(*values),
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-
-        hr = ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList10, (void **)&list10);
-        ok(SUCCEEDED(hr), "Failed to query ID3D12GraphicsCommandList10, hr #%x.\n", (int)hr);
-        ID3D12GraphicsCommandList_SetComputeRootSignature(list, context.default_root_uav_rs);
-        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0,
-                ID3D12Resource_GetGPUVirtualAddress(output));
-        memset(&program_desc, 0, sizeof(program_desc));
-        program_desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
-        program_desc.WorkGraph.BackingMemory.SizeInBytes = backing_size;
-        program_desc.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(backing);
-        program_desc.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
-        program_desc.WorkGraph.ProgramIdentifier = ident;
-        ID3D12GraphicsCommandList10_SetProgram(list10, &program_desc);
         memset(&dispatch_desc, 0, sizeof(dispatch_desc));
         dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
         dispatch_desc.NodeCPUInput.EntrypointIndex = entry_index;
         dispatch_desc.NodeCPUInput.NumRecords = 1;
-        dispatch_desc.NodeCPUInput.pRecords = graphs[test->graph].input ? &params : NULL;
-        dispatch_desc.NodeCPUInput.RecordStrideInBytes = graphs[test->graph].input ? sizeof(params) : 0;
-        ID3D12GraphicsCommandList10_DispatchGraph(list10, &dispatch_desc);
-        ID3D12GraphicsCommandList10_Release(list10);
+        workgraph_record_dispatch(&context, context.context.list, &ident, backing, wg_reqs.MinSizeInBytes, output,
+                &dispatch_desc);
+        workgraph_read_output(&context, output, values, WG_DIVIDER_VALUES);
 
-        workgraph_read_output(&context, output, values, WG_RETAIN_VALUES);
-        if (test->graph <= 1 || test->graph == 5)
+        ok(values[0] == WG_DIVIDER_RECORDS && values[1] == WG_DIVIDER_RECORDS && values[4] == WG_DIVIDER_RECORDS,
+                "Expected %u groups each, got %u Owner, %u Reader, %u A_Pad.\n", WG_DIVIDER_RECORDS, values[0],
+                values[1], values[4]);
+        ok(!values[2], "%u records have wrong contents.\n", values[2]);
+        ok(!values[3], "%u records arrived more than once.\n", values[3]);
+        for (i = 0; i < (WG_DIVIDER_RECORDS + 31) / 32; i++)
         {
-            ok(values[2] == 0, "%u records have wrong contents.\n", values[2]);
-            ok(values[3] == 0, "%u records arrived more than once.\n", values[3]);
+            word = i + 1 < (WG_DIVIDER_RECORDS + 31) / 32 ? ~0u : (1u << (WG_DIVIDER_RECORDS % 32)) - 1;
+            ok(values[16 + i] == word && values[1056 + i] == word, "Word %u: Owner %#x, Reader %#x.\n", i,
+                    values[16 + i], values[1056 + i]);
         }
-        n = workgraph_count_damaged_words(&context, backing, backing_size, 64 * 1024, 0x7a11c0deu);
-        ok(!n, "%u words after the backing memory were written.\n", n);
 
-        memset(&control, 0, sizeof(control));
-        if (frame && rounds)
-        {
-            workgraph_read_buffer_range(&context, backing, info.control_offset, sizeof(control), (uint32_t *)&control);
-            for (j = 0, used_rounds = 0; j <= WG_DRAIN_MAX_ROUNDS; j++)
-                used_rounds += !!(control.executed[j / 32] & (1u << (j % 32)));
-            trace("%u rounds.\n", used_rounds);
-        }
         if (frame)
         {
-            memset(&info, 0, sizeof(info));
-            data_size = sizeof(info);
-            hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &data_size, &info);
-            ok(hr == S_OK && data_size == sizeof(info), "Failed to get the round frame, hr #%x.\n", (int)hr);
             memset(&lost, 0, sizeof(lost));
-            data_size = sizeof(lost);
-            hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_status_guid, &data_size, &lost);
-            ok(hr == S_OK && data_size == sizeof(lost), "Failed to get the lost records, hr #%x.\n", (int)hr);
+            size = sizeof(lost);
+            hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_status_guid, &size, &lost);
+            ok(hr == S_OK && size == sizeof(lost), "Failed to get the lost records, hr #%x.\n", (int)hr);
             ok(!lost.events && !lost.records, "Lost %"PRIu64" records in %"PRIu64" events.\n", lost.records,
                     lost.events);
-            if (rounds)
-                workgraph_check_pool_states(&context, backing, &info);
         }
 
-        reason = test->reason;
-        switch (test->graph)
-        {
-            case 0:
-                /* level_sinks: Mid broadcasts (u = 1), and the bound of pool 2 is the demand of one Mid record. */
-                k = 8;
-                if (frame && rounds)
-                {
-                    workgraph_pool_sizes_at(pools, backing_size, &sizes);
-                    workgraph_pool_caps(&sizes, 2, caps);
-                    k = workgraph_pool_admit(8, 1, pools->bound[2], caps);
-                    trace("%"PRIu64" Mid records a round.\n", k);
-                    reason = workgraph_level_sinks_oracle(k, rounds, &mids, expected_pending,
-                            expected_executed);
-                    for (j = 0; j <= WG_DRAIN_MAX_ROUNDS; j++)
-                        ok(control.pending[j] == expected_pending[j], "Round %u: expected pending %u, got %u.\n",
-                                j, expected_pending[j], control.pending[j]);
-                    for (j = 0; j < 3; j++)
-                        ok(control.executed[j] == expected_executed[j], "Executed word %u: expected %#x, got %#x.\n",
-                                j, expected_executed[j], control.executed[j]);
-                    if (test->size == WG_RETAIN_FIT)
-                        ok(k && k < 8, "Expected retention, got %"PRIu64" Mid records a round.\n", k);
-                }
-                else
-                {
-                    mids = 8;
-                }
-                ok(values[0] == 512 * mids, "Expected %u Leaf records, got %u.\n", 512 * mids, values[0]);
-                if (frame && rounds)
-                    ok(info.abandoned_records == 8 - mids, "Expected %u abandoned records, got %"PRIu64".\n",
-                            8 - mids, info.abandoned_records);
-                break;
-
-            case 1:
-                /* pool_retain: each admitted Mid record gives 256 Leaf records and 11 records of level 2 (2 Side, 1
-                 * Fan, 8 empty). A Side record gives 128 Join records, a Fan record and an empty record one each. The
-                 * records that are not in the outputs are the abandoned records: 4 - m Mid records, 11m - s - f - e
-                 * records of level 2 and 128s + f + e - j Join records, for s Side records: 4 + 10m + 127s - j. */
-                ok(!(values[0] % 256), "Got %u Leaf records.\n", values[0]);
-                mids = values[0] / 256;
-                ok(values[5] <= 2 * mids && values[1] <= 128 * values[5] + 9 * mids,
-                        "Got %u Side and %u Join records for %u Mid records.\n", values[5], values[1], mids);
-                if (frame && rounds)
-                {
-                    ok(info.abandoned_records == 4 + 10 * mids + 127 * values[5] - values[1],
-                            "Expected %u abandoned records, got %"PRIu64".\n",
-                            4 + 10 * mids + 127 * values[5] - values[1], info.abandoned_records);
-                    /* Pool 3 holds less than 2 Side records, so level 2 keeps Side records across rounds. */
-                    workgraph_pool_sizes_at(pools, backing_size, &sizes);
-                    ok(!workgraph_pool_fits(pools, &sizes, 3, 2, 1), "Expected pool 3 to hold 1 Side record.\n");
-                    if (rounds < WG_DRAIN_MAX_ROUNDS)
-                    {
-                        ok(info.abandoned_records, "Expected abandoned records.\n");
-                        reason = WG_DRAIN_REASON_EXHAUSTED;
-                    }
-                    else
-                    {
-                        reason = WG_DRAIN_REASON_COMPLETE;
-                        ok(control.pending[0] == 1, "Expected retention in round 1.\n");
-                    }
-                }
-                else
-                {
-                    reason = WG_DRAIN_REASON_COMPLETE;
-                }
-                if (reason == WG_DRAIN_REASON_COMPLETE)
-                {
-                    ok(mids == 4 && values[5] == 8 && values[1] == 1060,
-                            "Expected 1024 Leaf, 8 Side and 1060 Join records, got %u, %u, %u.\n", values[0],
-                            values[5], values[1]);
-                    for (j = 0; j < 32; j++)
-                        ok(values[8 + j] == ~0u && values[64 + j] == ~0u, "Leaf word %u: %#x, Side Join word: %#x.\n",
-                                j, values[8 + j], values[64 + j]);
-                    ok(values[40] == 0xfu && values[41] == 32 && values[4] == 32, "Fan %#x, Done Join %u, Done %u.\n",
-                            values[40], values[41], values[4]);
-                }
-                break;
-
-            case 2:
-                for (j = 0; j < ARRAY_SIZE(recursion_reference); j++)
-                    ok(values[j] == recursion_reference[j], "Value %u: expected %u, got %u.\n", j,
-                            recursion_reference[j], values[j]);
-                break;
-
-            case 3:
-                for (j = 0; j < 128; j++)
-                    ok(values[j] == (j < 64 ? 512 * 64 + 9 : 256 * 64 + 11), "Value %u: got %u.\n", j, values[j]);
-                break;
-
-            case 4:
-                /* pool_wide_pair: one record, 8192 records for each reader, or none after a fault. */
-                n = frame && rounds && reason == WG_DRAIN_REASON_FAULT ? 0 : 8192;
-                ok(values[0] == n && values[1] == n && !values[2], "Expected %u records each, got %u, %u, %u bad.\n",
-                        n, values[0], values[1], values[2]);
-                if (frame && rounds)
-                    ok(info.abandoned_records == (reason == WG_DRAIN_REASON_FAULT ? test->abandoned : 0),
-                            "Expected %"PRIu64" abandoned records, got %"PRIu64".\n", test->abandoned,
-                            info.abandoned_records);
-                break;
-
-            case 5:
-                /* pool_charge: each admitted record gives one Sink record, and each group 128 Sink records. */
-                n = frame && rounds ? charge_admitted[min(rounds, ARRAY_SIZE(charge_admitted) - 1)] : 34;
-                ok(values[0] == n && !((values[0] + values[1]) % 128), "Expected %u Sink records, got %u and %u.\n",
-                        n, values[0], values[1]);
-                ok(vkd3d_popcount(values[8] & 0x1ffffu) + vkd3d_popcount(values[9] & 0x1ffffu) == n &&
-                        !(values[8] & ~0x1ffffu) && !(values[9] & ~0x1ffffu), "Got ids %#x, %#x.\n", values[8],
-                        values[9]);
-                reason = n == 34 ? WG_DRAIN_REASON_COMPLETE : WG_DRAIN_REASON_EXHAUSTED;
-                if (frame && rounds)
-                {
-                    ok(info.abandoned_records == 34 - n, "Expected %u abandoned records, got %"PRIu64".\n", 34 - n,
-                            info.abandoned_records);
-                    ok(used_rounds == min(rounds + 1, ARRAY_SIZE(charge_admitted)), "Got %u rounds.\n", used_rounds);
-                }
-                break;
-        }
-
-        if (frame && rounds)
-        {
-            ok(control.close_reason == reason, "Expected close reason %u, got %u.\n", reason, control.close_reason);
-            ok(control.fault == (reason == WG_DRAIN_REASON_FAULT), "Got fault %u.\n", control.fault);
-            ok(control.closes == 1, "Expected 1 close, got %u.\n", control.closes);
-            ok(info.abandoned_events == (reason != WG_DRAIN_REASON_COMPLETE), "Got %u abandonment events.\n",
-                    info.abandoned_events);
-            ok(info.abandoned_reasons == (reason != WG_DRAIN_REASON_COMPLETE ? 1u << reason : 0),
-                    "Got reasons %#x.\n", info.abandoned_reasons);
-            if (reason == WG_DRAIN_REASON_COMPLETE)
-                ok(!info.abandoned_records, "Got %"PRIu64" abandoned records.\n", info.abandoned_records);
-        }
-
+        hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+        ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
         ID3D12Resource_Release(output);
-        ID3D12Resource_Release(backing);
+        if (backing)
+            ID3D12Resource_Release(backing);
         ID3D12StateObject_Release(pso);
+        destroy_workgraph_test_context(&context);
     }
     vkd3d_test_set_context(NULL);
-
-    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
-    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
-    free(tail_pattern);
     free(values);
-    free(pools);
-    destroy_workgraph_test_context(&context);
 }

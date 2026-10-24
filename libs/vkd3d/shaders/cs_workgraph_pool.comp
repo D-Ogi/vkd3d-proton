@@ -10,7 +10,8 @@
 //     admits the largest k records that fit the free capacity of pool L + 1, and writes k to admit[]. A record is
 //     admitted as a whole, with all its readers: ceil(k / u) groups take ceil(k / u) x demand. The free capacity is
 //     the capacity of the half less the records of pool L + 1 that were retained in the round before. Sets the
-//     admitted word of the round frame if a record is admitted.
+//     admitted word of the round frame if a record is admitted. If the head of pool L + 1 is above a capacity, the
+//     pass admits no record and sets FAULT_ADMIT_HEAD in the fault word.
 //   RETAIN (after the payload expander of level L, before its nodes):
 //     (a) If level is not 0: the distributor admitted the first k records of each slot (end_elements -
 //         primary_linear_offset is k, and padding0 is the count). The other records of half h of pool L (source) are
@@ -20,7 +21,10 @@
 //     (b) If inject_level is not 0: the records of pool L + 1 that were retained in round r - 1 are in half h. The pass
 //         gives them to the producers of level L as if they had written them: packed entries of at most 256 records,
 //         the node counts, and the payload and entry counters, so that the producers append after them. It writes the
-//         output guard of pool L + 1.
+//         output guard of pool L + 1. If the head of pool L + 1 is above a capacity, or its slots do not add up to its
+//         records, the pass injects no record and sets FAULT_INJECT_HEAD in the fault word: the records of the pool
+//         are lost, and the close marks the abandoned record count as a lower bound.
+//     Lab flavour: if fault_head is not 0, (a) writes an invalid head (AMDGPU_WDDM_WG_FAIL=pool-head or pool-records).
 // The distributor of the level reset the counters before this pass. The layouts are in vkd3d_private.h:
 // struct vkd3d_workgraph_pool_state, struct vkd3d_workgraph_pool_admission, struct vkd3d_workgraph_pool_level_args.
 
@@ -32,6 +36,11 @@ const uint MODE_ADMIT = 0u;
 const uint MODE_RETAIN = 1u;
 const uint EMPTY_RECORD_BYTES = 4u;
 const uint ENTRY_RECORDS = 256u;
+// VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS, VKD3D_WORKGRAPH_DRAIN_FAULT_ADMIT_HEAD,
+// VKD3D_WORKGRAPH_DRAIN_FAULT_INJECT_HEAD.
+const uint MAX_ROUNDS = 64u;
+const uint FAULT_ADMIT_HEAD = 2u;
+const uint FAULT_INJECT_HEAD = 4u;
 
 layout(buffer_reference, buffer_reference_align = 16, std430) buffer IndirectCommandsBuffer
 {
@@ -107,9 +116,15 @@ layout(buffer_reference, buffer_reference_align = 4, std430) writeonly buffer Ad
 	uint data[];
 };
 
-layout(buffer_reference, buffer_reference_align = 4, std430) writeonly buffer AdmittedWord
+// struct vkd3d_workgraph_drain_control.
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer Control
 {
-	uint value;
+	uint pending[MAX_ROUNDS + 1u];
+	uint executed[3];
+	uint fault;
+	uint closes;
+	uint close_reason;
+	uint admitted;
 };
 
 layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer LevelArgs
@@ -126,7 +141,7 @@ layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer Le
 	OutputGuard guard;
 	AdmissionTable table;
 	AdmitCounts admit;
-	AdmittedWord admitted;
+	Control control;
 	uint pool_state_stride;
 	uint level;
 	uint inject_level;
@@ -134,7 +149,7 @@ layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer Le
 	uint payload_capacity;
 	uint packed_capacity;
 	uint caps[3];
-	uint padding;
+	uint fault_head;
 };
 
 layout(push_constant, std430) uniform Registers
@@ -159,11 +174,29 @@ uint64_t free_capacity(uint cap, uint64_t used)
 	return uint64_t(cap) > used ? uint64_t(cap) - used : 0ul;
 }
 
+// The retained records of pool level + 1 came from one half of the pool, so a valid head is at most the capacity of a
+// half: payload bytes, packed entries, and records (one unrolled offset each).
+bool head_in_capacity(LevelArgs args, uvec4 head)
+{
+	return head.x <= args.caps[0] && head.y <= args.caps[1] &&
+		uint64_t(head.z) + uint64_t(head.w) <= uint64_t(args.caps[2]);
+}
+
 void admit(LevelArgs args)
 {
 	uvec4 head = pool_state(args, args.level + 1u).head;
 	uint64_t free_space[3];
 	bool admitted = false;
+
+	// With a valid head, the free capacity is the capacity less the head. An invalid head admits no record, also for a
+	// slot without demand.
+	if (!head_in_capacity(args, head))
+	{
+		for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
+			args.admit.data[node_index] = 0u;
+		atomicOr(args.control.fault, FAULT_ADMIT_HEAD);
+		return;
+	}
 
 	free_space[0] = free_capacity(args.caps[0], uint64_t(head.x));
 	free_space[1] = free_capacity(args.caps[1], uint64_t(head.y));
@@ -212,7 +245,7 @@ void admit(LevelArgs args)
 	}
 
 	if (admitted)
-		args.admitted.value = 1u;
+		args.control.admitted = 1u;
 }
 
 void retain(LevelArgs args)
@@ -263,14 +296,34 @@ void retain(LevelArgs args)
 		records += kept;
 	}
 
+	uvec4 head = uvec4(block + EMPTY_RECORD_BYTES * empty, packed, records, empty);
+	// The lab hooks: 1 writes payload bytes above every capacity, 2 one record more than the slots hold.
+	if (args.fault_head == 1u)
+		head.x = ~0u;
+	else if (args.fault_head == 2u)
+		head.z += 1u;
 	if (tid == 0u)
-		state.head = uvec4(block + EMPTY_RECORD_BYTES * empty, packed, records, empty);
+		state.head = head;
 }
 
 void inject(LevelArgs args)
 {
 	PoolState state = pool_state(args, args.inject_level);
+	uvec4 head = state.head;
+	uint64_t kept = 0ul;
 	uint packed = 0u;
+
+	for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
+		kept += uint64_t(state.slots[node_index].x);
+	// The output guard of the pool is written also for an invalid head. Then the counters stay as the distributor reset
+	// them.
+	args.guard.payload_capacity = args.payload_capacity;
+	args.guard.packed_capacity = args.packed_capacity;
+	if (!head_in_capacity(args, head) || kept != uint64_t(head.z) + uint64_t(head.w))
+	{
+		atomicOr(args.control.fault, FAULT_INJECT_HEAD);
+		return;
+	}
 
 	for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
 	{
@@ -290,10 +343,8 @@ void inject(LevelArgs args)
 		}
 	}
 
-	args.atomics.payload_atomic = state.head.x;
+	args.atomics.payload_atomic = head.x;
 	args.atomics.fused_atomic = packed;
-	args.guard.payload_capacity = args.payload_capacity;
-	args.guard.packed_capacity = args.packed_capacity;
 }
 
 void main()

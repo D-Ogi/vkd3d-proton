@@ -4720,8 +4720,8 @@ struct vkd3d_workgraph_gpu_input_indirect
 
 static bool d3d12_wg_requires_primary_execution(const struct d3d12_wg_state_object *state)
 {
-    return state->device->device_info.properties2.properties.limits.maxComputeWorkGroupCount[0] <
-            VKD3D_WORKGRAPH_MAX_WGX_NO_PRIMARY_EXECUTION_THRESHOLD;
+    /* amdgpu-wddm fork: the same decision as the distributor pipeline (struct vkd3d_workgraph_indirect_ops). */
+    return state->device->meta_ops.workgraph.require_wg_divider;
 }
 
 static void d3d12_command_list_workgraph_execute_node_gpu(
@@ -4920,8 +4920,7 @@ static bool d3d12_command_list_workgraph_prepare_pools(struct d3d12_command_list
             args->guard_va = base + program->output_guard_scratch_offset;
             args->table_va = table.va;
             args->admit_va = base + program->pool_admit_scratch_offset;
-            args->admitted_va = base + program->drain_control_scratch_offset +
-                    offsetof(struct vkd3d_workgraph_drain_control, admitted);
+            args->control_va = base + program->drain_control_scratch_offset;
             args->pool_state_stride = program->pool_state_stride;
             args->level = level;
             args->num_nodes = program->num_pipelines;
@@ -4932,6 +4931,12 @@ static bool d3d12_command_list_workgraph_prepare_pools(struct d3d12_command_list
                 args->payload_capacity = args->caps[D3D12_WG_POOL_PAYLOAD];
                 args->packed_capacity = args->caps[D3D12_WG_POOL_ENTRIES];
             }
+            /* The lab hooks write an invalid head of pool "level" in the rounds of half 0, so round 2 reads it: 1 for
+             * payload bytes above every capacity, 2 for one record more than the slots hold. */
+            if (level && !half && d3d12_wg_fault_injected("pool-head", level))
+                args->fault_head = 1;
+            else if (level && !half && d3d12_wg_fault_injected("pool-records", level))
+                args->fault_head = 2;
         }
     }
 

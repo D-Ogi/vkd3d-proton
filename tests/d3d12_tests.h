@@ -499,6 +499,7 @@ decl_test(test_workgraph_predication);
 decl_test(test_workgraph_drain_rounds);
 decl_test(test_workgraph_drain_layout);
 decl_test(test_workgraph_drain_retention);
+decl_test(test_workgraph_shared_divider);
 decl_test(test_workgraph_dispatch_failure);
 decl_test(test_workgraph_broadcast_input);
 decl_test(test_workgraph_thread_input);

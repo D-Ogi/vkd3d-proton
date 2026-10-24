@@ -179,9 +179,6 @@ void main()
 			cmd.padding0 = counts;
 
 			registers.commands.indirect_commands[node_index] = cmd;
-
-			// Reset the counters so we don't have to do an extra pass on next iteration.
-			registers.atomics.node_counts[node_index] = 0;
 		}
 
 		// Wave-uniform accumulate.
@@ -206,7 +203,8 @@ void main()
 				IndirectCommands cmd = registers.commands.indirect_commands[i];
 
 				int coalesce_divider = registers.dividers.data[i];
-				uint coalesce_mult = coalesce_divider != 0 ? coalesce_divider : 1u;
+				// amdgpu-wddm fork: the factor of the first loop. The divider of a broadcasting node is negative.
+				uint coalesce_mult = coalesce_divider > 0 ? uint(coalesce_divider) : 1u;
 				uint amplification = coalesce_divider < 0 ? uint(-coalesce_divider) : 1;
 
 				amplification &= 0xffffu;
@@ -224,7 +222,15 @@ void main()
 		}
 	}
 
-	// Reset the counters so we don't have to do an extra pass on next iteration.
+	// amdgpu-wddm fork: reset the counters so we don't have to do an extra pass on next iteration, but only after the
+	// first loop read all of them. A shared reader reads the count of its owner, and the owner can be in an earlier
+	// chunk of gl_SubgroupSize nodes.
+	subgroupMemoryBarrierBuffer();
+	subgroupBarrier();
+	for (uint i = gl_SubgroupInvocationID; i < registers.num_nodes; i += gl_SubgroupSize)
+		registers.atomics.node_counts[i] = 0;
+
+	// Reset the other counters.
 	// Also, have a single thread emit the fused expander kernel.
 	if (subgroupElect())
 	{

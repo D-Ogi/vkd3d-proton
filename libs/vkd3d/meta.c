@@ -2385,8 +2385,22 @@ static HRESULT vkd3d_workgraph_ops_init(struct vkd3d_workgraph_indirect_ops *wor
     spec_data[0] = device->device_info.vulkan_1_3_properties.maxSubgroupSize;
     spec_data[1] = device->device_info.vulkan_1_3_properties.maxSubgroupSize;
     spec_data[2] = 0;
-    spec_data[3] = device->device_info.properties2.properties.limits.maxComputeWorkGroupCount[0] <
+    workgraph_ops->require_wg_divider = device->device_info.properties2.properties.limits.maxComputeWorkGroupCount[0] <
             VKD3D_WORKGRAPH_MAX_WGX_NO_PRIMARY_EXECUTION_THRESHOLD;
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    {
+        /* amdgpu-wddm fork, lab flavour: AMDGPU_WDDM_WG_DIVIDER=1 selects the split dispatch also on a device with a
+         * large maxComputeWorkGroupCount, so that a test can run that path on any device. */
+        char value[8];
+
+        if (vkd3d_get_env_var("AMDGPU_WDDM_WG_DIVIDER", value, sizeof(value)) && !strcmp(value, "1"))
+        {
+            WARN("Work graphs: the distributor splits the workgroups of each node (AMDGPU_WDDM_WG_DIVIDER=1).\n");
+            workgraph_ops->require_wg_divider = true;
+        }
+    }
+#endif
+    spec_data[3] = workgraph_ops->require_wg_divider;
 
     memset(&required, 0, sizeof(required));
     required.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;

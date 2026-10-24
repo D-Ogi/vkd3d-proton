@@ -9,10 +9,12 @@
 //   MODE_PENDING: the last dispatch of round r. It sets bit r of the executed mask and writes pending[r]: 1 if work
 //     is waiting, 0 if not or if the fault word is set. A skipped round writes nothing. With record pools, work is
 //     waiting if a pool holds retained records. Self-check: if records were waiting at the start of an extra round and
-//     no admission pass of the round admitted a record, the round made no progress and the fault word is set.
+//     no admission pass of the round admitted a record, the round made no progress and FAULT_PROGRESS is set in the
+//     fault word. The admission and injection passes set the other bits of the fault word (cs_workgraph_pool.comp).
 //   MODE_CLOSE: runs outside every conditional block, after the last round. It writes the close reason and counts the
 //     close. If work is left (pending[rounds] is not 0) or the fault word is set, it adds one event to the abandonment
-//     record of the state object, and the records that the pools still hold to its record count.
+//     record of the state object, and the records that the pools still hold to its record count. If a pool pass found
+//     an invalid head, that pool lost its records, and the count is a lower bound (ABANDONED_LOWER_BOUND).
 // The layouts are struct vkd3d_workgraph_drain_control, struct vkd3d_workgraph_abandoned and struct
 // vkd3d_workgraph_pool_state in vkd3d_private.h.
 layout(local_size_x = 1) in;
@@ -25,8 +27,13 @@ const uint MAX_ROUNDS = 64u;
 const uint REASON_COMPLETE = 0u;
 const uint REASON_EXHAUSTED = 1u;
 const uint REASON_FAULT = 2u;
-// VKD3D_WORKGRAPH_ABANDONED.
+// VKD3D_WORKGRAPH_ABANDONED, VKD3D_WORKGRAPH_ABANDONED_LOWER_BOUND.
 const uint ABANDONED = 1u;
+const uint ABANDONED_LOWER_BOUND = 2u;
+// VKD3D_WORKGRAPH_DRAIN_FAULT_PROGRESS, and VKD3D_WORKGRAPH_DRAIN_FAULT_ADMIT_HEAD with
+// VKD3D_WORKGRAPH_DRAIN_FAULT_INJECT_HEAD.
+const uint FAULT_PROGRESS = 1u;
+const uint FAULT_HEAD = 2u | 4u;
 
 layout(buffer_reference, buffer_reference_align = 16, std430) buffer Control
 {
@@ -138,12 +145,12 @@ void main()
 
 		// The lab flavour injects a round without progress: the self-check sets the sticky fault word.
 		if (registers.stall != 0u)
-			control.fault = 1u;
+			control.fault |= FAULT_PROGRESS;
 
 		// The records in the pools, and the lab hook, which reports waiting work without records.
 		real = pools_hold_records() ? 1u : 0u;
 		if (registers.round != 0u && control.waiting != 0u && control.admitted == 0u)
-			control.fault = 1u;
+			control.fault |= FAULT_PROGRESS;
 		control.waiting = real;
 		control.admitted = 0u;
 
@@ -169,7 +176,8 @@ void main()
 			atomicAdd(registers.abandoned.events, 1u);
 			atomicOr(registers.abandoned.reasons, 1u << reason);
 			atomicExchange(registers.abandoned.last_reason, reason);
-			atomicOr(registers.abandoned.flags, ABANDONED);
+			atomicOr(registers.abandoned.flags, (control.fault & FAULT_HEAD) != 0u ? ABANDONED | ABANDONED_LOWER_BOUND :
+					ABANDONED);
 
 			records = pool_records();
 			uint lo = uint(records), hi = uint(records >> 32u);
