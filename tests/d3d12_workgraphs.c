@@ -109,6 +109,20 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/scalar_self_recursion.h"
 #include "shaders/workgraph/headers/empty_entry.h"
 #include "shaders/workgraph/headers/track_rw_entry.h"
+#include "shaders/workgraph/headers/multi_input_count.h"
+#include "shaders/workgraph/headers/empty_count64.h"
+
+/* is_vkd3d_proton_device() is always false in the Windows build of the tests, also with the vkd3d-proton DLLs next
+ * to the executable. This asks the device for the vkd3d-proton interop interface. */
+static bool workgraph_is_vkd3d_proton(ID3D12Device5 *device)
+{
+    IUnknown *interop;
+
+    if (FAILED(ID3D12Device5_QueryInterface(device, &IID_ID3D12DXVKInteropDevice, (void **)&interop)))
+        return false;
+    IUnknown_Release(interop);
+    return true;
+}
 
 /* The stride 0 cases are skipped on AMD because they hang the GPU with AMD's own driver. A different driver with
  * the AMD vendor ID can run them: set VKD3D_TEST_WORKGRAPH_AMD_STRIDE_0=1. */
@@ -1588,7 +1602,7 @@ void test_workgraph_cpu_input_extent(void)
     ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
 
     hr = try_create_workgraph_pso(&context, track_rw_entry_dxil, NULL, &pso[1]);
-    if (is_vkd3d_proton_device((ID3D12Device *)context.device))
+    if (workgraph_is_vkd3d_proton(context.device))
         ok(hr == S_OK, "Failed to create the tracked state object, hr #%x.\n", (int)hr);
     else
         ok(hr == S_OK || hr == E_INVALIDARG, "Tracked state object: unexpected hr #%x.\n", (int)hr);
@@ -1637,6 +1651,748 @@ void test_workgraph_cpu_input_extent(void)
 #else
     skip("The CPU input extent test needs VirtualAlloc.\n");
 #endif
+}
+
+/* Set VKD3D_TEST_WORKGRAPH_CASE to a part of a case name to run only the cases whose name contains it. */
+static bool workgraph_case_enabled(const char *name)
+{
+    const char *env = getenv("VKD3D_TEST_WORKGRAPH_CASE");
+
+    return !env || !env[0] || strstr(name, env);
+}
+
+struct workgraph_multi_input
+{
+    ID3D12Resource *buffer;
+    D3D12_GPU_VIRTUAL_ADDRESS va;
+};
+
+/* Writes one D3D12_MULTI_NODE_GPU_INPUT at offset 0 of an upload buffer and the D3D12_NODE_GPU_INPUT array at
+ * offset 256, with a stride of 32 bytes. */
+static void workgraph_create_multi_input(struct test_context_workgraph *context,
+        const D3D12_NODE_GPU_INPUT *inputs, unsigned int inputs_count, UINT num_node_inputs, UINT64 input_stride,
+        struct workgraph_multi_input *multi)
+{
+    D3D12_MULTI_NODE_GPU_INPUT header;
+    unsigned int i;
+    uint8_t *data;
+    size_t size;
+
+    size = 256 + 32 * max(inputs_count, 1u);
+    data = calloc(1, size);
+    for (i = 0; i < inputs_count; i++)
+        memcpy(data + 256 + 32 * i, &inputs[i], sizeof(inputs[i]));
+    multi->buffer = create_upload_buffer(context->context.device, size, NULL);
+    multi->va = ID3D12Resource_GetGPUVirtualAddress(multi->buffer);
+
+    memset(&header, 0, sizeof(header));
+    header.NumNodeInputs = num_node_inputs;
+    header.NodeInputs.StartAddress = multi->va + 256;
+    header.NodeInputs.StrideInBytes = input_stride;
+    memcpy(data, &header, sizeof(header));
+    update_buffer_data(multi->buffer, 0, size, data);
+    free(data);
+}
+
+static bool workgraph_get_program(ID3D12StateObject *pso, D3D12_PROGRAM_IDENTIFIER *ident,
+        D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS *wg_reqs, UINT *entry_indices, const D3D12_NODE_ID *entry_ids,
+        unsigned int entry_count)
+{
+    ID3D12StateObjectProperties1 *props1 = NULL;
+    ID3D12WorkGraphProperties *props = NULL;
+    unsigned int i;
+    bool ret = true;
+    HRESULT hr;
+
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12StateObjectProperties1, (void **)&props1);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12StateObjectProperties1, hr #%x.\n", (int)hr);
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+    if (!props1 || !props)
+    {
+        ret = false;
+        goto out;
+    }
+
+    *ident = ID3D12StateObjectProperties1_GetProgramIdentifier(props1, u"Dummy");
+    memset(wg_reqs, 0, sizeof(*wg_reqs));
+    ID3D12WorkGraphProperties_GetWorkGraphMemoryRequirements(props, 0, wg_reqs);
+    for (i = 0; i < entry_count; i++)
+    {
+        /* The order of the entry points is not defined, so look up each. */
+        entry_indices[i] = ID3D12WorkGraphProperties_GetEntrypointIndex(props, 0, entry_ids[i]);
+        ok(entry_indices[i] < entry_count, "Unexpected entry point index %u.\n", entry_indices[i]);
+        if (entry_indices[i] >= entry_count)
+            ret = false;
+    }
+
+out:
+    if (props)
+        ID3D12WorkGraphProperties_Release(props);
+    if (props1)
+        ID3D12StateObjectProperties1_Release(props1);
+    return ret;
+}
+
+/* Records the root arguments, SetProgram with initialization of the backing memory and one DispatchGraph. */
+static void workgraph_record_dispatch(struct test_context_workgraph *context, ID3D12GraphicsCommandList *list,
+        const D3D12_PROGRAM_IDENTIFIER *ident, ID3D12Resource *scratch, UINT64 scratch_size,
+        ID3D12Resource *output, const D3D12_DISPATCH_GRAPH_DESC *dispatch_desc)
+{
+    ID3D12GraphicsCommandList10 *list10;
+    D3D12_SET_PROGRAM_DESC program_desc;
+    HRESULT hr;
+
+    hr = ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList10, (void **)&list10);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12GraphicsCommandList10, hr #%x.\n", (int)hr);
+    if (FAILED(hr))
+        return;
+
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, context->default_root_uav_rs);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0, ID3D12Resource_GetGPUVirtualAddress(output));
+
+    memset(&program_desc, 0, sizeof(program_desc));
+    program_desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+    if (scratch)
+    {
+        program_desc.WorkGraph.BackingMemory.SizeInBytes = scratch_size;
+        program_desc.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(scratch);
+    }
+    program_desc.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+    program_desc.WorkGraph.ProgramIdentifier = *ident;
+    ID3D12GraphicsCommandList10_SetProgram(list10, &program_desc);
+    ID3D12GraphicsCommandList10_DispatchGraph(list10, dispatch_desc);
+    ID3D12GraphicsCommandList10_Release(list10);
+}
+
+static ID3D12Resource *workgraph_create_backing_memory(struct test_context_workgraph *context,
+        const D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS *wg_reqs)
+{
+    if (!wg_reqs->MinSizeInBytes)
+        return NULL;
+    return create_default_buffer(context->context.device, wg_reqs->MinSizeInBytes,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+}
+
+static void workgraph_read_output(struct test_context_workgraph *context, ID3D12Resource *output,
+        uint32_t *values, unsigned int count)
+{
+    struct resource_readback rb;
+    unsigned int i;
+
+    transition_resource_state(context->context.list, output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    get_buffer_readback_with_command_list(output, DXGI_FORMAT_R32_UINT, &rb,
+            context->context.queue, context->context.list);
+    reset_command_list(context->context.list, context->context.allocator);
+    for (i = 0; i < count; i++)
+        values[i] = get_readback_uint(&rb, i, 0, 0);
+    release_resource_readback(&rb);
+}
+
+/* The records of multi_input_count are 256 bytes. Record i of a buffer has the value (i % 7) + 1 in its first
+ * dword and the buffer's tail value in its last dword. */
+#define WG_COUNT_RECORD_SIZE 256u
+
+static ID3D12Resource *workgraph_create_count_records(struct test_context_workgraph *context,
+        unsigned int count, unsigned int stride, uint32_t tail)
+{
+    ID3D12Resource *buffer;
+    unsigned int i;
+    uint8_t *data;
+    size_t size;
+
+    size = (size_t)count * stride;
+    data = calloc(1, size);
+    for (i = 0; i < count; i++)
+    {
+        uint32_t value = (i % 7) + 1;
+
+        memcpy(data + (size_t)i * stride, &value, sizeof(value));
+        memcpy(data + (size_t)i * stride + WG_COUNT_RECORD_SIZE - 4, &tail, sizeof(tail));
+    }
+    buffer = create_upload_buffer(context->context.device, size, data);
+    free(data);
+    return buffer;
+}
+
+struct workgraph_count_input
+{
+    unsigned int entry; /* 0: EntryA, 1: EntryB. */
+    unsigned int first; /* First record of the buffer. */
+    unsigned int count;
+    bool repeat; /* Stride 0: record first is repeated count times. */
+};
+
+/* Adds the launch count and the sums of the inputs to expected[0..2] (EntryA) and expected[4..6] (EntryB). */
+static void workgraph_count_expected(const struct workgraph_count_input *input, unsigned int times, uint32_t tail,
+        uint32_t *expected)
+{
+    uint32_t *e = expected + 4 * input->entry;
+    uint64_t value = 0;
+    unsigned int i;
+
+    if (input->repeat)
+        value = (uint64_t)input->count * ((input->first % 7) + 1);
+    else
+    {
+        for (i = 0; i < input->count; i++)
+            value += ((input->first + i) % 7) + 1;
+    }
+
+    e[0] += input->count * times;
+    e[1] += (uint32_t)(value * times);
+    e[2] += input->count * tail * times;
+}
+
+void test_workgraph_multi_gpu_input_capacity(void)
+{
+    /* D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT must launch every record of every input (WorkGraphs.md,
+     * D3D12_MULTI_NODE_GPU_INPUT). A compute-only graph declares no maximum number of input records
+     * (SetMaximumInputRecords applies only to graphs with graphics nodes). The records are 256 bytes, so
+     * 524288 records are 128 MiB: an implementation that copies the inputs into one fixed 128 MiB range loses
+     * records past that size. The cases cover one input at that size and one record more, a padded stride,
+     * a stride of 0, records split across inputs and across entry points, many small inputs, and an input array
+     * with a stride of 0. */
+#define WG_CAPACITY_RECORDS 524289u
+    static const D3D12_NODE_ID entry_ids[] = { { u"EntryA", 0 }, { u"EntryB", 0 } };
+    static const struct workgraph_count_input one_exact[] = { { 0, 0, 524288 } };
+    static const struct workgraph_count_input one_more[] = { { 0, 0, WG_CAPACITY_RECORDS } };
+    static const struct workgraph_count_input repeated[] = { { 0, 5, WG_CAPACITY_RECORDS, true } };
+    static const struct workgraph_count_input split[] = { { 0, 0, 262144 }, { 0, 262144, 262145 } };
+    static const struct workgraph_count_input two_entries[] = { { 0, 0, WG_CAPACITY_RECORDS }, { 1, 0, WG_CAPACITY_RECORDS } };
+    static const struct
+    {
+        const char *name;
+        const struct workgraph_count_input *inputs;
+        unsigned int inputs_count;
+        bool padded; /* Use the buffer with a stride of 260 bytes. */
+        bool many; /* 64 inputs of 1024 to 1026 records, to EntryA and EntryB in turn. */
+        unsigned int array_repeat; /* If not 0: NumNodeInputs, with an input array stride of 0. */
+    }
+    tests[] =
+    {
+        { "one input, 524288 records", one_exact, ARRAY_SIZE(one_exact) },
+        { "one input, 524289 records", one_more, ARRAY_SIZE(one_more) },
+        { "one input, padded stride", one_more, ARRAY_SIZE(one_more), true },
+        { "one input, stride 0", repeated, ARRAY_SIZE(repeated) },
+        { "split across inputs", split, ARRAY_SIZE(split) },
+        { "split across entry points", two_entries, ARRAY_SIZE(two_entries) },
+        { "many small inputs", NULL, 64, false, true },
+        { "input array stride 0", one_more, ARRAY_SIZE(one_more), false, false, 3 },
+    };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct workgraph_count_input many[64];
+    const struct workgraph_count_input *inputs;
+    D3D12_NODE_GPU_INPUT node_inputs[64];
+    struct workgraph_multi_input multi;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    ID3D12Resource *records[2], *buffer;
+    uint32_t expected[8], values[8];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *scratch;
+    ID3D12Resource *output;
+    unsigned int i, j, n;
+    unsigned int stride;
+    UINT entry_index[2];
+    ID3D12StateObject *pso;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    hr = try_create_workgraph_pso(&context, multi_input_count_dxil, NULL, &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        goto out_pso;
+
+    records[0] = workgraph_create_count_records(&context, WG_CAPACITY_RECORDS, WG_COUNT_RECORD_SIZE, 1);
+    records[1] = workgraph_create_count_records(&context, WG_CAPACITY_RECORDS, WG_COUNT_RECORD_SIZE + 4, 1);
+
+    for (i = 0; i < ARRAY_SIZE(many); i++)
+    {
+        many[i].entry = i & 1;
+        many[i].first = i * 1100;
+        many[i].count = 1024 + (i % 3);
+        many[i].repeat = false;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        if (!workgraph_case_enabled(tests[i].name))
+            continue;
+        vkd3d_test_set_context("%s", tests[i].name);
+
+        inputs = tests[i].many ? many : tests[i].inputs;
+        buffer = records[tests[i].padded];
+        stride = tests[i].padded ? WG_COUNT_RECORD_SIZE + 4 : WG_COUNT_RECORD_SIZE;
+        memset(expected, 0, sizeof(expected));
+        for (j = 0; j < tests[i].inputs_count; j++)
+        {
+            node_inputs[j].EntrypointIndex = entry_index[inputs[j].entry];
+            node_inputs[j].NumRecords = inputs[j].count;
+            node_inputs[j].Records.StartAddress = ID3D12Resource_GetGPUVirtualAddress(buffer) +
+                    (UINT64)inputs[j].first * stride;
+            node_inputs[j].Records.StrideInBytes = inputs[j].repeat ? 0 : stride;
+            workgraph_count_expected(&inputs[j], max(tests[i].array_repeat, 1u), 1, expected);
+        }
+
+        n = tests[i].array_repeat ? tests[i].array_repeat : tests[i].inputs_count;
+        workgraph_create_multi_input(&context, node_inputs, tests[i].inputs_count, n,
+                tests[i].array_repeat ? 0 : 32, &multi);
+
+        scratch = workgraph_create_backing_memory(&context, &wg_reqs);
+        output = create_default_buffer(context.context.device, 4 * 1024,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+        dispatch_desc.MultiNodeGPUInput = multi.va;
+        workgraph_record_dispatch(&context, context.context.list, &ident, scratch, wg_reqs.MinSizeInBytes,
+                output, &dispatch_desc);
+        workgraph_read_output(&context, output, values, ARRAY_SIZE(values));
+
+        for (j = 0; j < ARRAY_SIZE(values); j++)
+            ok(values[j] == expected[j], "Value %u: expected %u, got %u.\n", j, expected[j], values[j]);
+
+        if (scratch)
+            ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+        ID3D12Resource_Release(multi.buffer);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    ID3D12Resource_Release(records[0]);
+    ID3D12Resource_Release(records[1]);
+out_pso:
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+#undef WG_CAPACITY_RECORDS
+}
+
+void test_workgraph_multi_gpu_input_count_wrap(void)
+{
+    /* Record counts of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT are 32 bits per input, but their sum is not
+     * limited by the spec. empty_count64 counts its launches in 64 bits. Each case launches up to 2^32 threads.
+     * The inputs come from an input array with a stride of 32, or of 0 to repeat one input.
+     * The NVIDIA driver on Windows stops the application with a GPU error (nvlddmkm event 153, measured on an
+     * RTX 4090) for a sum of 2^32 records and for 2^24 inputs or more. These cases run only on vkd3d-proton,
+     * which must launch every record. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"EmptyEntry", 0 } };
+    static const struct
+    {
+        const char *name;
+        UINT num_node_inputs;
+        UINT64 input_stride;
+        UINT num_records[2];
+        uint64_t expected;
+        bool native_fault;
+    }
+    tests[] =
+    {
+        { "two inputs, 2^32 - 1 records", 2, 32, { 0x80000000u, 0x7fffffffu }, 0xffffffffull },
+        { "two inputs of 2^31 records", 2, 32, { 0x80000000u, 0x80000000u }, 0x100000000ull, true },
+        { "2^24 inputs of one record", 0x1000000u, 0, { 1 }, 0x1000000ull, true },
+        { "2^32 - 1 inputs of one record", UINT_MAX, 0, { 1 }, 0xffffffffull, true },
+        { "2^32 - 1 inputs of no record", UINT_MAX, 0, { 0 }, 0 },
+    };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct workgraph_multi_input multi;
+    D3D12_NODE_GPU_INPUT node_inputs[2];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *scratch;
+    ID3D12Resource *output;
+    ID3D12StateObject *pso;
+    uint32_t values[2];
+    UINT entry_index;
+    unsigned int i;
+    uint64_t count;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    hr = try_create_workgraph_pso(&context, empty_count64_dxil, NULL, &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, &entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        goto out;
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        if (!workgraph_case_enabled(tests[i].name))
+            continue;
+        vkd3d_test_set_context("%s", tests[i].name);
+        if (tests[i].native_fault && !workgraph_is_vkd3d_proton(context.device))
+        {
+            skip("The native driver faults.\n");
+            continue;
+        }
+
+        memset(node_inputs, 0, sizeof(node_inputs));
+        node_inputs[0].EntrypointIndex = entry_index;
+        node_inputs[0].NumRecords = tests[i].num_records[0];
+        node_inputs[1].EntrypointIndex = entry_index;
+        node_inputs[1].NumRecords = tests[i].num_records[1];
+        workgraph_create_multi_input(&context, node_inputs, ARRAY_SIZE(node_inputs), tests[i].num_node_inputs,
+                tests[i].input_stride, &multi);
+
+        scratch = workgraph_create_backing_memory(&context, &wg_reqs);
+        output = create_default_buffer(context.context.device, 4 * 1024,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+        dispatch_desc.MultiNodeGPUInput = multi.va;
+        workgraph_record_dispatch(&context, context.context.list, &ident, scratch, wg_reqs.MinSizeInBytes,
+                output, &dispatch_desc);
+        workgraph_read_output(&context, output, values, ARRAY_SIZE(values));
+
+        count = values[0] | ((uint64_t)values[1] << 32);
+        ok(count == tests[i].expected, "Expected %"PRIu64" launches, got %"PRIu64".\n", tests[i].expected, count);
+
+        if (scratch)
+            ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+        ID3D12Resource_Release(multi.buffer);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+out:
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+void test_workgraph_multi_gpu_input_two_queues(void)
+{
+    /* Two queues execute the same work graph at the same time, each with its own backing memory, inputs and
+     * output (WorkGraphs.md: a work graph can run on several queues in parallel when each execution has its own
+     * backing memory). The graph has only leaf entry points. Each execution has one large input and 16 small
+     * inputs to EntryA; the records of the two executions have different tail values, so that records that one
+     * execution takes from the other change the sums. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"EntryA", 0 }, { u"EntryB", 0 } };
+    static const uint32_t tails[2] = { 1, 3 };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    ID3D12CommandAllocator *allocators[2];
+    ID3D12GraphicsCommandList *lists[2];
+    struct test_context_workgraph context;
+    struct workgraph_count_input inputs[17];
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct workgraph_multi_input multi[2];
+    D3D12_NODE_GPU_INPUT node_inputs[17];
+    ID3D12Resource *scratch[2], *output[2];
+    ID3D12CommandQueue *queues[2];
+    uint32_t expected[8], values[8];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *records[2];
+    unsigned int i, j, k, iter;
+    ID3D12StateObject *pso;
+    UINT entry_index[2];
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    hr = try_create_workgraph_pso(&context, multi_input_count_dxil, NULL, &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        goto out_pso;
+
+    /* One input of 68000 records, then 16 inputs of 2000 records (512000 bytes each). */
+    inputs[0].entry = 0;
+    inputs[0].first = 0;
+    inputs[0].count = 68000;
+    inputs[0].repeat = false;
+    for (i = 1; i < ARRAY_SIZE(inputs); i++)
+    {
+        inputs[i].entry = 0;
+        inputs[i].first = 68000 + (i - 1) * 2000;
+        inputs[i].count = 2000;
+        inputs[i].repeat = false;
+    }
+
+    for (i = 0; i < 2; i++)
+    {
+        queues[i] = create_command_queue(context.context.device, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                D3D12_COMMAND_QUEUE_PRIORITY_NORMAL);
+        hr = ID3D12Device_CreateCommandAllocator(context.context.device, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                &IID_ID3D12CommandAllocator, (void **)&allocators[i]);
+        ok(hr == S_OK, "Failed to create command allocator, hr #%x.\n", (int)hr);
+        hr = ID3D12Device_CreateCommandList(context.context.device, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                allocators[i], NULL, &IID_ID3D12GraphicsCommandList, (void **)&lists[i]);
+        ok(hr == S_OK, "Failed to create command list, hr #%x.\n", (int)hr);
+
+        records[i] = workgraph_create_count_records(&context, 100000, WG_COUNT_RECORD_SIZE, tails[i]);
+        for (j = 0; j < ARRAY_SIZE(inputs); j++)
+        {
+            node_inputs[j].EntrypointIndex = entry_index[inputs[j].entry];
+            node_inputs[j].NumRecords = inputs[j].count;
+            node_inputs[j].Records.StartAddress = ID3D12Resource_GetGPUVirtualAddress(records[i]) +
+                    (UINT64)inputs[j].first * WG_COUNT_RECORD_SIZE;
+            node_inputs[j].Records.StrideInBytes = WG_COUNT_RECORD_SIZE;
+        }
+        workgraph_create_multi_input(&context, node_inputs, ARRAY_SIZE(inputs), ARRAY_SIZE(inputs), 32, &multi[i]);
+        scratch[i] = workgraph_create_backing_memory(&context, &wg_reqs);
+    }
+
+    for (iter = 0; iter < 4; iter++)
+    {
+        vkd3d_test_set_context("Iteration %u", iter);
+
+        for (i = 0; i < 2; i++)
+        {
+            output[i] = create_default_buffer(context.context.device, 4 * 1024,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+            dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+            dispatch_desc.MultiNodeGPUInput = multi[i].va;
+            workgraph_record_dispatch(&context, lists[i], &ident, scratch[i], wg_reqs.MinSizeInBytes,
+                    output[i], &dispatch_desc);
+            hr = ID3D12GraphicsCommandList_Close(lists[i]);
+            ok(hr == S_OK, "Failed to close command list, hr #%x.\n", (int)hr);
+        }
+
+        /* Both executions are submitted before either is waited for. */
+        for (i = 0; i < 2; i++)
+            exec_command_list(queues[i], lists[i]);
+        for (i = 0; i < 2; i++)
+            wait_queue_idle(context.context.device, queues[i]);
+
+        for (i = 0; i < 2; i++)
+        {
+            memset(expected, 0, sizeof(expected));
+            for (j = 0; j < ARRAY_SIZE(inputs); j++)
+                workgraph_count_expected(&inputs[j], 1, tails[i], expected);
+
+            workgraph_read_output(&context, output[i], values, ARRAY_SIZE(values));
+            for (k = 0; k < ARRAY_SIZE(values); k++)
+                ok(values[k] == expected[k], "Queue %u, value %u: expected %u, got %u.\n", i, k, expected[k], values[k]);
+
+            ID3D12Resource_Release(output[i]);
+            reset_command_list(lists[i], allocators[i]);
+        }
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    for (i = 0; i < 2; i++)
+    {
+        if (scratch[i])
+            ID3D12Resource_Release(scratch[i]);
+        ID3D12Resource_Release(multi[i].buffer);
+        ID3D12Resource_Release(records[i]);
+        ID3D12GraphicsCommandList_Release(lists[i]);
+        ID3D12CommandAllocator_Release(allocators[i]);
+        ID3D12CommandQueue_Release(queues[i]);
+    }
+out_pso:
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+void test_workgraph_dispatch_failure(void)
+{
+    /* The lab flavour of the amdgpu-wddm engine reads AMDGPU_WDDM_WG_FAIL at each scratch memory allocation of a
+     * DispatchGraph call. "scratch:<n>" fails allocation n of the call (counted from 0), as if the memory was
+     * exhausted. The command list must then fail Close with E_OUTOFMEMORY (it is not submitted), without a crash.
+     * When n is past the last allocation of the call, Close succeeds and the graph gives the correct result.
+     * This runs for each dispatch mode. Set VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1 to run this test. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"EntryA", 0 }, { u"EntryB", 0 } };
+    static const char *mode_names[] = { "CPU input", "multi CPU input", "GPU input", "multi GPU input" };
+    struct workgraph_count_input inputs[3] = { { 0, 0, 3000 }, { 1, 3000, 7 }, { 0, 3100, 2000 } };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct workgraph_multi_input multi;
+    D3D12_NODE_CPU_INPUT cpu_inputs[3];
+    D3D12_NODE_GPU_INPUT node_inputs[3];
+    uint32_t expected[8], values[8];
+    unsigned int failures, n, i, j;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *gpu_input;
+    ID3D12Resource *scratch;
+    ID3D12Resource *output;
+    ID3D12Resource *records;
+    unsigned int mode, used;
+    UINT entry_index[2];
+    ID3D12StateObject *pso;
+    uint8_t *cpu_records;
+    char fault[32];
+    const char *env;
+    HRESULT hr;
+
+    env = getenv("VKD3D_TEST_WORKGRAPH_FAULT_INJECTION");
+    if (!env || env[0] != '1')
+    {
+        skip("Set VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1 to run the fault injection test.\n");
+        return;
+    }
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    if (!workgraph_is_vkd3d_proton(context.device))
+    {
+        skip("Fault injection needs the amdgpu-wddm engine.\n");
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+
+    hr = try_create_workgraph_pso(&context, multi_input_count_dxil, NULL, &pso);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        goto out_pso;
+
+    records = workgraph_create_count_records(&context, 6000, WG_COUNT_RECORD_SIZE, 1);
+    cpu_records = calloc(6000, WG_COUNT_RECORD_SIZE);
+    for (i = 0; i < 6000; i++)
+    {
+        uint32_t value = (i % 7) + 1, tail = 1;
+
+        memcpy(cpu_records + (size_t)i * WG_COUNT_RECORD_SIZE, &value, sizeof(value));
+        memcpy(cpu_records + (size_t)i * WG_COUNT_RECORD_SIZE + WG_COUNT_RECORD_SIZE - 4, &tail, sizeof(tail));
+    }
+    for (i = 0; i < ARRAY_SIZE(inputs); i++)
+    {
+        node_inputs[i].EntrypointIndex = entry_index[inputs[i].entry];
+        node_inputs[i].NumRecords = inputs[i].count;
+        node_inputs[i].Records.StartAddress = ID3D12Resource_GetGPUVirtualAddress(records) +
+                (UINT64)inputs[i].first * WG_COUNT_RECORD_SIZE;
+        node_inputs[i].Records.StrideInBytes = WG_COUNT_RECORD_SIZE;
+        cpu_inputs[i].EntrypointIndex = entry_index[inputs[i].entry];
+        cpu_inputs[i].NumRecords = inputs[i].count;
+        cpu_inputs[i].pRecords = cpu_records + (size_t)inputs[i].first * WG_COUNT_RECORD_SIZE;
+        cpu_inputs[i].RecordStrideInBytes = WG_COUNT_RECORD_SIZE;
+    }
+    workgraph_create_multi_input(&context, node_inputs, ARRAY_SIZE(node_inputs), ARRAY_SIZE(node_inputs), 32, &multi);
+    gpu_input = create_upload_buffer(context.context.device, sizeof(node_inputs[0]), &node_inputs[0]);
+    scratch = workgraph_create_backing_memory(&context, &wg_reqs);
+
+    for (mode = 0; mode < ARRAY_SIZE(mode_names); mode++)
+    {
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        switch (mode)
+        {
+            case 0:
+                dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+                dispatch_desc.NodeCPUInput = cpu_inputs[0];
+                used = 1;
+                break;
+            case 1:
+                dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_CPU_INPUT;
+                dispatch_desc.MultiNodeCPUInput.NumNodeInputs = ARRAY_SIZE(cpu_inputs);
+                dispatch_desc.MultiNodeCPUInput.pNodeInputs = cpu_inputs;
+                dispatch_desc.MultiNodeCPUInput.NodeInputStrideInBytes = sizeof(cpu_inputs[0]);
+                used = ARRAY_SIZE(cpu_inputs);
+                break;
+            case 2:
+                dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_GPU_INPUT;
+                dispatch_desc.NodeGPUInput = ID3D12Resource_GetGPUVirtualAddress(gpu_input);
+                used = 1;
+                break;
+            default:
+                dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+                dispatch_desc.MultiNodeGPUInput = multi.va;
+                used = ARRAY_SIZE(node_inputs);
+                break;
+        }
+
+        memset(expected, 0, sizeof(expected));
+        for (i = 0; i < used; i++)
+            workgraph_count_expected(&inputs[i], 1, 1, expected);
+
+        failures = 0;
+        for (n = 0; n < 256; n++)
+        {
+            vkd3d_test_set_context("%s, scratch:%u", mode_names[mode], n);
+            output = create_default_buffer(context.context.device, 4 * 1024,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+            snprintf(fault, sizeof(fault), "scratch:%u", n);
+            workgraph_set_fault(fault);
+            workgraph_record_dispatch(&context, context.context.list, &ident, scratch, wg_reqs.MinSizeInBytes,
+                    output, &dispatch_desc);
+            workgraph_set_fault(NULL);
+
+            transition_resource_state(context.context.list, output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            hr = ID3D12GraphicsCommandList_Close(context.context.list);
+            if (hr == E_OUTOFMEMORY)
+            {
+                failures++;
+                ID3D12Resource_Release(output);
+                reset_command_list(context.context.list, context.context.allocator);
+                continue;
+            }
+
+            ok(hr == S_OK, "Expected S_OK or E_OUTOFMEMORY, got hr #%x.\n", (int)hr);
+            /* The list is closed, so read back with a second recording. */
+            exec_command_list(context.context.queue, context.context.list);
+            wait_queue_idle(context.context.device, context.context.queue);
+            reset_command_list(context.context.list, context.context.allocator);
+            {
+                struct resource_readback rb;
+
+                get_buffer_readback_with_command_list(output, DXGI_FORMAT_R32_UINT, &rb,
+                        context.context.queue, context.context.list);
+                reset_command_list(context.context.list, context.context.allocator);
+                for (j = 0; j < ARRAY_SIZE(values); j++)
+                    values[j] = get_readback_uint(&rb, j, 0, 0);
+                release_resource_readback(&rb);
+            }
+            for (j = 0; j < ARRAY_SIZE(values); j++)
+                ok(values[j] == expected[j], "Value %u: expected %u, got %u.\n", j, expected[j], values[j]);
+            ID3D12Resource_Release(output);
+            break;
+        }
+        vkd3d_test_set_context("%s", mode_names[mode]);
+        ok(failures > 0, "No allocation failed.\n");
+        ok(n < 256, "The allocations did not end.\n");
+
+        hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+        ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+    }
+    vkd3d_test_set_context(NULL);
+
+    if (scratch)
+        ID3D12Resource_Release(scratch);
+    ID3D12Resource_Release(gpu_input);
+    ID3D12Resource_Release(multi.buffer);
+    ID3D12Resource_Release(records);
+    free(cpu_records);
+out_pso:
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
 }
 
 void test_workgraph_broadcast_input(void)
