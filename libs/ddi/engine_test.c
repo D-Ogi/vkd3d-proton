@@ -2661,7 +2661,7 @@ static void cross_queue_copy(ID3D12Device *device, ID3D12CommandQueue *qa, ID3D1
     UINT64 wait_value = 0, signal_value = 0;
     ID3D12Fence *f = NULL, *g = NULL, *h = NULL;
     unsigned int mark_a, mark_b;
-    VkSemaphore timeline = NULL;
+    VkSemaphore timeline = VK_NULL_HANDLE;
     BOOL waits, held, ok;
     unsigned int i, bad = 0;
     D3D12_RANGE range;
