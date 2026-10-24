@@ -5590,6 +5590,9 @@ struct vkd3d_workgraph_setup_gpu_input_args
 #define VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS 4u
 #define VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE (512u * 1024u)
 #define VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE (32u * 1024u * 1024u)
+/* The staging range with MaxSizeInBytes of backing memory. The backing memory above MinSizeInBytes makes the staging
+ * range larger, up to this size (WorkGraphs.md, Discovering backing memory size requirements). */
+#define VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_MAX_SIZE (256u * 1024u * 1024u)
 /* Workgroups of the classify and copy passes. Each loops over the inputs, so any number of inputs fits. */
 #define VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS 1024u
 

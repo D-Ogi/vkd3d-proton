@@ -32,6 +32,12 @@
 #define THREAD_COALESCE_COUNT 32u
 /* Size of each payload ring of a work graph state object. */
 #define VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE (128ull * 1024 * 1024)
+/* The packed offsets of the payloads, after the required scratch memory: their size with MinSizeInBytes and with
+ * MaxSizeInBytes of backing memory. The sizes are arbitrary. */
+#define VKD3D_WORKGRAPH_PACKED_OFFSETS_MIN_SIZE (64ull * 1024 * 1024)
+#define VKD3D_WORKGRAPH_PACKED_OFFSETS_MAX_SIZE (256ull * 1024 * 1024)
+/* 64k is arbitrary, but reasonable. */
+#define VKD3D_WORKGRAPH_BACKING_GRANULARITY D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT
 
 /* amdgpu-wddm fork, lab flavour only: AMDGPU_WDDM_WG_FAIL=<point> makes the creation of a work graph state object
  * fail at that point, as if an allocation failed there, so that a test can run the cleanup of a partly built
@@ -69,13 +75,15 @@ static const GUID amdgpu_wddm_wg_status_guid =
         { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x05 } };
 #endif
 
-/* amdgpu-wddm fork, lab flavour only: AMDGPU_WDDM_WG_MULTI_INPUT=staging=<bytes>,large=<bytes>,groups=<n> sets the
- * staging size, the large input size and the number of classify and copy workgroups of
- * D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT for the work graphs created after it is set. Each part is optional.
- * Small values let a test cross every limit of these passes with a few thousand records. */
+/* amdgpu-wddm fork, lab flavour only:
+ * AMDGPU_WDDM_WG_MULTI_INPUT=staging=<bytes>,staging_max=<bytes>,large=<bytes>,groups=<n> sets the staging size with
+ * MinSizeInBytes and with MaxSizeInBytes of backing memory, the large input size and the number of classify and copy
+ * workgroups of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT for the work graphs created after it is set. Each part is
+ * optional. Small values let a test cross every limit of these passes with a few thousand records. */
 struct d3d12_wg_multi_input_config
 {
     VkDeviceSize staging_size;
+    VkDeviceSize staging_max_size;
     uint32_t large_size;
     uint32_t groups;
 };
@@ -88,6 +96,7 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
 #endif
 
     config->staging_size = VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE;
+    config->staging_max_size = VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_MAX_SIZE;
     config->large_size = VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE;
     config->groups = VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS;
 
@@ -104,6 +113,9 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
         if (!strncmp(p, "staging=", 8) && (n = strtoull(p + 8, NULL, 0)) >= 16
                 && n <= VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE)
             config->staging_size = n & ~15ull;
+        else if (!strncmp(p, "staging_max=", 12) && (n = strtoull(p + 12, NULL, 0)) >= 16
+                && n <= VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_MAX_SIZE)
+            config->staging_max_size = n & ~15ull;
         else if (!strncmp(p, "large=", 6) && (n = strtoull(p + 6, NULL, 0)) >= 4
                 && n <= VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE)
             config->large_size = n;
@@ -114,8 +126,12 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
             WARN("Ignoring %s in AMDGPU_WDDM_WG_MULTI_INPUT.\n", p);
     }
 
-    WARN("Multi GPU input: staging %"PRIu64" bytes, large %u bytes, %u groups.\n",
-            config->staging_size, config->large_size, config->groups);
+    /* The staging range does not get smaller with more backing memory. */
+    if (config->staging_max_size < config->staging_size)
+        config->staging_max_size = config->staging_size;
+
+    WARN("Multi GPU input: staging %"PRIu64" to %"PRIu64" bytes, large %u bytes, %u groups.\n",
+            config->staging_size, config->staging_max_size, config->large_size, config->groups);
 #endif
 }
 
@@ -246,10 +262,14 @@ struct d3d12_wg_state_object_program
     VkDeviceSize share_mapping_scratch_size;
     VkDeviceSize payload_expander_scratch_offset;
     VkDeviceSize payload_expander_scratch_size;
-    /* amdgpu-wddm fork: the staging range of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT. It is in the backing memory,
-     * so each execution context has its own. */
-    VkDeviceSize multi_input_staging_scratch_offset;
-    VkDeviceSize multi_input_staging_scratch_size;
+    /* amdgpu-wddm fork: the staging range of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT, with MinSizeInBytes and with
+     * MaxSizeInBytes of backing memory. It is at the end of the backing memory, so each execution context has its
+     * own (d3d12_command_list_workgraph_multi_input_staging). */
+    VkDeviceSize multi_input_staging_min_size;
+    VkDeviceSize multi_input_staging_max_size;
+    /* amdgpu-wddm fork: MinSizeInBytes and MaxSizeInBytes of D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS. */
+    VkDeviceSize min_backing_size;
+    VkDeviceSize max_backing_size;
     /* amdgpu-wddm fork: the two payload rings and the unrolled offsets of the levels. They are in the backing
      * memory, so that each execution context has its own (WorkGraphs.md, Backing memory). Before, the state
      * object had one set, which executions of the graph on parallel queues shared. */
@@ -2141,11 +2161,6 @@ static void STDMETHODCALLTYPE d3d12_work_graph_properties_GetWorkGraphMemoryRequ
         UINT WorkGraphIndex,
         D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS *pWorkGraphMemoryRequirements)
 {
-    /* Arbitrary */
-    const VkDeviceSize packed_offset_payload_max_size = 256 * 1024 * 1024;
-    const VkDeviceSize packed_offset_payload_min_size = 64 * 1024 * 1024;
-    const VkDeviceSize size_granularity = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; /* arbitrary, but 64k is reasonable. */
-
     struct d3d12_wg_state_object *object = impl_from_ID3D12WorkGraphProperties(iface);
     TRACE("iface %p, WorkGraphIndex %u, pWorkGraphMemoryRequirements %p\n", iface, WorkGraphIndex, pWorkGraphMemoryRequirements);
     if (WorkGraphIndex >= object->programs_count)
@@ -2155,11 +2170,9 @@ static void STDMETHODCALLTYPE d3d12_work_graph_properties_GetWorkGraphMemoryRequ
         return;
     }
 
-    pWorkGraphMemoryRequirements->MinSizeInBytes =
-            align64(object->programs[WorkGraphIndex].required_scratch_size + packed_offset_payload_min_size, size_granularity);
-    pWorkGraphMemoryRequirements->MaxSizeInBytes =
-            align64(object->programs[WorkGraphIndex].required_scratch_size + packed_offset_payload_max_size, size_granularity);
-    pWorkGraphMemoryRequirements->SizeGranularityInBytes = size_granularity;
+    pWorkGraphMemoryRequirements->MinSizeInBytes = object->programs[WorkGraphIndex].min_backing_size;
+    pWorkGraphMemoryRequirements->MaxSizeInBytes = object->programs[WorkGraphIndex].max_backing_size;
+    pWorkGraphMemoryRequirements->SizeGranularityInBytes = VKD3D_WORKGRAPH_BACKING_GRANULARITY;
     TRACE("Required scratch size: %"PRIu64" bytes.\n", pWorkGraphMemoryRequirements->MinSizeInBytes);
 }
 
@@ -2616,7 +2629,6 @@ static HRESULT d3d12_wg_state_object_compile_program(
     alloc_scratch(share_mapping_scratch, program->num_pipelines * sizeof(uint32_t));
     alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
     d3d12_wg_get_multi_input_config(&multi_input_config);
-    alloc_scratch(multi_input_staging_scratch, multi_input_config.staging_size);
     alloc_scratch(payload0_scratch, VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE);
     alloc_scratch(payload1_scratch, VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE);
     alloc_scratch(unrolled_offsets_scratch, VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE);
@@ -2626,6 +2638,15 @@ static HRESULT d3d12_wg_state_object_compile_program(
     program->multi_input_groups = multi_input_config.groups;
 
     program->required_scratch_size = scratch_offset;
+
+    /* amdgpu-wddm fork: after the required scratch memory come the packed offsets, then the staging range of the
+     * multi GPU input at the end. */
+    program->multi_input_staging_min_size = multi_input_config.staging_size;
+    program->multi_input_staging_max_size = multi_input_config.staging_max_size;
+    program->min_backing_size = align64(program->required_scratch_size + VKD3D_WORKGRAPH_PACKED_OFFSETS_MIN_SIZE +
+            program->multi_input_staging_min_size, VKD3D_WORKGRAPH_BACKING_GRANULARITY);
+    program->max_backing_size = align64(program->required_scratch_size + VKD3D_WORKGRAPH_PACKED_OFFSETS_MAX_SIZE +
+            program->multi_input_staging_max_size, VKD3D_WORKGRAPH_BACKING_GRANULARITY);
     program->indirect_commands_scratch_node_offset =
             program->indirect_commands_scratch_base_offset + WG_INDIRECT_COMMAND_OFFSET;
 
@@ -3800,6 +3821,48 @@ static bool d3d12_command_list_workgraph_execute_entry_gpu(
     return true;
 }
 
+/* amdgpu-wddm fork: the staging range of the multi GPU input in the backing memory of the list. It is at the end of
+ * the backing memory that the driver uses. With MinSizeInBytes it has the minimum size. Each more
+ * SizeGranularityInBytes adds to it, up to the maximum size with MaxSizeInBytes. The packed offsets before it have
+ * at least their minimum size. Memory past the last whole granule or past MaxSizeInBytes is not used
+ * (WorkGraphs.md, D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS). */
+static void d3d12_command_list_workgraph_multi_input_staging(const struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program, VkDeviceAddress *va, VkDeviceSize *size)
+{
+    VkDeviceSize backing_size = list->wg_state.BackingMemory.SizeInBytes;
+    VkDeviceSize used, staging;
+
+    *va = 0;
+    *size = 0;
+
+    if (backing_size >= program->min_backing_size)
+    {
+        used = program->min_backing_size + (backing_size - program->min_backing_size) /
+                VKD3D_WORKGRAPH_BACKING_GRANULARITY * VKD3D_WORKGRAPH_BACKING_GRANULARITY;
+        used = min(used, program->max_backing_size);
+        staging = program->multi_input_staging_min_size + (used - program->min_backing_size);
+        staging = min(staging, program->multi_input_staging_max_size);
+    }
+    else
+    {
+        /* The application gives less backing memory than GetWorkGraphMemoryRequirements() asks for. The packed
+         * offsets keep their minimum size, the staging range gets what is left. The records that do not fit are
+         * reported as lost. */
+        WARN("Backing memory is less than the minimum (%"PRIu64" < %"PRIu64").\n",
+                backing_size, program->min_backing_size);
+        used = backing_size;
+        if (used <= program->required_scratch_size + VKD3D_WORKGRAPH_PACKED_OFFSETS_MIN_SIZE)
+            return;
+        staging = used - program->required_scratch_size - VKD3D_WORKGRAPH_PACKED_OFFSETS_MIN_SIZE;
+        staging = min(staging, program->multi_input_staging_min_size);
+    }
+
+    /* The merge slots start at 16-byte offsets of the range, as with a range of the required scratch memory. */
+    staging &= ~(VkDeviceSize)15;
+    *va = list->wg_state.BackingMemory.StartAddress + used - staging;
+    *size = staging;
+}
+
 static void d3d12_command_list_workgraph_multi_gpu_input_pass(struct d3d12_command_list *list,
         const struct d3d12_wg_state_object_program *program, struct vkd3d_workgraph_multi_gpu_input_prepare_args *args,
         enum vkd3d_workgraph_multi_gpu_input_mode mode, uint32_t num_groups, const char *tag)
@@ -3891,18 +3954,8 @@ static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
     prepare_args.num_entry_points = num_entries;
     prepare_args.large_size = program->multi_input_large_size;
     prepare_args.status_va = state->lost_records.va;
-    if (list->wg_state.BackingMemory.SizeInBytes >= program->required_scratch_size)
-    {
-        prepare_args.staging_va = list->wg_state.BackingMemory.StartAddress + program->multi_input_staging_scratch_offset;
-        prepare_args.staging_capacity = program->multi_input_staging_scratch_size;
-    }
-    else
-    {
-        /* The application gave less backing memory than GetWorkGraphMemoryRequirements() asks for. Only the
-         * direct slots then work. */
-        ERR("Backing memory is not large enough for the staging range (%"PRIu64" < %"PRIu64").\n",
-                list->wg_state.BackingMemory.SizeInBytes, program->required_scratch_size);
-    }
+    d3d12_command_list_workgraph_multi_input_staging(list, program,
+            &prepare_args.staging_va, &prepare_args.staging_capacity);
 
     d3d12_command_list_workgraph_multi_gpu_input_pass(list, program, &prepare_args,
             VKD3D_WORKGRAPH_MULTI_INPUT_MODE_INIT, 1, "multi-gpu-input-init");
