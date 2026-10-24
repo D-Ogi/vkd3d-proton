@@ -24431,6 +24431,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_DispatchGraph(
 {
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     TRACE("iface %p, desc %p\n", iface, desc);
+    /* amdgpu-wddm fork: DispatchGraph is an action command, as Dispatch is. This begins a SetPredication block
+     * that is deferred while a render pass resume is still possible, so that the graph is predicated. */
+    d3d12_command_list_check_render_pass_validation(list, NULL, true);
     d3d12_command_list_flush_dgc_batch(list);
     d3d12_command_list_workgraph_dispatch(list, desc);
 }
