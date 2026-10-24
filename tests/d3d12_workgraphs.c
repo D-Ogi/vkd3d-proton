@@ -121,6 +121,7 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/output_bounds.h"
 #include "shaders/workgraph/headers/output_counts.h"
 #include "shaders/workgraph/headers/output_index_bounds.h"
+#include "shaders/workgraph/headers/output_zero_counts.h"
 #include "shaders/workgraph/headers/level_sinks.h"
 #include "shaders/workgraph/headers/empty_count64.h"
 
@@ -3968,6 +3969,74 @@ void test_workgraph_output_index_bounds(void)
         {
             ok(result.lost.records == tests[i].lost, "Expected %"PRIu64" lost records, got %"PRIu64".\n",
                     tests[i].lost, result.lost.records);
+            ok(!result.lost.lower_bound, "The lost count is a lower bound.\n");
+        }
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+    destroy_workgraph_test_context(&context);
+}
+
+void test_workgraph_output_zero_counts(void)
+{
+    /* An allocation of 0 records is valid, and a group or a thread can make any number of them. Such an allocation
+     * must reserve no payload memory and no packed offset entry, otherwise the work graph would need unbounded memory
+     * for valid work. Each case makes 4096 allocations of 0 records and then one allocation of 64 records of 4 bytes,
+     * with "ring=256" (the 256 bytes of the 64 records) and a packed offset limit of one entry for each allocation of
+     * the 64 records (2 for the thread case, which takes one allocation per wave and has 2 waves with wave32). All 64
+     * records must arrive. The controls show that the limits apply: with one allocation of 1 record first, the
+     * allocation of 63 records does not fit in 256 bytes (16 + 256 bytes) or in a packed offset limit of 1. Each case
+     * launches at most 64 records. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"GroupProducer", 0 }, { u"ThreadProducer", 0 } };
+    static const struct
+    {
+        unsigned int entry;
+        const char *limits;
+        uint32_t calls, zero, count;
+        uint32_t fit; /* Records that the engine launches. */
+    }
+    tests[] =
+    {
+        { 0, "ring=256,packed=1,canary=1", 0, 0, 64, 64 },
+        { 0, "ring=256,packed=1,canary=1", 4096, 0, 64, 64 },
+        { 0, "ring=256,canary=1", 1, 1, 63, 1 },
+        { 0, "ring=1024,packed=1,canary=1", 1, 1, 63, 1 },
+        { 1, "ring=256,packed=2,canary=1", 0, 0, 1, 64 },
+        { 1, "ring=256,packed=2,canary=1", 4096, 0, 1, 64 },
+    };
+    struct test_context_workgraph context;
+    struct workgraph_case_result result;
+    uint32_t params[3], requested;
+    unsigned int i;
+    bool is_engine;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    is_engine = workgraph_is_vkd3d_proton(context.device);
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("Test %u, %s, %u calls of %u, count %u", i, tests[i].limits, tests[i].calls,
+                tests[i].zero, tests[i].count);
+        params[0] = tests[i].calls;
+        params[1] = tests[i].zero;
+        params[2] = tests[i].count;
+        if (!workgraph_run_bounded_case(&context, output_zero_counts_dxil, entry_ids, ARRAY_SIZE(entry_ids),
+                tests[i].entry, tests[i].limits, params, sizeof(params), true, 0, &result))
+            continue;
+
+        requested = tests[i].entry ? 64 * tests[i].count : tests[i].calls * tests[i].zero + tests[i].count;
+        ok(result.values[0] == (is_engine ? tests[i].fit : requested), "Expected %u records, got %u.\n",
+                is_engine ? tests[i].fit : requested, result.values[0]);
+        ok(result.values[1] == 0, "%u records have a wrong id.\n", result.values[1]);
+        ok(result.values[2] == 0, "%u records arrived more than once.\n", result.values[2]);
+        if (is_engine)
+        {
+            ok(result.lost.records == requested - tests[i].fit, "Expected %u lost records, got %"PRIu64".\n",
+                    requested - tests[i].fit, result.lost.records);
             ok(!result.lost.lower_bound, "The lost count is a lower bound.\n");
         }
     }

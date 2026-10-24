@@ -492,6 +492,7 @@ decl_test(test_workgraph_level_output_limits);
 decl_test(test_workgraph_output_bounds);
 decl_test(test_workgraph_output_counts);
 decl_test(test_workgraph_output_index_bounds);
+decl_test(test_workgraph_output_zero_counts);
 decl_test(test_workgraph_level_sinks);
 decl_test(test_workgraph_canary_admission);
 decl_test(test_workgraph_predication);
