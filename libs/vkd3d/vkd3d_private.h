@@ -5808,8 +5808,8 @@ struct vkd3d_workgraph_pool_level_args
     uint32_t packed_capacity;
     /* The admission capacity of pool level + 1: payload bytes, packed entries, unrolled offsets. */
     uint32_t caps[3];
-    /* Lab flavour: not 0 if the retention pass writes an invalid head (AMDGPU_WDDM_WG_FAIL=pool-head:<level>: 1,
-     * pool-records:<level>: 2). */
+    /* Lab flavour: not 0 if the retention pass writes an invalid pool state (AMDGPU_WDDM_WG_FAIL=pool-head:<level>:
+     * 1, pool-records:<level>: 2, pool-slot:<level>: 3). */
     uint32_t fault_head;
 };
 

@@ -4481,8 +4481,78 @@ static const char *workgraph_drain_info_error(HRESULT hr, UINT size, const struc
     return NULL;
 }
 
-/* The largest stride of struct vkd3d_workgraph_pool_state that a test accepts: the head and 2^16 slots. */
+/* The largest stride of struct vkd3d_workgraph_pool_state that a test accepts: the head and 2^16 slots. This is a bound
+ * of this harness, so that a bad reply cannot make it read a large range. It is not a node limit of the API. */
 #define WG_POOL_STATE_MAX_STRIDE (16u + 8u * 65536u)
+
+/* The lab flavour of the amdgpu-wddm engine gives the distributor slots of the nodes of the first program through
+ * GetPrivateData with this GUID (amdgpu_wddm_wg_slot_guid in libs/vkd3d/workgraphs.c): struct workgraph_slots, then
+ * for each node index of GetNodeIndex its slot and the slot of the node whose input it shares (~0 if none). The
+ * distributor runs one subgroup of subgroup_size invocations and goes through the slots in chunks of that size. */
+static const GUID workgraph_slot_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x0c } };
+
+struct workgraph_slots
+{
+    uint32_t subgroup_size;
+    uint32_t wg_divider; /* 1 if the distributor splits the workgroups of each node. */
+    uint32_t slots;
+    uint32_t nodes;
+};
+
+/* The largest number of nodes that a test accepts in the slot reply. This is a bound of this harness, not a node
+ * limit of the API. */
+#define WG_SLOT_MAX_NODES 65536u
+
+/* Gets the slot reply of a state object and checks it. *words gets the slot and the shared slot of node index i at
+ * 2 * i and 2 * i + 1; the caller frees it. Returns NULL if the reply is valid, else the reason, and then *words is
+ * NULL. */
+static const char *workgraph_get_slots(ID3D12StateObject *pso, struct workgraph_slots *slots, uint32_t **words)
+{
+    const char *error = NULL;
+    UINT size = 0, size2;
+    unsigned int i;
+    uint32_t *data;
+    HRESULT hr;
+
+    *words = NULL;
+    memset(slots, 0, sizeof(*slots));
+    hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_slot_guid, &size, NULL);
+    if (hr != S_OK)
+        return "no slot reply";
+    if (size < sizeof(*slots) || (size - sizeof(*slots)) % 8)
+        return "wrong size of the slot reply";
+    if ((size - sizeof(*slots)) / 8 > WG_SLOT_MAX_NODES)
+        return "more nodes in the slot reply than the harness bound";
+    if (!(data = malloc(size)))
+        return "out of memory";
+    size2 = size;
+    hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_slot_guid, &size2, data);
+    memcpy(slots, data, sizeof(*slots));
+    if (hr != S_OK || size2 != size)
+        error = "the slot reply changed";
+    else if (slots->nodes != (size - sizeof(*slots)) / 8)
+        error = "wrong node count in the slot reply";
+    else if (slots->subgroup_size < 4 || slots->subgroup_size > 128 ||
+            (slots->subgroup_size & (slots->subgroup_size - 1)))
+        error = "wrong subgroup size";
+    else if (slots->wg_divider > 1)
+        error = "wrong divider value";
+    for (i = 0; !error && i < slots->nodes; i++)
+    {
+        if (data[4 + 2 * i] >= slots->slots ||
+                (data[5 + 2 * i] != UINT32_MAX && data[5 + 2 * i] >= slots->slots))
+            error = "a slot outside the slots of the distributor";
+    }
+    if (error)
+    {
+        free(data);
+        return error;
+    }
+    *words = data;
+    memmove(data, data + 4, size - sizeof(*slots));
+    return NULL;
+}
 
 /* Checks the pool state range of a round frame reply with extra rounds against the record pools reply, before a test
  * reads the pool states. The engine puts the pool states after the control block, in the fixed bookkeeping of the pool
@@ -4524,6 +4594,9 @@ static void workgraph_check_pool_state_admission(void)
     struct workgraph_pools *pools;
 
     pools = calloc(1, sizeof(*pools));
+    ok(!!pools, "Failed to allocate the record pools.\n");
+    if (!pools)
+        return;
     pools->valid = 1;
     pools->execution = 1;
     pools->pools = 3;
@@ -6674,7 +6747,7 @@ struct workgraph_retain_case
  * call, before the reply before the call, and its range must be the same and valid before the pool states are read.
  * kept1 gets the kept records of the first slots of pool 1. Returns false, after a failure, if nothing was read. */
 static bool workgraph_check_pool_states(struct test_context_workgraph *context, ID3D12Resource *backing,
-        const struct workgraph_drain_info *info, const struct workgraph_drain_info *before,
+        uint64_t backing_size, const struct workgraph_drain_info *info, const struct workgraph_drain_info *before,
         const struct workgraph_pools *pools, uint32_t kept1[WG_RETAIN_SLOTS])
 {
     unsigned int pool, slot, slots;
@@ -6687,12 +6760,15 @@ static bool workgraph_check_pool_states(struct test_context_workgraph *context, 
     if (!error && (info->pool_state_offset != before->pool_state_offset ||
             info->pool_state_stride != before->pool_state_stride || info->pool_states != before->pool_states))
         error = "the range is not the range before the call";
+    /* At most 32 pool states of at most WG_POOL_STATE_MAX_STRIDE bytes, so the product does not wrap. The range must
+     * also be inside the backing memory of the call; a subtraction, because offset + bytes can wrap. */
+    bytes = (uint64_t)info->pool_states * info->pool_state_stride;
+    if (!error && (info->pool_state_offset > backing_size || bytes > backing_size - info->pool_state_offset))
+        error = "not inside the backing memory of the call";
     ok(!error, "Pool states: %s (%u of %u bytes at %#"PRIx64").\n", error, info->pool_states,
             info->pool_state_stride, info->pool_state_offset);
     if (error)
         return false;
-    /* At most 32 pool states of at most WG_POOL_STATE_MAX_STRIDE bytes. */
-    bytes = (uint64_t)info->pool_states * info->pool_state_stride;
     words = malloc((size_t)bytes);
     ok(!!words, "Failed to allocate %"PRIu64" bytes.\n", bytes);
     if (!words)
@@ -6822,10 +6898,85 @@ workgraph_retain_graphs[] =
     { &pool_straddle_dxil, u"A_Entry", false, 1 },
 };
 
-/* pool_straddle: the slots of the owners, and the number of slots. */
-#define WG_STRADDLE_A_OWNER 1
-#define WG_STRADDLE_Y_OWNER 74
-#define WG_STRADDLE_SLOTS 76
+/* pool_straddle: the slots of the distributor that the slot reply gives. Pair 0 is A_Owner and Z_Reader, pair 1 is
+ * Y_Owner and B_Reader. */
+struct workgraph_straddle
+{
+    uint32_t subgroup_size;
+    uint32_t slots;
+    uint32_t owner[2];
+    uint32_t reader[2];
+};
+
+/* Binds pool_straddle to the slots of the distributor, before any GPU work. The distributor goes through the slots in
+ * chunks of its subgroup size S, so the case is a test of a shared reader in another chunk than its owner only if
+ * owner / S and reader / S are different for both pairs, with the owner first in pair 0 and the reader first in pair 1.
+ * Returns false if the case must stop: after a failure if the reply is bad, or after a skip if the slots do not cross
+ * a chunk at S. A skip is not a pass of the case. */
+static bool workgraph_bind_straddle(ID3D12StateObject *pso, struct workgraph_straddle *straddle)
+{
+    static const WCHAR *const names[4] = { u"A_Owner", u"Z_Reader", u"Y_Owner", u"B_Reader" };
+    ID3D12WorkGraphProperties *props;
+    struct workgraph_slots slots;
+    uint32_t *words, slot[4], share[4];
+    unsigned int i, index;
+    const char *error;
+    D3D12_NODE_ID id;
+    HRESULT hr;
+
+    memset(straddle, 0, sizeof(*straddle));
+    error = workgraph_get_slots(pso, &slots, &words);
+    ok(!error, "Slot reply: %s.\n", error);
+    if (error)
+        return false;
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        free(words);
+        return false;
+    }
+    for (i = 0; i < 4 && !error; i++)
+    {
+        id.Name = names[i];
+        id.ArrayIndex = 0;
+        index = ID3D12WorkGraphProperties_GetNodeIndex(props, 0, id);
+        if (index >= slots.nodes)
+        {
+            error = "a node of the graph has no node index";
+            break;
+        }
+        slot[i] = words[2 * index];
+        share[i] = words[2 * index + 1];
+    }
+    ID3D12WorkGraphProperties_Release(props);
+    free(words);
+    if (!error && (share[0] != UINT32_MAX || share[2] != UINT32_MAX || share[1] != slot[0] || share[3] != slot[2]))
+        error = "the readers do not read the inputs of their owners";
+    if (!error && slots.slots > WG_RETAIN_SLOTS)
+        error = "more slots than the case reads";
+    ok(!error, "pool_straddle: %s.\n", error);
+    if (error)
+        return false;
+
+    straddle->subgroup_size = slots.subgroup_size;
+    straddle->slots = slots.slots;
+    straddle->owner[0] = slot[0];
+    straddle->reader[0] = slot[1];
+    straddle->owner[1] = slot[2];
+    straddle->reader[1] = slot[3];
+    trace("Distributor: subgroup size %u, divider %u, %u slots. A_Owner slot %u, Z_Reader slot %u (chunks %u, %u); "
+            "Y_Owner slot %u, B_Reader slot %u (chunks %u, %u).\n", slots.subgroup_size, slots.wg_divider, slots.slots,
+            slot[0], slot[1], slot[0] / slots.subgroup_size, slot[1] / slots.subgroup_size,
+            slot[2], slot[3], slot[2] / slots.subgroup_size, slot[3] / slots.subgroup_size);
+    if (slot[0] / slots.subgroup_size >= slot[1] / slots.subgroup_size ||
+            slot[3] / slots.subgroup_size >= slot[2] / slots.subgroup_size)
+    {
+        skip("The slots of pool_straddle do not cross a chunk of %u slots in both orders.\n", slots.subgroup_size);
+        return false;
+    }
+    return true;
+}
 
 /* One case of test_workgraph_drain_retention. index is the index of the case. */
 static void workgraph_run_retain_case(struct workgraph_retain_run *run, unsigned int index,
@@ -6842,6 +6993,7 @@ static void workgraph_run_retain_case(struct workgraph_retain_run *run, unsigned
     struct test_context_workgraph *context = &run->context;
     uint32_t expected_pending[WG_DRAIN_MAX_ROUNDS + 1], expected_executed[3], kept1[WG_RETAIN_SLOTS];
     struct workgraph_drain_info info, info_after;
+    struct workgraph_straddle straddle;
     struct workgraph_pools *pools = run->pools;
     uint32_t *values = run->values, fault_word;
     struct workgraph_pool_sizes sizes, check_sizes;
@@ -6941,6 +7093,12 @@ static void workgraph_run_retain_case(struct workgraph_retain_run *run, unsigned
             return;
         }
     }
+    memset(&straddle, 0, sizeof(straddle));
+    if (frame && test->graph == 6 && !workgraph_bind_straddle(pso, &straddle))
+    {
+        ID3D12StateObject_Release(pso);
+        return;
+    }
     if (frame && rounds)
     {
         /* The layout of the test must be the layout of the engine at each size of the reply. */
@@ -6999,6 +7157,14 @@ static void workgraph_run_retain_case(struct workgraph_retain_run *run, unsigned
         }
         ok(backing_size, "No backing size for the case.\n");
         if (!backing_size)
+        {
+            ID3D12StateObject_Release(pso);
+            return;
+        }
+        /* The reply put the control block inside Min, and the backing memory is at least Min. */
+        ok(backing_size >= pools->min_size && info.control_offset <= backing_size - sizeof(control),
+                "Control block at %#"PRIx64" not inside %#"PRIx64" bytes.\n", info.control_offset, backing_size);
+        if (backing_size < pools->min_size || info.control_offset > backing_size - sizeof(control))
         {
             ID3D12StateObject_Release(pso);
             return;
@@ -7069,8 +7235,16 @@ static void workgraph_run_retain_case(struct workgraph_retain_run *run, unsigned
         ok(hr == S_OK && data_size == sizeof(lost), "Failed to get the lost records, hr #%x.\n", (int)hr);
         ok(!lost.events && !lost.records, "Lost %"PRIu64" records in %"PRIu64" events.\n", lost.records,
                 lost.events);
-        if (rounds && !error)
-            states = workgraph_check_pool_states(context, backing, &info_after, &info, pools, kept1);
+        if (error)
+        {
+            /* The other checks use the reply. */
+            ID3D12Resource_Release(output);
+            ID3D12Resource_Release(backing);
+            ID3D12StateObject_Release(pso);
+            return;
+        }
+        if (rounds)
+            states = workgraph_check_pool_states(context, backing, backing_size, &info_after, &info, pools, kept1);
         ok(!rounds || states, "The pool states were not read.\n");
     }
 
@@ -7232,17 +7406,18 @@ static void workgraph_run_retain_case(struct workgraph_retain_run *run, unsigned
             {
                 ok(info_after.abandoned_records == 8 - admitted, "Expected %u abandoned records, got %"PRIu64".\n",
                         8 - admitted, info_after.abandoned_records);
-                /* The slots: the reply gives 76 slots, and only the owners keep records. Admission is in slot order,
-                 * so A_Owner (slot 1) gets its records admitted first, and Y_Owner (slot 74) keeps records. */
-                ok(info_after.pool_state_stride == ((16 + 8 * WG_STRADDLE_SLOTS + 15) & ~15u),
-                        "Expected %u slots, got a stride of %u bytes.\n", WG_STRADDLE_SLOTS,
-                        info_after.pool_state_stride);
-                for (j = 0; j < WG_STRADDLE_SLOTS && states; j++)
-                    ok(!kept1[j] || j == WG_STRADDLE_A_OWNER || j == WG_STRADDLE_Y_OWNER, "Slot %u keeps %u records.\n",
+                /* The slots of the slot reply. Only the owners keep records. Admission is in slot order, so A_Owner
+                 * (before Y_Owner) gets its records admitted first, and Y_Owner keeps records. */
+                ok(info_after.pool_state_stride == ((16 + 8 * straddle.slots + 15) & ~15u),
+                        "Expected %u slots, got a stride of %u bytes.\n", straddle.slots, info_after.pool_state_stride);
+                ok(straddle.owner[0] < straddle.owner[1], "A_Owner slot %u, Y_Owner slot %u.\n", straddle.owner[0],
+                        straddle.owner[1]);
+                for (j = 0; j < straddle.slots && states; j++)
+                    ok(!kept1[j] || j == straddle.owner[0] || j == straddle.owner[1], "Slot %u keeps %u records.\n",
                             j, kept1[j]);
                 if (rounds < WG_DRAIN_MAX_ROUNDS)
                 {
-                    ok(info_after.abandoned_records && (!states || kept1[WG_STRADDLE_Y_OWNER]),
+                    ok(info_after.abandoned_records && (!states || kept1[straddle.owner[1]]),
                             "Expected abandoned records of Y_Owner, got %"PRIu64".\n", info_after.abandoned_records);
                     reason = WG_DRAIN_REASON_EXHAUSTED;
                 }
@@ -7305,8 +7480,8 @@ void test_workgraph_drain_retention(void)
      * (shared readers whose owners are in other subgroup-sized chunks of the distributor, in both slot orders).
      * With VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1, AMDGPU_WDDM_WG_FAIL=pool-head:<level> makes the retention pass of
      * that level write a head above the capacity of the pool in round 1, and pool-records:<level> a head with one
-     * record more than the slots: the admission and injection passes of round 2 must refuse the pool and set the fault
-     * word, and the abandoned record count is a lower bound. Other drivers ignore the switches and give the same
+     * record more than the slots, and pool-slot:<level> blocks 16 bytes after their place: the admission and injection
+     * passes of round 2 must refuse the pool and set the fault word, and the abandoned record count is a lower bound. Other drivers ignore the switches and give the same
      * records.
      * Each case launches at most 16384 records. */
     static const struct workgraph_retain_case tests[] =
@@ -7340,6 +7515,10 @@ void test_workgraph_drain_retention(void)
         { "chain, no round frame", 0, 64, WG_RETAIN_FIT, WG_RETAIN_ORACLE, 0, false, NULL, 0,
                 WG_RETAIN_NO_ROUND_FRAME },
         { "chain, no record pools", 0, 64, WG_RETAIN_FIT, WG_RETAIN_ORACLE, 0, false, NULL, 0, WG_RETAIN_NO_POOLS },
+        /* The blocks of pool 1 are 16 bytes after their place, with a valid head: only the check of the slots of the
+         * injection finds it. */
+        { "partial groups, blocks of pool 1 not at their place", 5, 64, WG_RETAIN_GROUPS, WG_DRAIN_REASON_FAULT, 0,
+                false, "pool-slot:1", WG_DRAIN_FAULT_PROGRESS | WG_DRAIN_FAULT_INJECT_HEAD },
     };
     struct workgraph_retain_run run;
     unsigned int i, steps;
@@ -7368,6 +7547,15 @@ void test_workgraph_drain_retention(void)
     run.pools = malloc(sizeof(*run.pools));
     run.values = malloc(WG_RETAIN_VALUES * sizeof(*run.values));
     run.tail_pattern = malloc(64 * 1024);
+    ok(run.pools && run.values && run.tail_pattern, "Failed to allocate the case state.\n");
+    if (!run.pools || !run.values || !run.tail_pattern)
+    {
+        free(run.tail_pattern);
+        free(run.values);
+        free(run.pools);
+        destroy_workgraph_test_context(&run.context);
+        return;
+    }
     for (i = 0; i < 64 * 1024 / sizeof(uint32_t); i++)
         run.tail_pattern[i] = 0x7a11c0deu;
 
@@ -7435,6 +7623,9 @@ void test_workgraph_shared_divider(void)
     HRESULT hr;
 
     values = malloc(WG_DIVIDER_VALUES * sizeof(*values));
+    ok(!!values, "Failed to allocate the values.\n");
+    if (!values)
+        return;
     for (pass = 0; pass < 2; pass++)
     {
         vkd3d_test_set_context("Divider %s", pass ? "off" : "on");
@@ -7460,6 +7651,26 @@ void test_workgraph_shared_divider(void)
                 ID3D12StateObject_Release(pso);
             destroy_workgraph_test_context(&context);
             continue;
+        }
+
+        if (frame)
+        {
+            struct workgraph_slots slots;
+            const char *error;
+            uint32_t *words;
+
+            /* The CPU side and the shader specialization take the divider from one value of the device. */
+            error = workgraph_get_slots(pso, &slots, &words);
+            ok(!error, "Slot reply: %s.\n", error);
+            free(words);
+            if (error)
+            {
+                ID3D12StateObject_Release(pso);
+                destroy_workgraph_test_context(&context);
+                continue;
+            }
+            trace("Distributor: subgroup size %u, divider %u.\n", slots.subgroup_size, slots.wg_divider);
+            ok(slots.wg_divider == !pass, "Expected divider %u, got %u.\n", !pass, slots.wg_divider);
         }
 
         backing = workgraph_create_backing_memory(&context, &wg_reqs);

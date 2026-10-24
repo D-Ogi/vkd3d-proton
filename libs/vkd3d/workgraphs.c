@@ -214,6 +214,30 @@ struct amdgpu_wddm_wg_pools
         struct amdgpu_wddm_wg_region staging;
     } layouts[5];
 };
+
+/* amdgpu-wddm fork, lab flavour only: GetPrivateData with this GUID gives struct amdgpu_wddm_wg_slots of the first
+ * program, for tests that put nodes at given slots of the distributor. With data NULL, it gives the size only. The
+ * distributor runs one subgroup of subgroup_size invocations (the required subgroup size of its pipeline) and goes
+ * through the slots in chunks of subgroup_size. wg_divider is 1 if the distributor splits the workgroups of each node
+ * (VKD3D_WORKGRAPH_MAX_WGX_NO_PRIMARY_EXECUTION_THRESHOLD, or AMDGPU_WDDM_WG_DIVIDER=1 at device creation): the
+ * shader specialization and the CPU side use the same value. node[i] is the node of node index i (GetNodeIndex): its
+ * slot in the distributor and in the pool states, and the slot of the node whose input it shares, or ~0. The last byte
+ * is the version of the struct (12). */
+static const GUID amdgpu_wddm_wg_slot_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x0c } };
+
+struct amdgpu_wddm_wg_slots
+{
+    uint32_t subgroup_size;
+    uint32_t wg_divider;
+    uint32_t slots; /* The slots of the distributor: one for each node and recursion depth. */
+    uint32_t nodes; /* The entries of node[]. */
+    struct
+    {
+        uint32_t slot;
+        uint32_t share_slot;
+    } node[];
+};
 #endif
 
 /* amdgpu-wddm fork, lab flavour: the canary ranges of a program, offsets from the start of the backing memory.
@@ -2259,6 +2283,43 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
             }
         }
         *data_size = sizeof(*pools);
+        return S_OK;
+    }
+
+    /* amdgpu-wddm fork, lab flavour: the slots of the nodes of the first program, for tests. */
+    if (IsEqualGUID(guid, &amdgpu_wddm_wg_slot_guid))
+    {
+        const struct d3d12_wg_state_object_program *program;
+        struct amdgpu_wddm_wg_slots *slots;
+        unsigned int i, entry, nodes;
+        size_t size;
+
+        if (!data_size)
+            return E_INVALIDARG;
+        program = state_object->programs_count ? &state_object->programs[0] : NULL;
+        nodes = program ? program->node_order_count : 0;
+        size = sizeof(*slots) + (size_t)nodes * sizeof(slots->node[0]);
+        if (size > UINT_MAX)
+            return E_INVALIDARG;
+        if (data && *data_size < size)
+            return E_INVALIDARG;
+        if (data)
+        {
+            slots = data;
+            memset(slots, 0, size);
+            slots->subgroup_size = state_object->device->device_info.vulkan_1_3_properties.maxSubgroupSize;
+            slots->wg_divider = state_object->device->meta_ops.workgraph.require_wg_divider;
+            slots->slots = program ? program->num_pipelines : 0;
+            slots->nodes = nodes;
+            for (i = 0; i < nodes; i++)
+            {
+                entry = program->node_order[i];
+                slots->node[i].slot = entry;
+                slots->node[i].share_slot = entry < program->num_pipelines && program->share_mapping ?
+                        program->share_mapping[entry] : UINT32_MAX;
+            }
+        }
+        *data_size = size;
         return S_OK;
     }
 #endif
@@ -4931,12 +4992,15 @@ static bool d3d12_command_list_workgraph_prepare_pools(struct d3d12_command_list
                 args->payload_capacity = args->caps[D3D12_WG_POOL_PAYLOAD];
                 args->packed_capacity = args->caps[D3D12_WG_POOL_ENTRIES];
             }
-            /* The lab hooks write an invalid head of pool "level" in the rounds of half 0, so round 2 reads it: 1 for
-             * payload bytes above every capacity, 2 for one record more than the slots hold. */
+            /* The lab hooks write an invalid pool state of pool "level" in the rounds of half 0, so round 2 reads it:
+             * 1 for payload bytes above every capacity, 2 for one record more than the slots hold, 3 for blocks 16
+             * bytes after the place of the retention pass with a valid head. */
             if (level && !half && d3d12_wg_fault_injected("pool-head", level))
                 args->fault_head = 1;
             else if (level && !half && d3d12_wg_fault_injected("pool-records", level))
                 args->fault_head = 2;
+            else if (level && !half && d3d12_wg_fault_injected("pool-slot", level))
+                args->fault_head = 3;
         }
     }
 
