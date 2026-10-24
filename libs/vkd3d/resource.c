@@ -1180,6 +1180,18 @@ static HRESULT vkd3d_get_image_create_info_tiling(struct d3d12_device *device,
         if (desc->Alignment && !(desc->Flags & D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT))
             candidate_alignment = desc->Alignment;
 
+        /* amdgpu-wddm fork: request the same small-image alignment for eligible placed textures and
+         * allocation queries, independent of desc.Alignment. BD-233's alias audit found a 128x256 BC7
+         * image with 9 mips occupying 0x10000 bytes next to a texture placed only 0xB000 bytes later.
+         * A small-alignment query followed by default-alignment creation is the inferred cause.
+         * This is a layout preference, not a guarantee of 4 KiB Vulkan alignment. Keep the actual
+         * memory-requirement padding and binding alignment checks. D3D placement alignment is unchanged;
+         * the outer condition excludes committed, linear and sparse images from this request. */
+        if (d3d12_resource_supports_small_resource_alignment(desc, format) &&
+                candidate_alignment > D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
+                (supported_alignment & (2u * D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT - 1u)))
+            candidate_alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+
         if (VKD3D_CONFIG_FLAG_IS_SET(PLACED_TEXTURE_ALIASING) &&
                 resource && (resource->flags & VKD3D_RESOURCE_PLACED) &&
                 (candidate_alignment > D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) &&
