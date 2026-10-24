@@ -527,7 +527,19 @@ struct omm_test_configuration
     uint32_t index_offset;
     DXGI_FORMAT index_buffer_format;
     D3D12_RAYTRACING_GEOMETRY_FLAGS geometry_flags;
+    /* Number of micromaps in the array, a multiple of 16; 0 means 16. */
+    unsigned int micromap_count;
 };
+
+#define OMM_TEST_MAX_MICROMAPS 208
+
+/* Micromap i reads its data at byte offset i & 7. It is 4-state when bit 3 of i + 8 * (i / 64) is set: of each
+ * 16 micromaps the first 8 are 2-state, and the first micromap of each block of 64 alternates between the
+ * formats. A build can sort micromaps into blocks of 64, so the block boundaries see both formats. */
+static bool omm_test_micromap_is_4_state(unsigned int index)
+{
+    return !!((index + (index / 64) * 8) & 8);
+}
 
 static void init_rt_omm_geometry(struct raytracing_test_context *context,
     struct test_rt_omm_geometry *rt_omm_geom, struct test_geometry *geom,
@@ -536,27 +548,41 @@ static void init_rt_omm_geometry(struct raytracing_test_context *context,
 {
     D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY histogram[2];
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs;
-    D3D12_RAYTRACING_OPACITY_MICROMAP_DESC micromap_desc[16];
+    D3D12_RAYTRACING_OPACITY_MICROMAP_DESC micromap_desc[OMM_TEST_MAX_MICROMAPS];
     D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC array_desc;
     D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC omm_linkage;
     D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC tri_desc;
     D3D12_RAYTRACING_INSTANCE_DESC instance_desc;
     D3D12_RAYTRACING_GEOMETRY_DESC geom_desc;
+    unsigned int micromap_count;
     unsigned int i;
 
-    for (i = 0; i < ARRAY_SIZE(micromap_desc); i++)
+    micromap_count = config->micromap_count ? config->micromap_count : 16;
+    assert(micromap_count <= ARRAY_SIZE(micromap_desc) && !(micromap_count % 16));
+
+    memset(histogram, 0, sizeof(histogram));
+    histogram[0].Format = D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE;
+    histogram[0].SubdivisionLevel = config->subdivision;
+    histogram[1].Format = D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE;
+    histogram[1].SubdivisionLevel = config->subdivision;
+
+    for (i = 0; i < micromap_count; i++)
     {
+        bool state4 = omm_test_micromap_is_4_state(i);
+
         micromap_desc[i].ByteOffset = i & 7;
-        micromap_desc[i].Format = i < 8 ?
-            D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE :
-            D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE;
+        micromap_desc[i].Format = state4 ?
+            D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE :
+            D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE;
         micromap_desc[i].SubdivisionLevel = config->subdivision;
+        histogram[state4].Count++;
     }
 
     assert(sizeof(micromap_desc[0]) == 8);
 
     rt_omm_geom->micromap_payload = create_upload_buffer(context->context.device, micromap_payload_size, micromap_payload);
-    rt_omm_geom->omm_triangle = create_upload_buffer(context->context.device, sizeof(micromap_desc), micromap_desc);
+    rt_omm_geom->omm_triangle = create_upload_buffer(context->context.device,
+            micromap_count * sizeof(micromap_desc[0]), micromap_desc);
     rt_omm_geom->omm_index_buffer = create_upload_buffer(context->context.device, config->index_buffer_size, config->index_buffer);
 
     memset(&inputs, 0, sizeof(inputs));
@@ -568,13 +594,6 @@ static void init_rt_omm_geometry(struct raytracing_test_context *context,
 
     array_desc.NumOmmHistogramEntries = ARRAY_SIZE(histogram);
     array_desc.pOmmHistogram = histogram;
-    memset(histogram, 0, sizeof(histogram));
-    histogram[0].Count = ARRAY_SIZE(micromap_desc) / 2;
-    histogram[0].Format = D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE;
-    histogram[0].SubdivisionLevel = config->subdivision;
-    histogram[1].Count = ARRAY_SIZE(micromap_desc) / 2;
-    histogram[1].Format = D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE;
-    histogram[1].SubdivisionLevel = config->subdivision;
 
     array_desc.PerOmmDescs.StartAddress = ID3D12Resource_GetGPUVirtualAddress(rt_omm_geom->omm_triangle);
     array_desc.PerOmmDescs.StrideInBytes = sizeof(micromap_desc[0]);
@@ -586,11 +605,12 @@ static void init_rt_omm_geometry(struct raytracing_test_context *context,
         (config->omm_build_flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION) ?
         ID3D12Resource_GetGPUVirtualAddress(rt_omm_geom->query) : 0);
 
-    for (i = 0; i < ARRAY_SIZE(micromap_desc); i++)
+    for (i = 0; i < micromap_count; i++)
         micromap_desc[i].SubdivisionLevel = 0;
     for (i = 0; i < ARRAY_SIZE(histogram); i++)
         histogram[i].SubdivisionLevel = 0;
-    rt_omm_geom->omm_triangle_alt = create_upload_buffer(context->context.device, sizeof(micromap_desc), micromap_desc);
+    rt_omm_geom->omm_triangle_alt = create_upload_buffer(context->context.device,
+            micromap_count * sizeof(micromap_desc[0]), micromap_desc);
     array_desc.PerOmmDescs.StartAddress = ID3D12Resource_GetGPUVirtualAddress(rt_omm_geom->omm_triangle_alt);
     create_acceleration_structure(context, &inputs, &rt_omm_geom->omm_alt, 0);
 
@@ -4236,6 +4256,24 @@ static void test_raytracing_opacity_micro_map_inner(bool ray_query, bool legacy_
         0, 1, 2, 3,
     };
 
+    /* Micromaps of an array with OMM_TEST_MAX_MICROMAPS entries: the first micromap of each block of 64, and
+     * micromaps inside the blocks and at their ends. */
+    static const uint32_t triangle_to_omm_map_blocks[TRIANGLES_PER_RAY] = {
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT,
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE,
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT,
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE,
+        0, 64, 128, 192,
+    };
+
+    static const uint32_t triangle_to_omm_map_blocks_inner[TRIANGLES_PER_RAY] = {
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT,
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE,
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT,
+        D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE,
+        33, 63, 100, 207,
+    };
+
     struct vec2 uvs[NUM_RAYS_PER_TRIANGLE];
     struct vec4 rays_data[NUM_RAYS];
 
@@ -4491,6 +4529,34 @@ static void test_raytracing_opacity_micro_map_inner(bool ray_query, bool legacy_
             triangle_to_omm_map, sizeof(triangle_to_omm_map), INDEX_BUFFER_OFFSET, DXGI_FORMAT_R32_UINT,
             D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
         },
+        /* An array with more micromaps than one block of 64, as content baked offline has. A micromap of
+         * subdivision level 4 spans 16 dwords, so the build has to find the micromap of each dword across blocks. */
+        {
+            0, 0,
+            0,
+            0,
+            4,
+            triangle_to_omm_map_blocks, sizeof(triangle_to_omm_map_blocks), 0, DXGI_FORMAT_R32_UINT,
+            0, OMM_TEST_MAX_MICROMAPS,
+        },
+        {
+            0, 0,
+            0,
+            0,
+            4,
+            triangle_to_omm_map_blocks_inner, sizeof(triangle_to_omm_map_blocks_inner), 0, DXGI_FORMAT_R32_UINT,
+            0, OMM_TEST_MAX_MICROMAPS,
+        },
+        /* The build flags of the D3D12RaytracingOpacityMicromaps sample. */
+        {
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS,
+            0,
+            0,
+            2,
+            triangle_to_omm_map_blocks, sizeof(triangle_to_omm_map_blocks), 0, DXGI_FORMAT_R32_UINT,
+            0, OMM_TEST_MAX_MICROMAPS,
+        },
     };
 
     /* Each configuration runs with mixed micromap data and with uniform data. Uniform data gives micromaps with
@@ -4720,7 +4786,11 @@ static void test_raytracing_opacity_micro_map_inner(bool ray_query, bool legacy_
 
             omm = !(config->instance_flags & D3D12_RAYTRACING_INSTANCE_FLAG_DISABLE_OMMS);
 
-            index = triangle_to_omm_map[i % TRIANGLES_PER_RAY];
+            /* The 8-bit and 16-bit maps hold the values of triangle_to_omm_map. */
+            if (config->index_buffer_format == DXGI_FORMAT_R32_UINT)
+                index = ((const uint32_t *)config->index_buffer)[i % TRIANGLES_PER_RAY];
+            else
+                index = triangle_to_omm_map[i % TRIANGLES_PER_RAY];
 
             if (!omm)
             {
@@ -4759,11 +4829,11 @@ static void test_raytracing_opacity_micro_map_inner(bool ray_query, bool legacy_
                 unsigned int byte_offset;
                 unsigned int bit_offset;
 
-                index += INDEX_BUFFER_OFFSET;
+                index += config->index_offset;
                 byte_offset = index & 7;
                 bit_offset = byte_offset * 8;
 
-                if (index < 8)
+                if (!omm_test_micromap_is_4_state(index))
                 {
                     /* 1bpt mode */
                     bit_offset += bitcode;
