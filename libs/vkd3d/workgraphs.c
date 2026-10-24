@@ -33,9 +33,15 @@
 /* Size of each payload ring of a work graph state object. */
 #define VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE (128ull * 1024 * 1024)
 /* amdgpu-wddm fork: after each payload ring, the sink for the records of an allocation that does not fit
- * (struct vkd3d_workgraph_output_guard). It holds the largest output of a thread group (32 KB, WorkGraphs.md, Node
- * output limits) with the internal tracking words. */
+ * (struct vkd3d_workgraph_output_guard). One allocation is at most L records and 64 KiB - 15 bytes, with
+ * L = min((64 KiB - 15) / stride, 256) (dxil-spirv, build_allocate_node_records), and the record addressing clamps
+ * the record index to L - 1 (emit_build_output_payload_offset). A dropped allocation writes from the start of the
+ * sink, so it ends at most L x stride after it. An allocation that fits ends at or before the capacity; the records
+ * of a lane start inside it, so a write with an index past the count (which the application must not do) ends at
+ * most (L - 1) x stride after the capacity. Both are less than 64 KiB. */
 #define VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE (64ull * 1024)
+/* The node output allocator computes payload offsets in 32 bits. */
+STATIC_ASSERT(VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE <= UINT32_MAX);
 /* The packed offsets of the payloads, after the required scratch memory: their size with MinSizeInBytes and with
  * MaxSizeInBytes of backing memory. The sizes are arbitrary. */
 #define VKD3D_WORKGRAPH_PACKED_OFFSETS_MIN_SIZE (64ull * 1024 * 1024)
@@ -74,7 +80,8 @@ static inline bool d3d12_wg_fault_injected(const char *point, unsigned int index
 
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
 /* amdgpu-wddm fork, lab flavour only: GetPrivateData of a work graph state object with this GUID gives two UINT64:
- * the DispatchGraph calls that lost records, and the lost records (test_workgraph_multi_gpu_input_lost_records). */
+ * the DispatchGraph calls that lost records, and the lost records (test_workgraph_multi_gpu_input_lost_records).
+ * With a data size of three UINT64 or more, the third is 1 if the lost record count is a lower bound. */
 static const GUID amdgpu_wddm_wg_status_guid =
         { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x05 } };
 
@@ -86,7 +93,9 @@ static const GUID amdgpu_wddm_wg_canary_guid =
 
 /* amdgpu-wddm fork, lab flavour: the canary ranges of a program, offsets from the start of the backing memory.
  * Initialization fills them with VKD3D_WORKGRAPH_CANARY_PATTERN. Nothing writes them after that, so a test that
- * reads the backing memory back finds a write past a sink or past the unrolled offsets. */
+ * reads the backing memory back finds a write past a sink or past the unrolled offsets. sinks[] are the two payload
+ * sinks (the sink of payload ring 0 and of payload ring 1), so that a test can see which sink got the writes of the
+ * allocations that did not fit. */
 #define VKD3D_WORKGRAPH_CANARY_SIZE (4096u)
 #define VKD3D_WORKGRAPH_CANARY_PATTERN (0xc4a7c0deu)
 #define VKD3D_WORKGRAPH_CANARY_COUNT 3
@@ -98,7 +107,7 @@ struct amdgpu_wddm_wg_canaries
     {
         uint64_t offset;
         uint64_t size;
-    } ranges[VKD3D_WORKGRAPH_CANARY_COUNT];
+    } ranges[VKD3D_WORKGRAPH_CANARY_COUNT], sinks[2];
 };
 
 /* amdgpu-wddm fork, lab flavour only:
@@ -1764,13 +1773,14 @@ static void d3d12_wg_state_object_cleanup(struct d3d12_wg_state_object *state_ob
 
 /* amdgpu-wddm fork: reads the lost record counts that the GPU wrote. The executions can still run. */
 static void d3d12_wg_state_object_read_lost_records(struct d3d12_wg_state_object *state_object,
-        uint64_t *events, uint64_t *records)
+        uint64_t *events, uint64_t *records, bool *lower_bound)
 {
     volatile struct vkd3d_workgraph_lost_records *lost = state_object->lost_records_host;
     uint32_t hi, lo;
 
     *events = 0;
     *records = 0;
+    *lower_bound = false;
     if (!lost)
         return;
 
@@ -1782,6 +1792,7 @@ static void d3d12_wg_state_object_read_lost_records(struct d3d12_wg_state_object
 
     *events = lost->events;
     *records = ((uint64_t)hi << 32) | lo;
+    *lower_bound = !!(lost->flags & VKD3D_WORKGRAPH_LOST_RECORDS_LOWER_BOUND);
 }
 
 /* amdgpu-wddm fork: an ERR line when more records were lost since the last line. This runs when the
@@ -1791,8 +1802,9 @@ static void d3d12_wg_state_object_report_lost_records(struct d3d12_wg_state_obje
 {
     uint64_t events, records;
     uint32_t reported;
+    bool lower_bound;
 
-    d3d12_wg_state_object_read_lost_records(state_object, &events, &records);
+    d3d12_wg_state_object_read_lost_records(state_object, &events, &records, &lower_bound);
     reported = vkd3d_atomic_uint32_load_explicit(&state_object->lost_events_reported, vkd3d_memory_order_relaxed);
     if ((uint32_t)events == reported)
         return;
@@ -1800,10 +1812,12 @@ static void d3d12_wg_state_object_report_lost_records(struct d3d12_wg_state_obje
             vkd3d_memory_order_relaxed, vkd3d_memory_order_relaxed) != reported)
         return;
 
-    ERR("Work graph %p: %"PRIu64" times records did not fit, %"PRIu64" records were not launched in total. The "
+    ERR("Work graph %p: %"PRIu64" times records did not fit, %s%"PRIu64" records were not launched in total. The "
             "merged inputs of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT did not fit in the staging range, or the node "
-            "outputs of a level did not fit in the payload memory.\n",
-            (void *)state_object, events, records);
+            "outputs of a level did not fit in the payload memory.%s\n",
+            (void *)state_object, events, lower_bound ? "at least " : "", records,
+            lower_bound ? " A thread asked for more records than one allocation can hold, which is not valid, so "
+            "the count is a lower bound." : "");
 }
 
 static void d3d12_wg_state_object_dec_ref(struct d3d12_wg_state_object *state_object)
@@ -1863,18 +1877,22 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
     /* amdgpu-wddm fork, lab flavour: the lost record counts, for tests. */
     if (IsEqualGUID(guid, &amdgpu_wddm_wg_status_guid))
     {
-        uint64_t counts[2];
+        uint64_t counts[3];
+        bool lower_bound;
+        UINT size;
 
         if (!data_size)
             return E_INVALIDARG;
-        if (data && *data_size < sizeof(counts))
+        if (data && *data_size < 2 * sizeof(counts[0]))
             return E_INVALIDARG;
+        size = data && *data_size < sizeof(counts) ? 2 * sizeof(counts[0]) : sizeof(counts);
         if (data)
         {
-            d3d12_wg_state_object_read_lost_records(state_object, &counts[0], &counts[1]);
-            memcpy(data, counts, sizeof(counts));
+            d3d12_wg_state_object_read_lost_records(state_object, &counts[0], &counts[1], &lower_bound);
+            counts[2] = lower_bound;
+            memcpy(data, counts, size);
         }
-        *data_size = sizeof(counts);
+        *data_size = size;
         return S_OK;
     }
 
@@ -1900,6 +1918,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
                     canaries.ranges[i].offset = state_object->programs[0].canary_offsets[i];
                     canaries.ranges[i].size = VKD3D_WORKGRAPH_CANARY_SIZE;
                 }
+                canaries.sinks[0].offset = state_object->programs[0].payload0_scratch_offset +
+                        state_object->programs[0].payload_ring_size;
+                canaries.sinks[1].offset = state_object->programs[0].payload1_scratch_offset +
+                        state_object->programs[0].payload_ring_size;
+                canaries.sinks[0].size = canaries.sinks[1].size = VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE;
             }
             memcpy(data, &canaries, sizeof(canaries));
         }

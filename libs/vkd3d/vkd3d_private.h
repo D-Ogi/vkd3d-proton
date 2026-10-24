@@ -5572,15 +5572,18 @@ struct vkd3d_workgraph_workgroups_args
  * build_increment_node_count) finds it at AllocationOffset - 8 words. An allocation that would take the payload
  * past payload_capacity, or a packed offset entry past packed_capacity, is not counted: its records go to the
  * 64-bit count dropped_records_lo/hi, its payload to the sink after the payload ring and its packed offset to
- * sink[]. An allocation of more records than fit in the sink (VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE) is always dropped,
- * so that the records of a dropped allocation stay in the sink. Empty records count 4 bytes against
+ * sink[]. An allocation of more than 256 records or more than 64 KiB - 15 bytes is always dropped, so that the
+ * records of a dropped allocation stay in the sink (VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE). The payload is reserved with a
+ * compare/exchange loop, so the payload counter never goes past payload_capacity. Empty records count 4 bytes against
  * payload_capacity, so that the records of a level fit in the unrolled offsets.
  * The workgroup distributor reports the dropped records after each level and clears the count. */
 struct vkd3d_workgraph_output_guard
 {
     uint32_t payload_capacity;
     uint32_t packed_capacity;
-    uint32_t reserved0[2];
+    /* VKD3D_WORKGRAPH_LOST_RECORDS_LOWER_BOUND if a dropped count is a lower bound. */
+    uint32_t flags;
+    uint32_t reserved0;
     uint32_t dropped_records_lo;
     uint32_t dropped_records_hi;
     uint32_t sink[2];
@@ -5660,8 +5663,12 @@ struct vkd3d_workgraph_lost_records
     uint32_t events;
     uint32_t records_lo;
     uint32_t records_hi;
-    uint32_t padding;
+    uint32_t flags;
 };
+
+/* A thread asked for more records than one allocation can hold (not valid), and its count was added as the limit + 1,
+ * so the lost record count is a lower bound. */
+#define VKD3D_WORKGRAPH_LOST_RECORDS_LOWER_BOUND 0x1u
 
 struct vkd3d_workgraph_multi_gpu_input_copy_args
 {

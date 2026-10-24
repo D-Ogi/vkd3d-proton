@@ -50,7 +50,8 @@ layout(buffer_reference, buffer_reference_align = 16, std430) buffer OutputGuard
 {
 	uint payload_capacity;
 	uint packed_capacity;
-	uvec2 reserved0;
+	uint flags;
+	uint reserved0;
 	uint dropped_records_lo;
 	uint dropped_records_hi;
 	uvec2 sink;
@@ -62,7 +63,7 @@ layout(buffer_reference, buffer_reference_align = 16, std430) buffer LostRecords
 	uint events;
 	uint records_lo;
 	uint records_hi;
-	uint padding;
+	uint flags;
 };
 
 layout(push_constant, std430) uniform Registers
@@ -221,6 +222,12 @@ void main()
 		{
 			registers.output_guard.dropped_records_lo = 0u;
 			registers.output_guard.dropped_records_hi = 0u;
+			// Bit 0: the count is a lower bound (VKD3D_WORKGRAPH_LOST_RECORDS_LOWER_BOUND).
+			if (registers.output_guard.flags != 0u)
+			{
+				atomicOr(registers.lost_records.flags, registers.output_guard.flags);
+				registers.output_guard.flags = 0u;
+			}
 			uint old = atomicAdd(registers.lost_records.records_lo, dropped);
 			if (old + dropped < old)
 				dropped_hi += 1u;
