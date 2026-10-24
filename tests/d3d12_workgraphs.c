@@ -102,6 +102,15 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/coalesce_custom_input.h"
 #include "shaders/workgraph/headers/two_entry.h"
 
+/* The stride 0 cases are skipped on AMD because they hang the GPU with AMD's own driver. A different driver with
+ * the AMD vendor ID can run them: set VKD3D_TEST_WORKGRAPH_AMD_STRIDE_0=1. */
+static bool workgraph_skip_amd_stride_0(ID3D12Device *device)
+{
+    const char *env = getenv("VKD3D_TEST_WORKGRAPH_AMD_STRIDE_0");
+
+    return is_amd_windows_device(device) && !(env && env[0] == '1');
+}
+
 static void check_work_graph_properties(ID3D12StateObject *pso,
         LPCWSTR expected_program_name, LPCWSTR expected_entry_node, LPCWSTR expected_leaf_node,
         unsigned int expected_input_record_size,
@@ -589,7 +598,7 @@ void test_workgraph_basic(void)
         desc.num_threads[1] = 3;
         desc.num_threads[2] = 4;
 
-        if (is_amd_windows_device(context.context.device))
+        if (workgraph_skip_amd_stride_0(context.context.device))
         {
             skip("Skipping stride 0 test. Hangs AMD GPU.\n");
         }
@@ -603,7 +612,7 @@ void test_workgraph_basic(void)
         execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
     }
 
-    if (!is_amd_windows_device(context.context.device))
+    if (!workgraph_skip_amd_stride_0(context.context.device))
     {
         uint32_t records[] = { 1, 2, 2 };
         struct workgraph_test_desc desc;
@@ -633,7 +642,7 @@ void test_workgraph_basic(void)
         skip("Skipping stride 0 tests. Hangs AMD GPU.\n");
     }
 
-    if (!is_amd_windows_device(context.context.device))
+    if (!workgraph_skip_amd_stride_0(context.context.device))
     {
         const uint32_t records[] = { 1, 2, 2, 2, 1, 1 };
         struct workgraph_test_desc desc;
