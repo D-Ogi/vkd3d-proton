@@ -62,6 +62,13 @@ static inline bool d3d12_wg_fault_injected(const char *point, unsigned int index
 }
 #endif
 
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+/* amdgpu-wddm fork, lab flavour only: GetPrivateData of a work graph state object with this GUID gives two UINT64:
+ * the DispatchGraph calls that lost records, and the lost records (test_workgraph_multi_gpu_input_lost_records). */
+static const GUID amdgpu_wddm_wg_status_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x05 } };
+#endif
+
 /* amdgpu-wddm fork, lab flavour only: AMDGPU_WDDM_WG_MULTI_INPUT=staging=<bytes>,large=<bytes>,groups=<n> sets the
  * staging size, the large input size and the number of classify and copy workgroups of
  * D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT for the work graphs created after it is set. Each part is optional.
@@ -1608,6 +1615,50 @@ static void d3d12_wg_state_object_cleanup(struct d3d12_wg_state_object *state_ob
     d3d12_wg_state_object_cleanup_allocation(&state_object->payload[0], state_object->device);
     d3d12_wg_state_object_cleanup_allocation(&state_object->payload[1], state_object->device);
     d3d12_wg_state_object_cleanup_allocation(&state_object->unrolled_offsets, state_object->device);
+    d3d12_wg_state_object_cleanup_allocation(&state_object->lost_records, state_object->device);
+}
+
+/* amdgpu-wddm fork: reads the lost record counts that the GPU wrote. The executions can still run. */
+static void d3d12_wg_state_object_read_lost_records(struct d3d12_wg_state_object *state_object,
+        uint64_t *events, uint64_t *records)
+{
+    volatile struct vkd3d_workgraph_lost_records *lost = state_object->lost_records_host;
+    uint32_t hi, lo;
+
+    *events = 0;
+    *records = 0;
+    if (!lost)
+        return;
+
+    do
+    {
+        hi = lost->records_hi;
+        lo = lost->records_lo;
+    } while (hi != lost->records_hi);
+
+    *events = lost->events;
+    *records = ((uint64_t)hi << 32) | lo;
+}
+
+/* amdgpu-wddm fork: an ERR line when more DispatchGraph calls lost records since the last line. This runs when the
+ * application records the next DispatchGraph with the state object and when it releases the state object, so it
+ * is late, but the loss is in the log, and with the debugger log of the system route also in the debugger. */
+static void d3d12_wg_state_object_report_lost_records(struct d3d12_wg_state_object *state_object)
+{
+    uint64_t events, records;
+    uint32_t reported;
+
+    d3d12_wg_state_object_read_lost_records(state_object, &events, &records);
+    reported = vkd3d_atomic_uint32_load_explicit(&state_object->lost_events_reported, vkd3d_memory_order_relaxed);
+    if ((uint32_t)events == reported)
+        return;
+    if (vkd3d_atomic_uint32_compare_exchange(&state_object->lost_events_reported, reported, (uint32_t)events,
+            vkd3d_memory_order_relaxed, vkd3d_memory_order_relaxed) != reported)
+        return;
+
+    ERR("Work graph %p: %"PRIu64" DispatchGraph calls did not launch %"PRIu64" records in total. The merged inputs "
+            "of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT did not fit in the staging range.\n",
+            (void *)state_object, events, records);
 }
 
 static void d3d12_wg_state_object_dec_ref(struct d3d12_wg_state_object *state_object)
@@ -1619,6 +1670,7 @@ static void d3d12_wg_state_object_dec_ref(struct d3d12_wg_state_object *state_ob
     if (!refcount)
     {
         struct d3d12_device *device = state_object->device;
+        d3d12_wg_state_object_report_lost_records(state_object);
         vkd3d_private_store_destroy(&state_object->private_store);
         d3d12_wg_state_object_cleanup(state_object);
         vkd3d_free(state_object);
@@ -1661,6 +1713,26 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
     struct d3d12_wg_state_object *state_object = wg_impl_from_ID3D12StateObject(iface);
 
     TRACE("iface %p, guid %s, data_size %p, data %p.\n", iface, debugstr_guid(guid), data_size, data);
+
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    /* amdgpu-wddm fork, lab flavour: the lost record counts, for tests. */
+    if (IsEqualGUID(guid, &amdgpu_wddm_wg_status_guid))
+    {
+        uint64_t counts[2];
+
+        if (!data_size)
+            return E_INVALIDARG;
+        if (data && *data_size < sizeof(counts))
+            return E_INVALIDARG;
+        if (data)
+        {
+            d3d12_wg_state_object_read_lost_records(state_object, &counts[0], &counts[1]);
+            memcpy(data, counts, sizeof(counts));
+        }
+        *data_size = sizeof(counts);
+        return S_OK;
+    }
+#endif
 
     return vkd3d_get_private_data(&state_object->private_store, guid, data_size, data);
 }
@@ -2753,6 +2825,33 @@ static HRESULT d3d12_wg_state_object_convert_entry_point(
     return S_OK;
 }
 
+/* amdgpu-wddm fork: the host-visible struct vkd3d_workgraph_lost_records of the state object, cleared. */
+static HRESULT d3d12_wg_state_object_allocate_lost_records(struct d3d12_wg_state_object *object)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &object->device->vk_procs;
+    struct d3d12_wg_state_object_ring *ring = &object->lost_records;
+    void *ptr;
+    HRESULT hr;
+    VkResult vr;
+
+    if (FAILED(hr = vkd3d_create_buffer_explicit_usage(object->device,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            sizeof(struct vkd3d_workgraph_lost_records), "workgraph-lost-records", &ring->vk_buffer)))
+        return hr;
+
+    if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(object->device, ring->vk_buffer,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, &ring->allocation)))
+        return hr;
+
+    if ((vr = VK_CALL(vkMapMemory(object->device->vk_device, ring->allocation.vk_memory, 0, VK_WHOLE_SIZE, 0, &ptr))))
+        return hresult_from_vk_result(vr);
+
+    object->lost_records_host = ptr;
+    memset(ptr, 0, sizeof(struct vkd3d_workgraph_lost_records));
+    ring->va = vkd3d_get_buffer_device_address(object->device, ring->vk_buffer);
+    return S_OK;
+}
+
 static HRESULT d3d12_wg_state_object_allocate_rings(struct d3d12_wg_state_object *object)
 {
     /* This is the big achilles heel of any emulation path. This memory requirement is way too huge
@@ -2766,6 +2865,9 @@ static HRESULT d3d12_wg_state_object_allocate_rings(struct d3d12_wg_state_object
     if (FAILED(hr = d3d12_wg_state_object_allocate_ring(&object->payload[1], payload_ring_size, object->device)))
         return hr;
     if (FAILED(hr = d3d12_wg_state_object_allocate_ring(&object->unrolled_offsets, payload_ring_size, object->device)))
+        return hr;
+
+    if (FAILED(hr = d3d12_wg_state_object_allocate_lost_records(object)))
         return hr;
 
     return S_OK;
@@ -3813,6 +3915,7 @@ static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
     prepare_args.state_va = state_scratch.va;
     prepare_args.num_entry_points = num_entries;
     prepare_args.large_size = program->multi_input_large_size;
+    prepare_args.status_va = state->lost_records.va;
     if (list->wg_state.BackingMemory.SizeInBytes >= program->required_scratch_size)
     {
         prepare_args.staging_va = list->wg_state.BackingMemory.StartAddress + program->multi_input_staging_scratch_offset;
@@ -4023,6 +4126,7 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
     }
 
     d3d12_wg_scratch_fault_reset();
+    d3d12_wg_state_object_report_lost_records(wg_state);
 
     d3d12_command_list_end_current_render_pass(list, false);
     d3d12_command_list_debug_mark_begin_region(list, "WGDispatch");

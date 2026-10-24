@@ -5617,9 +5617,21 @@ struct vkd3d_workgraph_multi_gpu_input_prepare_args
     VkDeviceAddress state_va;
     VkDeviceAddress staging_va;
     VkDeviceSize staging_capacity;
+    /* struct vkd3d_workgraph_lost_records of the state object. */
+    VkDeviceAddress status_va;
     uint32_t num_entry_points;
     uint32_t mode;
     uint32_t large_size;
+    uint32_t padding;
+};
+
+/* amdgpu-wddm fork: the records that the merge slots did not launch, for all executions of a state object. The
+ * layout pass adds to it with atomics. The memory is host-visible, so that the CPU can report the loss. */
+struct vkd3d_workgraph_lost_records
+{
+    uint32_t events;
+    uint32_t records_lo;
+    uint32_t records_hi;
     uint32_t padding;
 };
 
@@ -7032,6 +7044,12 @@ struct d3d12_wg_state_object
      * Generally speaking, these buffers should be allocated in ring-buffers on device. */
     struct d3d12_wg_state_object_ring unrolled_offsets;
     struct d3d12_wg_state_object_ring payload[2];
+
+    /* amdgpu-wddm fork: struct vkd3d_workgraph_lost_records, mapped. lost_events_reported is the events count
+     * of the last ERR line. */
+    struct d3d12_wg_state_object_ring lost_records;
+    struct vkd3d_workgraph_lost_records *lost_records_host;
+    uint32_t lost_events_reported;
 
     struct vkd3d_private_store private_store;
 };

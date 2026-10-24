@@ -12,7 +12,8 @@
 // their records into the staging range of the backing memory, at the record size aligned to 4 bytes.
 // An empty record (record size 0) needs no copy: the merge slot only has the sum of the counts.
 // Records are lost only if the merged records of the entry points do not fit in the staging range, or if the merged
-// count of an entry point is more than 2^32 - 1. The overflow word of the state is then set.
+// count of an entry point is more than 2^32 - 1. The overflow word of the state is then set, and the lost records
+// are added to the struct vkd3d_workgraph_lost_records of the state object, which the CPU reports.
 // The mode selects the pass:
 //   MODE_INIT (one workgroup): clears the state and the slots.
 //   MODE_CLASSIFY (any number of workgroups): puts large inputs into the direct slots and sums the counts of the
@@ -85,6 +86,15 @@ layout(buffer_reference, buffer_reference_align = 8, std430) buffer Slots
 	GPUInput data[];
 };
 
+// struct vkd3d_workgraph_lost_records.
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer LostRecords
+{
+	uint events;
+	uint records_lo;
+	uint records_hi;
+	uint padding;
+};
+
 // struct vkd3d_workgraph_multi_gpu_input_prepare_args.
 layout(push_constant) uniform Registers
 {
@@ -93,6 +103,7 @@ layout(push_constant) uniform Registers
 	uint64_t state_va;
 	uint64_t staging_va;
 	uint64_t staging_capacity;
+	uint64_t lost_records_va;
 	uint num_entry_points;
 	uint mode;
 	uint large_size;
@@ -211,6 +222,7 @@ void layout_merge_slots(State state)
 	Slots slots = Slots(slots_va());
 	uint num_entries = registers.num_entry_points;
 	uint64_t offset = 0ul;
+	uint64_t lost = 0ul;
 	uint overflow = 0u;
 
 	if (gl_LocalInvocationIndex != 0u)
@@ -223,7 +235,10 @@ void layout_merge_slots(State state)
 		uint64_t count = wg_math_merge_count(merged, stride, wg_math_room(registers.staging_capacity, offset));
 
 		if (count < merged)
+		{
 			overflow = 1u;
+			lost += merged - count;
+		}
 
 		state.entries[e].fit = uint(count);
 		state.entries[e].cursor = 0u;
@@ -239,6 +254,18 @@ void layout_merge_slots(State state)
 	}
 
 	state.overflow = overflow;
+
+	if (overflow != 0u && registers.lost_records_va != 0ul)
+	{
+		LostRecords lost_records = LostRecords(registers.lost_records_va);
+		uint lo = uint(lost);
+		uint hi = uint(lost >> 32);
+		uint old = atomicAdd(lost_records.records_lo, lo);
+		hi += wg_math_add_carry(old, lo);
+		if (hi != 0u)
+			atomicAdd(lost_records.records_hi, hi);
+		atomicAdd(lost_records.events, 1u);
+	}
 }
 
 void main()
