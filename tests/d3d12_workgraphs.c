@@ -4400,6 +4400,74 @@ static unsigned int workgraph_check_drain_control(const struct workgraph_drain_c
     return reason;
 }
 
+/* Checks a reply of GetPrivateData with workgraph_drain_guid before the test uses it. min_size is the size of the
+ * backing memory of the calls. Returns NULL if the reply is valid, else the reason. */
+static const char *workgraph_drain_info_error(HRESULT hr, UINT size, const struct workgraph_drain_info *info,
+        unsigned int rounds, unsigned int pending_rounds, uint64_t min_size)
+{
+    if (hr != S_OK)
+        return "no reply";
+    if (size != sizeof(*info))
+        return "wrong size";
+    if (info->rounds != rounds)
+        return "wrong number of extra rounds";
+    if (info->pending_rounds != pending_rounds)
+        return "wrong pending hook";
+    /* The control block is only in the backing memory if there are extra rounds. */
+    if (!rounds)
+        return NULL;
+    if (info->control_offset % sizeof(uint32_t))
+        return "control block not aligned";
+    /* A subtraction, because control_offset + size can wrap. */
+    if (min_size < sizeof(struct workgraph_drain_control) ||
+            info->control_offset > min_size - sizeof(struct workgraph_drain_control))
+        return "control block not inside the backing memory";
+    return NULL;
+}
+
+/* Negative controls of workgraph_drain_info_error, on the CPU only: each reply must be refused. */
+static void workgraph_check_drain_admission(void)
+{
+    const uint64_t min_size = 0x10000;
+    struct workgraph_drain_info info;
+    uint64_t wrap;
+
+    memset(&info, 0, sizeof(info));
+    info.rounds = 2;
+    info.pending_rounds = 2;
+    info.control_offset = 0x100;
+    ok(!workgraph_drain_info_error(S_OK, sizeof(info), &info, 2, 2, min_size), "A valid reply was refused.\n");
+    ok(!!workgraph_drain_info_error(E_INVALIDARG, sizeof(info), &info, 2, 2, min_size),
+            "A missing reply was accepted.\n");
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info) - 4, &info, 2, 2, min_size), "A short reply was accepted.\n");
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info), &info, 3, 2, min_size), "Wrong rounds were accepted.\n");
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info), &info, 2, 1, min_size), "A wrong hook was accepted.\n");
+
+    info.control_offset = 0x102;
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info), &info, 2, 2, min_size),
+            "A control block that is not aligned was accepted.\n");
+    info.control_offset = min_size - sizeof(struct workgraph_drain_control);
+    ok(!workgraph_drain_info_error(S_OK, sizeof(info), &info, 2, 2, min_size),
+            "A control block at the end was refused.\n");
+    info.control_offset += 4;
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info), &info, 2, 2, min_size),
+            "A control block across the end was accepted.\n");
+    info.control_offset = 0;
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info), &info, 2, 2, sizeof(struct workgraph_drain_control) - 4),
+            "A control block in a smaller backing memory was accepted.\n");
+
+    /* This offset passes the check offset + size <= min_size, because the sum wraps. */
+    wrap = UINT64_MAX - 15;
+    ok(wrap + sizeof(struct workgraph_drain_control) <= min_size, "The sum does not wrap.\n");
+    info.control_offset = wrap;
+    ok(!!workgraph_drain_info_error(S_OK, sizeof(info), &info, 2, 2, min_size),
+            "A control block offset that wraps was accepted.\n");
+
+    /* Without extra rounds the offset is not used. */
+    info.rounds = info.pending_rounds = 0;
+    ok(!workgraph_drain_info_error(S_OK, sizeof(info), &info, 0, 0, min_size), "A reply without rounds was refused.\n");
+}
+
 struct workgraph_drain_call
 {
     const char *fault; /* AMDGPU_WDDM_WG_FAIL while the call is recorded, or NULL. */
@@ -4417,13 +4485,15 @@ struct workgraph_drain_case
     bool direct; /* A copy comes before the first SetPredication, so that it is not deferred. */
     struct workgraph_drain_call calls[WG_DRAIN_MAX_CALLS];
     unsigned int call_count;
+    bool bare; /* No application barrier and no ordinary Dispatch between the calls. */
 };
 
 /* Records the calls of one case in one command list, each DispatchGraph of level_sinks followed by an ordinary
- * Dispatch of drain_dispatch with the same predicate, and checks the records of each call, the Dispatch, 64 KiB after
- * each backing memory and, on the engine, the control block and the reports. */
+ * Dispatch of drain_dispatch with the same predicate (not for a bare case), and checks the records of each call, the
+ * Dispatch, 64 KiB after each backing memory and, if frame is true, the control block and the reports. If frame is
+ * false, the state object must not give the round frame (a native driver or the release flavour). */
 static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3D12PipelineState *cs_pso,
-        ID3D12Resource *predicates, unsigned int index, const struct workgraph_drain_case *test)
+        ID3D12Resource *predicates, unsigned int index, const struct workgraph_drain_case *test, bool frame)
 {
     static const D3D12_NODE_ID entry_id = { u"Entry", 0 };
     ID3D12Resource *backing[WG_DRAIN_MAX_CALLS], *output[WG_DRAIN_MAX_CALLS], *copy_src, *copy_dst;
@@ -4441,8 +4511,8 @@ static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3
     uint32_t *tail_pattern;
     ID3D12StateObject *pso;
     uint32_t params = 0;
-    bool has_drain;
     UINT entry_index;
+    const char *error;
     UINT size;
     HRESULT hr;
 
@@ -4459,18 +4529,25 @@ static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3
         return;
     }
 
+    /* The reply is checked before any GPU work: a missing or bad round frame fails the case. */
     memset(&info, 0, sizeof(info));
     size = sizeof(info);
-    has_drain = SUCCEEDED(ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &size, &info));
-    if (has_drain)
+    hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &size, &info);
+    if (frame)
     {
-        ok(size == sizeof(info), "Got size %u.\n", size);
-        ok(info.rounds == test->rounds, "Expected %u extra rounds, got %u.\n", test->rounds, info.rounds);
-        ok(info.pending_rounds == test->pending_rounds, "Expected pending hook %u, got %u.\n",
-                test->pending_rounds, info.pending_rounds);
-        ok(info.control_offset + sizeof(control) <= wg_reqs.MinSizeInBytes,
-                "The control block at %#"PRIx64" is not inside %#"PRIx64" bytes.\n", info.control_offset,
-                (uint64_t)wg_reqs.MinSizeInBytes);
+        error = workgraph_drain_info_error(hr, size, &info, test->rounds, test->pending_rounds,
+                wg_reqs.MinSizeInBytes);
+        ok(!error, "Round frame: %s (hr #%x, size %u, rounds %u, pending %u, control block %#"PRIx64").\n",
+                error, (int)hr, size, info.rounds, info.pending_rounds, info.control_offset);
+        if (error)
+        {
+            ID3D12StateObject_Release(pso);
+            return;
+        }
+    }
+    else
+    {
+        ok(FAILED(hr), "Got a round frame, but none was expected.\n");
     }
 
     /* 64 KiB more than the backing memory that the graph gets, with a pattern that nothing may write. */
@@ -4538,6 +4615,9 @@ static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3
         workgraph_set_fault(call->fault);
         ID3D12GraphicsCommandList10_DispatchGraph(list10, &dispatch_desc);
         workgraph_set_fault(NULL);
+        /* A bare case leaves the order of calls on the same backing memory to the work graph implementation. */
+        if (test->bare)
+            continue;
         uav_barrier(list, NULL);
 
         ID3D12GraphicsCommandList_SetPipelineState(list, cs_pso);
@@ -4561,8 +4641,8 @@ static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3
                 values[0]);
         ok(values[2] == 0, "Call %u: %u records have wrong contents.\n", i, values[2]);
         ok(values[3] == 0, "Call %u: %u records arrived more than once.\n", i, values[3]);
-        ok(values[8] == run[i], "Call %u: expected %u launches of the Dispatch after it, got %u.\n", i, run[i],
-                values[8]);
+        ok(values[8] == (run[i] && !test->bare), "Call %u: expected %u launches of the Dispatch after it, got %u.\n",
+                i, run[i] && !test->bare, values[8]);
 
         stall = WG_DRAIN_NO_STALL;
         if (call->fault && !strncmp(call->fault, "drain-stall:", 12))
@@ -4572,7 +4652,7 @@ static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3
             hook_calls += (call->predicate != WG_PREDICATE_NONE) + test->rounds;
 
         /* The control block of a backing memory shows its last call. */
-        if (has_drain && test->rounds && (i + 1 == test->call_count || !test->calls[i + 1].same_backing))
+        if (frame && test->rounds && (i + 1 == test->call_count || !test->calls[i + 1].same_backing))
         {
             vkd3d_test_set_context("Test %u, %s, call %u", index, test->limits, i);
             workgraph_read_buffer_range(context, backing[i], info.control_offset, sizeof(control),
@@ -4602,11 +4682,15 @@ static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3
         ok(!damaged, "%u words after backing memory %u were written.\n", damaged, i);
     }
 
-    if (has_drain && test->rounds)
+    if (frame && test->rounds)
     {
+        memset(&info, 0, sizeof(info));
         size = sizeof(info);
         hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &size, &info);
-        ok(hr == S_OK, "Failed to get the round frame, hr #%x.\n", (int)hr);
+        ok(hr == S_OK && size == sizeof(info), "Failed to get the round frame, hr #%x, size %u.\n", (int)hr, size);
+    }
+    if (frame && test->rounds && hr == S_OK && size == sizeof(info))
+    {
         ok(info.abandoned_events == events, "Expected %u abandonment events, got %u.\n", events,
                 info.abandoned_events);
         ok(info.abandoned_reasons == reasons, "Expected reasons %#x, got %#x.\n", reasons, info.abandoned_reasons);
@@ -4678,6 +4762,15 @@ void test_workgraph_drain_rounds(void)
                 CALL("drain-hook", NONE, EQ, false) }, 3 },
         { "rounds=2,pending=2,canary=1", 2, 2, true,
                 { CALL("drain-hook", 0, NE, false), CALL("drain-hook", 8, NE, false) }, 2 },
+        /* Executed, skipped and executed on one backing memory, with no application barrier between the calls:
+         * the third call must start from the state that the close of the first call left (B5). The first call
+         * must run, because a skipped call does not initialize the backing memory on every driver. */
+        { "rounds=2,pending=2,canary=1", 2, 2, false,
+                { CALL(NULL, 8, EQ, false), CALL(NULL, 0, EQ, true), CALL(NULL, 8, EQ, true) }, 3, true },
+        { "rounds=1,pending=2,canary=1", 1, 2, true,
+                { CALL(NULL, 0, NE, false), CALL(NULL, 8, NE, true), CALL(NULL, 0, NE, true) }, 3, true },
+        { "rounds=4,pending=5,canary=1", 4, 5, false,
+                { CALL("drain-stall:2", 8, EQ, false), CALL(NULL, 0, EQ, true), CALL(NULL, 8, EQ, true) }, 3, true },
     };
 #undef NE
 #undef EQ
@@ -4687,11 +4780,37 @@ void test_workgraph_drain_rounds(void)
     struct test_context_workgraph context;
     ID3D12PipelineState *cs_pso;
     ID3D12Resource *predicates;
+    bool is_engine, frame;
+    const char *env;
     unsigned int i;
     HRESULT hr;
 
+    workgraph_check_drain_admission();
+
     if (!init_workgraph_test_context(&context))
         return;
+
+    /* VKD3D_TEST_WORKGRAPH_DRAIN=frame requires the round frame, "none" requires that there is none (the release
+     * flavour or a native driver). If it is not set, the round frame is required on the amdgpu-wddm engine. */
+    is_engine = workgraph_is_vkd3d_proton(context.device);
+    env = getenv("VKD3D_TEST_WORKGRAPH_DRAIN");
+    if (!env || !env[0])
+        frame = is_engine;
+    else if (!strcmp(env, "frame") || !strcmp(env, "none"))
+        frame = !strcmp(env, "frame");
+    else
+    {
+        ok(false, "Unknown VKD3D_TEST_WORKGRAPH_DRAIN=%s.\n", env);
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (frame && !is_engine)
+    {
+        ok(false, "The round frame needs the amdgpu-wddm engine.\n");
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    trace("Round frame %s.\n", frame ? "required" : "not expected");
 
     cs_pso = create_compute_pipeline_state(context.context.device, context.default_root_uav_rs,
             drain_dispatch_dxil);
@@ -4699,8 +4818,14 @@ void test_workgraph_drain_rounds(void)
 
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
+        char name[16];
+
+        /* VKD3D_TEST_WORKGRAPH_CASE=case<i>. runs only case i. */
+        sprintf(name, "case%u.", i);
+        if (!workgraph_case_enabled(name))
+            continue;
         vkd3d_test_set_context("Test %u, %s", i, tests[i].limits);
-        workgraph_run_drain_case(&context, cs_pso, predicates, i, &tests[i]);
+        workgraph_run_drain_case(&context, cs_pso, predicates, i, &tests[i], frame);
     }
     vkd3d_test_set_context(NULL);
 
