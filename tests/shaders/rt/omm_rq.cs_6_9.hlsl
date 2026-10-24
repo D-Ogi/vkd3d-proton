@@ -12,19 +12,16 @@ struct Payload
 	float hits;
 };
 
+/* Ray N can only intersect triangle N % 8. Each step adds its value, so the result also
+ * counts non-opaque candidates, and a wrong primitive adds 64. */
+float check_primitive(uint primitive, uint thr, float value)
+{
+	return primitive == thr % 8 ? value : 64.0;
+}
+
 void MissShader(inout Payload payload)
 {
 	payload.hits += 0.125;
-}
-
-void ClosestHit(inout Payload payload)
-{
-	payload.hits = 1.0;
-}
-
-void AnyHit(inout Payload payload)
-{
-	payload.hits = 0.75;
 }
 
 [numthreads(64, 1, 1)]
@@ -47,13 +44,14 @@ void main(uint thr : SV_DispatchThreadID)
 	// Register the anyhit, but don't commit it as closest hit.
 	while (rq.Proceed())
 		if (rq.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
-			AnyHit(payload);
+			payload.hits += check_primitive(rq.CandidatePrimitiveIndex(), thr, 0.75);
 
 	if (rq.CommittedStatus() == COMMITTED_NOTHING)
 		MissShader(payload);
+	else if (rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+		payload.hits += check_primitive(rq.CommittedPrimitiveIndex(), thr, 1.0);
 	else
-		ClosestHit(payload);
+		payload.hits += 64.0;
 
 	Buf[thr] = payload.hits;
 }
-
