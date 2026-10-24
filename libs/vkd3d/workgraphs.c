@@ -33,6 +33,35 @@
 /* Size of each payload ring of a work graph state object. */
 #define VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE (128ull * 1024 * 1024)
 
+/* amdgpu-wddm fork, lab flavour only: AMDGPU_WDDM_WG_FAIL=<point> makes the creation of a work graph state object
+ * fail at that point, as if an allocation failed there, so that a test can run the cleanup of a partly built
+ * program. The points are "slots" (the recursion depth slots), "program" (the per-slot arrays of a program) and
+ * "pipeline:<n>" (before the pipelines of slot n of a program are created; the slots of the
+ * earlier levels have their pipelines then). */
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+static bool d3d12_wg_fault_injected(const char *point, unsigned int index)
+{
+    char value[64], expected[64];
+
+    if (!vkd3d_get_env_var("AMDGPU_WDDM_WG_FAIL", value, sizeof(value)))
+        return false;
+    if (index == UINT_MAX)
+        snprintf(expected, sizeof(expected), "%s", point);
+    else
+        snprintf(expected, sizeof(expected), "%s:%u", point, index);
+    if (strcmp(value, expected))
+        return false;
+
+    ERR("Work graph fault injection at %s.\n", expected);
+    return true;
+}
+#else
+static inline bool d3d12_wg_fault_injected(const char *point, unsigned int index)
+{
+    return false;
+}
+#endif
+
 /* This is arbitrary, but we have a trade-off to make.
  * If amplification count is low, we spawn very few redundant threads,
  * but occupancy might be too low if number of records is low.
@@ -214,7 +243,9 @@ static void d3d12_wg_state_object_free_programs(
             vkd3d_free(programs[i].levels[j].shared_nodes);
         }
 
-        for (j = 0; j < programs[i].num_pipelines; j++)
+        /* amdgpu-wddm fork: num_pipelines is set before the pipelines are allocated, and the creation of a
+         * state object can fail between the two. Every other per-slot array is freed without a look at it. */
+        for (j = 0; programs[i].pipelines && j < programs[i].num_pipelines; j++)
         {
             VK_CALL(vkDestroyPipeline(device->vk_device, programs[i].pipelines[j].vk_non_entry_pipeline, NULL));
             VK_CALL(vkDestroyPipeline(device->vk_device, programs[i].pipelines[j].vk_cpu_node_entry_pipeline, NULL));
@@ -572,7 +603,8 @@ static HRESULT d3d12_wg_state_object_program_add_node_to_level(
 
     if (level >= MAX_WORKGRAPH_LEVELS)
     {
-        FIXME("Recursion factor is too deep.\n");
+        /* amdgpu-wddm fork: ERR, because the release flavour removes FIXME lines. */
+        ERR("Work graph is deeper than %u nodes.\n", MAX_WORKGRAPH_LEVELS);
         return E_INVALIDARG;
     }
 
@@ -583,8 +615,9 @@ static HRESULT d3d12_wg_state_object_program_add_node_to_level(
         if (exec->nodes[i] == entry_point_index)
             return S_OK;
 
-    vkd3d_array_reserve((void **)&exec->nodes, &exec->nodes_size,
-            exec->nodes_count + 1, sizeof(*exec->nodes));
+    if (!vkd3d_array_reserve((void **)&exec->nodes, &exec->nodes_size,
+            exec->nodes_count + 1, sizeof(*exec->nodes)))
+        return E_OUTOFMEMORY;
     exec->nodes[exec->nodes_count++] = entry_point_index;
     program->num_levels = max(program->num_levels, level + 1);
 
@@ -622,8 +655,9 @@ static HRESULT d3d12_wg_state_object_program_add_node_to_level(
 
             if (j == exec->shared_nodes_count)
             {
-                vkd3d_array_reserve((void **)&exec->shared_nodes, &exec->shared_nodes_size,
-                        exec->shared_nodes_count + 1, sizeof(*exec->shared_nodes));
+                if (!vkd3d_array_reserve((void **)&exec->shared_nodes, &exec->shared_nodes_size,
+                        exec->shared_nodes_count + 1, sizeof(*exec->shared_nodes)))
+                    return E_OUTOFMEMORY;
                 exec->shared_nodes[exec->shared_nodes_count].node_pipeline_index = i;
                 exec->shared_nodes[exec->shared_nodes_count].node_payload_index = entry_point_index;
                 exec->shared_nodes_count++;
@@ -894,13 +928,31 @@ static HRESULT d3d12_wg_state_object_program_init_slots(
         const struct d3d12_wg_state_object_data *data)
 {
     unsigned int num_slots, slot, depth;
+    uint64_t total;
     uint32_t factor;
     size_t i;
 
-    num_slots = data->entry_points_count;
+    /* A graph has at most 0xffffff node slots, recursion depths included, and a chain of at most 32 nodes
+     * (WorkGraphs.md, Node count limits). Reject other values before the slot arrays are sized from them. */
+    total = data->entry_points_count;
     for (i = 0; i < data->entry_points_count; i++)
-        if (data->entry_points[i].node_input)
-            num_slots += data->entry_points[i].node_input->recursion_factor;
+    {
+        if (!data->entry_points[i].node_input)
+            continue;
+        factor = data->entry_points[i].node_input->recursion_factor;
+        if (factor > MAX_WORKGRAPH_LEVELS)
+        {
+            ERR("Node recursion depth %u is above %u.\n", factor, MAX_WORKGRAPH_LEVELS);
+            return E_INVALIDARG;
+        }
+        total += factor;
+    }
+    if (total > 0xffffff)
+    {
+        ERR("Work graph has %"PRIu64" node slots, more than 0xffffff.\n", total);
+        return E_INVALIDARG;
+    }
+    num_slots = total;
 
     program->num_nodes = data->entry_points_count;
     program->num_pipelines = num_slots;
@@ -908,6 +960,11 @@ static HRESULT d3d12_wg_state_object_program_init_slots(
     program->slot_depth = vkd3d_malloc(max(num_slots, 1) * sizeof(*program->slot_depth));
     program->recursion_slot_base = vkd3d_malloc(max(data->entry_points_count, 1) *
             sizeof(*program->recursion_slot_base));
+    if (d3d12_wg_fault_injected("slots", UINT_MAX))
+    {
+        vkd3d_free(program->slot_depth);
+        program->slot_depth = NULL;
+    }
     if (!program->slot_entry || !program->slot_depth || !program->recursion_slot_base)
         return E_OUTOFMEMORY;
 
@@ -2277,6 +2334,14 @@ static HRESULT d3d12_wg_state_object_compile_program(
     program->coalesce_dividers_or_amp = vkd3d_calloc(program->num_pipelines, sizeof(int32_t));
     program->share_mapping = vkd3d_malloc(program->num_pipelines * sizeof(uint32_t));
     program->payload_expander_meta = vkd3d_calloc(program->num_pipelines, sizeof(struct d3d12_wg_payload_expander_meta));
+    if (d3d12_wg_fault_injected("program", UINT_MAX))
+    {
+        vkd3d_free(program->share_mapping);
+        program->share_mapping = NULL;
+    }
+    if (!program->pipelines || !program->coalesce_dividers_or_amp ||
+            !program->share_mapping || !program->payload_expander_meta)
+        return E_OUTOFMEMORY;
 
     for (i = 0; i < program->num_pipelines; i++)
         program->share_mapping[i] = UINT32_MAX;
@@ -2389,8 +2454,15 @@ static HRESULT d3d12_wg_state_object_compile_program(
     {
         const struct d3d12_workgraph_level_execution *exec = &program->levels[level];
         for (i = 0; i < exec->nodes_count; i++)
+        {
+            if (d3d12_wg_fault_injected("pipeline", exec->nodes[i]))
+            {
+                hr = E_OUTOFMEMORY;
+                goto fail;
+            }
             if (FAILED(hr = d3d12_wg_state_object_compile_pipeline(object, data, program, exec->nodes[i], &tmp)))
                 goto fail;
+        }
 
         for (i = 0; i < exec->shared_nodes_count; i++)
             if (FAILED(hr = d3d12_wg_state_object_compile_pipeline(object, data, program, exec->shared_nodes[i].node_pipeline_index, &tmp)))
@@ -2636,7 +2708,8 @@ static HRESULT d3d12_wg_state_object_compile_programs(
      * an entry point and non-entry point and there are overrides for dispatch parameters.
      * Many things can hopefully be resolved through spec constants of course, but we'll have to see
      * as the implementation comes together. */
-    object->modules = vkd3d_calloc(data->entry_points_count, sizeof(*object->modules));
+    if (!(object->modules = vkd3d_calloc(data->entry_points_count, sizeof(*object->modules))))
+        return E_OUTOFMEMORY;
     object->modules_count = data->entry_points_count;
 
     for (i = 0; i < data->entry_points_count; i++)
