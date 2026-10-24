@@ -155,8 +155,9 @@ struct amdgpu_wddm_wg_drain
 };
 
 /* amdgpu-wddm fork, lab flavour only: GetPrivateData with this GUID gives struct amdgpu_wddm_wg_pools of the first
- * program, for test_workgraph_drain_layout: W of each pool, Min and Max of the pool layout, and the layouts with Min,
- * Min + one granule and Max of backing memory. */
+ * program, for test_workgraph_drain_layout: W of each pool, Min and Max of the pool layout, and the layouts with
+ * Min - 16 bytes (none), Min, Min + one granule + 8 bytes, Max and Max + one granule of backing memory. The empty-record
+ * state has no size yet, so Min is not the final Min of the scheduler. */
 static const GUID amdgpu_wddm_wg_pool_guid =
         { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x08 } };
 
@@ -185,7 +186,7 @@ struct amdgpu_wddm_wg_pools
         struct amdgpu_wddm_wg_region isolated[MAX_WORKGRAPH_LEVELS][2][D3D12_WG_POOL_COMPONENT_COUNT];
         struct amdgpu_wddm_wg_region arena[2][D3D12_WG_POOL_COMPONENT_COUNT];
         struct amdgpu_wddm_wg_region staging;
-    } layouts[3];
+    } layouts[5];
 };
 #endif
 
@@ -227,6 +228,10 @@ struct d3d12_wg_multi_input_config
      * pending=<k> (test hook): the pending dispatches of the rounds below k report waiting work. */
     uint32_t drain_rounds;
     uint32_t drain_pending;
+    /* pool_records=<n>, pool_stride=<bytes> (test hook): each output with a payload counts n records of that stride in
+     * the record pools, so that a test reaches the 64-bit bounds and Max = Min. Execution does not use the pools. */
+    uint32_t pool_records;
+    uint32_t pool_stride;
     uint32_t large_size;
     uint32_t groups;
 };
@@ -245,6 +250,8 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
     config->canaries = false;
     config->drain_rounds = 0;
     config->drain_pending = 0;
+    config->pool_records = 0;
+    config->pool_stride = 0;
     config->large_size = VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE;
     config->groups = VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS;
 
@@ -268,13 +275,18 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
                 config->drain_rounds = n;
             else if (!strncmp(p, "pending=", 8) && (n = strtoull(p + 8, NULL, 0)) <= VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS + 1)
                 config->drain_pending = n;
+            else if (!strncmp(p, "pool_records=", 13) && (n = strtoull(p + 13, NULL, 0)) <= UINT32_MAX)
+                config->pool_records = n;
+            else if (!strncmp(p, "pool_stride=", 12) && (n = strtoull(p + 12, NULL, 0)) <= UINT32_MAX)
+                config->pool_stride = n;
             else
                 WARN("Ignoring %s in AMDGPU_WDDM_WG_LIMITS.\n", p);
         }
 
         WARN("Work graph limits: payload ring %"PRIu64" bytes, packed offset limit %u, canaries %u, "
-                "extra rounds %u, pending hook %u.\n", config->ring_size, config->packed_limit, config->canaries,
-                config->drain_rounds, config->drain_pending);
+                "extra rounds %u, pending hook %u, pool records %u, pool stride %u.\n", config->ring_size,
+                config->packed_limit, config->canaries, config->drain_rounds, config->drain_pending, config->pool_records,
+                config->pool_stride);
     }
 
     if (!vkd3d_get_env_var("AMDGPU_WDDM_WG_MULTI_INPUT", value, sizeof(value)))
@@ -466,6 +478,8 @@ struct d3d12_wg_state_object_program
      * maximum of the W of the producer items of level L - 1. pool_valid is false if the metadata gave no bound; the
      * pools are then not used. pool_arena_payload is the payload bytes per record of the arena. */
     bool pool_valid;
+    uint32_t pool_test_records;
+    uint32_t pool_test_stride;
     uint64_t pool_w[MAX_WORKGRAPH_LEVELS][D3D12_WG_POOL_COMPONENT_COUNT];
     VkDeviceSize pool_fixed_size;
     VkDeviceSize pool_staging_size;
@@ -2157,9 +2171,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
                 pools->min_size = program->pool_min_size;
                 pools->max_size = program->pool_max_size;
                 memcpy(pools->w, program->pool_w, sizeof(pools->w));
-                pools->layouts[0].size = program->pool_min_size;
-                pools->layouts[1].size = program->pool_min_size + VKD3D_WORKGRAPH_BACKING_GRANULARITY;
-                pools->layouts[2].size = program->pool_max_size;
+                pools->layouts[0].size = program->pool_min_size - 16;
+                pools->layouts[1].size = program->pool_min_size;
+                pools->layouts[2].size = program->pool_min_size + VKD3D_WORKGRAPH_BACKING_GRANULARITY + 8;
+                pools->layouts[3].size = program->pool_max_size;
+                pools->layouts[4].size = program->pool_max_size + VKD3D_WORKGRAPH_BACKING_GRANULARITY;
                 for (n = 0; n < ARRAY_SIZE(pools->layouts); n++)
                 {
                     if (!d3d12_wg_drain_layout(program, pools->layouts[n].size, &layout))
@@ -2977,12 +2993,16 @@ static bool d3d12_wg_state_object_program_item_w(const struct d3d12_wg_state_obj
             if (node_index == program->slot_entry[slot] && program->slot_depth[slot] >= target->recursion_factor)
                 continue;
             stride = align64(target->payload_stride, 16);
+            if (stride && program->pool_test_stride)
+                stride = align64(program->pool_test_stride, 16);
             max_stride = max(max_stride, stride);
         }
         if (!max_stride)
             continue;
 
         records = output->max_records ? output->max_records : largest;
+        if (program->pool_test_records)
+            records = program->pool_test_records;
         payload = records * max_stride;
         if (entry->node_input->launch_type == VKD3D_SHADER_NODE_LAUNCH_TYPE_THREAD)
         {
@@ -3416,6 +3436,8 @@ static HRESULT d3d12_wg_state_object_compile_program(
     add_fixed(output_guard_scratch);
 #undef add_fixed
     program->pool_staging_size = program->multi_input_staging_min_size;
+    program->pool_test_records = multi_input_config.pool_records;
+    program->pool_test_stride = multi_input_config.pool_stride;
     d3d12_wg_state_object_program_compute_pools(program, data);
 
     for (level = 0; level < program->num_levels; level++)
