@@ -81,6 +81,8 @@ enum vkd3d_meta_copy_mode
 #include <cs_workgraph_distribute_payload_offsets.h>
 #include <cs_workgraph_complete_compaction.h>
 #include <cs_workgraph_setup_gpu_input.h>
+#include <cs_workgraph_multi_gpu_input_prepare.h>
+#include <cs_workgraph_multi_gpu_input_copy.h>
 #include <cs_gdeflate.h>
 #include <cs_gdeflate_prepare.h>
 

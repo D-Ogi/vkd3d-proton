@@ -5575,6 +5575,31 @@ struct vkd3d_workgraph_setup_gpu_input_args
     uint32_t num_entry_points;
 };
 
+/* amdgpu-wddm fork: D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT (cs_workgraph_multi_gpu_input_*.comp).
+ * The state buffer holds the copy arguments (32 bytes), the totals and the cursors (each N u32, aligned to
+ * 16 bytes), then N D3D12_NODE_GPU_INPUT, for N entry points. Meta push data is limited to 64 bytes. */
+struct vkd3d_workgraph_multi_gpu_input_prepare_args
+{
+    VkDeviceAddress multi_input_va;
+    VkDeviceAddress record_strides_va;
+    VkDeviceAddress state_va;
+    VkDeviceAddress dest_va;
+    VkDeviceSize dest_capacity;
+    uint32_t num_entry_points;
+};
+
+struct vkd3d_workgraph_multi_gpu_input_copy_args
+{
+    VkDeviceAddress multi_input_va;
+    VkDeviceAddress state_va;
+    uint32_t num_entry_points;
+};
+
+static inline VkDeviceSize vkd3d_workgraph_multi_gpu_input_counters_size(uint32_t num_entry_points)
+{
+    return (num_entry_points * sizeof(uint32_t) + 15) & ~(VkDeviceSize)15;
+}
+
 struct vkd3d_workgraph_indirect_pipeline
 {
     uint32_t component_count;
@@ -5594,6 +5619,10 @@ struct vkd3d_workgraph_indirect_ops
     VkPipeline vk_setup_gpu_input_pipeline;
     VkPipeline vk_payload_offset_pipeline;
     VkPipeline vk_complete_compaction_pipeline;
+    VkPipelineLayout vk_multi_gpu_input_prepare_layout;
+    VkPipelineLayout vk_multi_gpu_input_copy_layout;
+    VkPipeline vk_multi_gpu_input_prepare_pipeline;
+    VkPipeline vk_multi_gpu_input_copy_pipeline;
 };
 
 struct vkd3d_meta_ops
@@ -5691,6 +5720,13 @@ void vkd3d_meta_get_workgraph_payload_offset_pipeline(struct vkd3d_meta_ops *met
         struct vkd3d_workgraph_meta_pipeline_info *info);
 void vkd3d_meta_get_workgraph_complete_compaction_pipeline(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_workgraph_meta_pipeline_info *info);
+void vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *prepare, struct vkd3d_workgraph_meta_pipeline_info *copy);
+
+static inline uint32_t vkd3d_meta_get_workgraph_multi_gpu_input_copy_max_groups_x(void)
+{
+    return 65535;
+}
 
 static inline uint32_t vkd3d_meta_get_workgraph_setup_gpu_input_workgroup_size(void)
 {

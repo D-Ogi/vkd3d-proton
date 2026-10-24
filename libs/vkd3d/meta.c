@@ -2421,6 +2421,29 @@ static HRESULT vkd3d_workgraph_ops_init(struct vkd3d_workgraph_indirect_ops *wor
             &spec_info, true, NULL, &workgraph_ops->vk_setup_gpu_input_pipeline)))
         return hresult_from_vk_result(vr);
 
+    /* amdgpu-wddm fork: D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT. */
+    push_range.size = sizeof(struct vkd3d_workgraph_multi_gpu_input_prepare_args);
+    if ((vr = vkd3d_meta_create_pipeline_layout(device,
+            0, NULL, &push_range,
+            &workgraph_ops->vk_multi_gpu_input_prepare_layout)))
+        return hresult_from_vk_result(vr);
+
+    push_range.size = sizeof(struct vkd3d_workgraph_multi_gpu_input_copy_args);
+    if ((vr = vkd3d_meta_create_pipeline_layout(device,
+            0, NULL, &push_range,
+            &workgraph_ops->vk_multi_gpu_input_copy_layout)))
+        return hresult_from_vk_result(vr);
+
+    if ((vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_workgraph_multi_gpu_input_prepare),
+            cs_workgraph_multi_gpu_input_prepare, workgraph_ops->vk_multi_gpu_input_prepare_layout,
+            NULL, true, NULL, &workgraph_ops->vk_multi_gpu_input_prepare_pipeline)))
+        return hresult_from_vk_result(vr);
+
+    if ((vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_workgraph_multi_gpu_input_copy),
+            cs_workgraph_multi_gpu_input_copy, workgraph_ops->vk_multi_gpu_input_copy_layout,
+            NULL, true, NULL, &workgraph_ops->vk_multi_gpu_input_copy_pipeline)))
+        return hresult_from_vk_result(vr);
+
     return S_OK;
 }
 
@@ -2481,6 +2504,19 @@ static void vkd3d_workgraph_ops_cleanup(struct vkd3d_workgraph_indirect_ops *wor
     VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_setup_gpu_input_pipeline, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_payload_offset_pipeline, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_complete_compaction_pipeline, NULL));
+    VK_CALL(vkDestroyPipelineLayout(device->vk_device, workgraph_ops->vk_multi_gpu_input_prepare_layout, NULL));
+    VK_CALL(vkDestroyPipelineLayout(device->vk_device, workgraph_ops->vk_multi_gpu_input_copy_layout, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_multi_gpu_input_prepare_pipeline, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_multi_gpu_input_copy_pipeline, NULL));
+}
+
+void vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *prepare, struct vkd3d_workgraph_meta_pipeline_info *copy)
+{
+    prepare->vk_pipeline_layout = meta_ops->workgraph.vk_multi_gpu_input_prepare_layout;
+    prepare->vk_pipeline = meta_ops->workgraph.vk_multi_gpu_input_prepare_pipeline;
+    copy->vk_pipeline_layout = meta_ops->workgraph.vk_multi_gpu_input_copy_layout;
+    copy->vk_pipeline = meta_ops->workgraph.vk_multi_gpu_input_copy_pipeline;
 }
 
 void vkd3d_meta_get_workgraph_workgroup_pipeline(struct vkd3d_meta_ops *meta_ops,

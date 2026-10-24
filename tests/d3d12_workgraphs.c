@@ -542,7 +542,7 @@ static void execute_workgraph_test(struct test_context_workgraph *context,
         expected = desc->expected_cb(desc, i);
         v = get_readback_uint(&rb, i, 0, 0);
 
-        bug_if(desc->is_bug) todo_if(expected != 0 && desc->mode == D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT)
+        bug_if(desc->is_bug)
         ok(expected == v, "Value %u: expected %u, got %u.\n", i, expected, v);
     }
 
@@ -890,6 +890,10 @@ void test_workgraph_thread_input(void)
         vkd3d_test_set_context("GPU");
         desc.mode = D3D12_DISPATCH_MODE_NODE_GPU_INPUT;
         execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
+        /* amdgpu-wddm fork: the multi GPU input path copies the records of each input. */
+        vkd3d_test_set_context("Multi GPU");
+        desc.mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+        execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
     }
 
     ID3D12StateObject_Release(pso);
@@ -940,6 +944,10 @@ void test_workgraph_coalesced_input(void)
         execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
         vkd3d_test_set_context("GPU");
         desc.mode = D3D12_DISPATCH_MODE_NODE_GPU_INPUT;
+        execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
+        /* amdgpu-wddm fork: the multi GPU input path copies the records of each input. */
+        vkd3d_test_set_context("Multi GPU");
+        desc.mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
         execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
     }
 

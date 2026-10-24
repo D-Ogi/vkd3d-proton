@@ -1,0 +1,120 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// amdgpu-wddm fork: second pass of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT.
+// One workgroup per D3D12_NODE_GPU_INPUT of the multi input array. The workgroup takes a part of the range
+// of its entry point (prepared by cs_workgraph_multi_gpu_input_prepare.comp) and copies its records there.
+// The order of the records in a range is not defined, as the order of records in a work graph is not defined.
+layout(local_size_x = 64) in;
+
+struct GPUInput
+{
+	uint entry_point_index;
+	uint num_records;
+	uint64_t records_va;
+	uint64_t records_stride;
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer MultiInput
+{
+	uint num_node_inputs;
+	uint padding;
+	uint64_t inputs_va;
+	uint64_t inputs_stride;
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer InputRef
+{
+	GPUInput value;
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) buffer Counters
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer SynthInputs
+{
+	GPUInput data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) buffer Dword
+{
+	uint value;
+};
+
+// State layout: struct vkd3d_workgraph_multi_gpu_input_prepare_args in vkd3d_private.h.
+layout(push_constant) uniform Registers
+{
+	MultiInput multi_input;
+	uint64_t state_va;
+	uint num_entry_points;
+} registers;
+
+const uint MAX_GROUPS_X = 65535u;
+
+shared uint shared_count;
+shared uint shared_first;
+shared uint shared_entry;
+shared uint64_t shared_src_va;
+shared uint64_t shared_src_stride;
+
+void main()
+{
+	uint64_t counters_size = uint64_t((registers.num_entry_points * 4u + 15u) & ~15u);
+	Counters cursors = Counters(registers.state_va + 32ul + counters_size);
+	SynthInputs synth_inputs = SynthInputs(registers.state_va + 32ul + 2ul * counters_size);
+	uint input_index = gl_WorkGroupID.y * MAX_GROUPS_X + gl_WorkGroupID.x;
+	if (input_index >= registers.multi_input.num_node_inputs)
+		return;
+
+	if (gl_LocalInvocationIndex == 0u)
+	{
+		InputRef node_input = InputRef(registers.multi_input.inputs_va +
+				uint64_t(input_index) * registers.multi_input.inputs_stride);
+		uint e = node_input.value.entry_point_index;
+		uint num = node_input.value.num_records;
+		uint count = 0u;
+		uint first = 0u;
+
+		if (e < registers.num_entry_points && num != 0u)
+		{
+			first = atomicAdd(cursors.data[e], num);
+			uint limit = synth_inputs.data[e].num_records;
+			if (first < limit)
+				count = min(num, limit - first);
+		}
+
+		shared_count = count;
+		shared_first = first;
+		shared_entry = e;
+		shared_src_va = node_input.value.records_va;
+		shared_src_stride = node_input.value.records_stride;
+	}
+
+	barrier();
+
+	uint count = shared_count;
+	if (count == 0u)
+		return;
+
+	GPUInput synth = synth_inputs.data[shared_entry];
+	uint dst_stride = uint(synth.records_stride);
+	uint dwords = dst_stride / 4u;
+	if (dwords == 0u)
+		return;
+
+	// The destination stride is the record size, aligned to 4 bytes. A source stride of 0 repeats one record.
+	uint64_t dst_va = synth.records_va + uint64_t(shared_first) * uint64_t(dst_stride);
+	uint total = count * dwords;
+
+	for (uint t = gl_LocalInvocationIndex; t < total; t += gl_WorkGroupSize.x)
+	{
+		uint record = t / dwords;
+		uint dword = t - record * dwords;
+		Dword src = Dword(shared_src_va + uint64_t(record) * shared_src_stride + uint64_t(dword) * 4ul);
+		Dword dst = Dword(dst_va + uint64_t(record) * uint64_t(dst_stride) + uint64_t(dword) * 4ul);
+		dst.value = src.value;
+	}
+}

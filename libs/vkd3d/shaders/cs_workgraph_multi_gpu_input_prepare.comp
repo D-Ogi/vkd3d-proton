@@ -1,0 +1,129 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// amdgpu-wddm fork: first pass of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT.
+// One invocation reads the D3D12_MULTI_NODE_GPU_INPUT array from GPU memory, counts the records of each
+// entry point, and gives each entry point one contiguous range in the destination ring.
+// For each entry point it writes one D3D12_NODE_GPU_INPUT that points to that range, so that the normal
+// NODE_GPU_INPUT path can execute it. It also writes the indirect arguments of the copy pass.
+// The record count of the inputs is only in GPU memory, so the CPU cannot do this.
+layout(local_size_x = 1) in;
+
+// D3D12_NODE_GPU_INPUT, 24 bytes.
+struct GPUInput
+{
+	uint entry_point_index;
+	uint num_records;
+	uint64_t records_va;
+	uint64_t records_stride;
+};
+
+// D3D12_MULTI_NODE_GPU_INPUT, 24 bytes.
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer MultiInput
+{
+	uint num_node_inputs;
+	uint padding;
+	uint64_t inputs_va;
+	uint64_t inputs_stride;
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer InputRef
+{
+	GPUInput value;
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer Strides
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) buffer Counters
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) writeonly buffer SynthInputs
+{
+	GPUInput data[];
+};
+
+// x, y, z: indirect dispatch of the copy pass. w: number of inputs. Then the overflow flag.
+layout(buffer_reference, buffer_reference_align = 16, std430) writeonly buffer CopyArgs
+{
+	uvec4 dispatch_and_count;
+	uint overflow;
+};
+
+// State layout: struct vkd3d_workgraph_multi_gpu_input_prepare_args in vkd3d_private.h.
+layout(push_constant) uniform Registers
+{
+	MultiInput multi_input;
+	Strides record_strides;
+	uint64_t state_va;
+	uint64_t dest_va;
+	uint64_t dest_capacity;
+	uint num_entry_points;
+} registers;
+
+const uint MAX_GROUPS_X = 65535u;
+
+void main()
+{
+	uint num_inputs = registers.multi_input.num_node_inputs;
+	uint64_t inputs_va = registers.multi_input.inputs_va;
+	uint64_t inputs_stride = registers.multi_input.inputs_stride;
+	uint num_entries = registers.num_entry_points;
+	uint64_t counters_size = uint64_t((num_entries * 4u + 15u) & ~15u);
+	CopyArgs copy_args = CopyArgs(registers.state_va);
+	Counters totals = Counters(registers.state_va + 32ul);
+	Counters cursors = Counters(registers.state_va + 32ul + counters_size);
+	SynthInputs synth_inputs = SynthInputs(registers.state_va + 32ul + 2ul * counters_size);
+	uint64_t offset = 0;
+	uint overflow = 0u;
+
+	for (uint e = 0u; e < num_entries; e++)
+	{
+		totals.data[e] = 0u;
+		cursors.data[e] = 0u;
+	}
+
+	// An entry point index out of range is an application error. Such an input is ignored.
+	for (uint i = 0u; i < num_inputs; i++)
+	{
+		InputRef node_input = InputRef(inputs_va + uint64_t(i) * inputs_stride);
+		uint e = node_input.value.entry_point_index;
+		if (e < num_entries)
+			totals.data[e] += node_input.value.num_records;
+	}
+
+	for (uint e = 0u; e < num_entries; e++)
+	{
+		uint stride = registers.record_strides.data[e];
+		uint total = totals.data[e];
+		uint64_t bytes = uint64_t(total) * uint64_t(stride);
+
+		// The ring has a fixed size, as the payload rings of the other levels. Records that do not fit
+		// are dropped, and the overflow flag is set, so that memory outside the ring is never written.
+		if (stride != 0u && offset + bytes > registers.dest_capacity)
+		{
+			uint64_t room = registers.dest_capacity > offset ? registers.dest_capacity - offset : 0ul;
+			total = uint(room / uint64_t(stride));
+			bytes = uint64_t(total) * uint64_t(stride);
+			overflow = 1u;
+		}
+
+		GPUInput synth;
+		synth.entry_point_index = e;
+		synth.num_records = total;
+		synth.records_va = registers.dest_va + offset;
+		synth.records_stride = uint64_t(stride);
+		synth_inputs.data[e] = synth;
+
+		offset = (offset + bytes + 15ul) & ~15ul;
+	}
+
+	uint groups_y = (num_inputs + MAX_GROUPS_X - 1u) / MAX_GROUPS_X;
+	copy_args.dispatch_and_count = uvec4(min(num_inputs, MAX_GROUPS_X), groups_y, 1u, num_inputs);
+	copy_args.overflow = overflow;
+}
