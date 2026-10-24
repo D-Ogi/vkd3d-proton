@@ -9911,7 +9911,11 @@ bool d3d12_device_supports_workgraphs(const struct d3d12_device *device)
 {
     /* Thread nodes currently need wave32 to function correctly since the API limits for thread nodes
      * match wave32 expectations (8 nodes per thread * 32 threads = 256 max nodes). */
+    /* amdgpu-wddm fork: VKD3D_CONFIG=workgraphs enables work graphs alone. enable_experimental_features also
+     * enables other features (SM 6.9, maintenance8 behaviour), which a device must not report for this one.
+     * The device conditions below stay the same for every switch. */
     return (VKD3D_CONFIG_FLAG_IS_SET(ENABLE_EXPERIMENTAL_FEATURES) ||
+            VKD3D_CONFIG_FLAG_IS_SET(WORKGRAPHS) ||
             vkd3d_debug_control_is_test_suite()) &&
             d3d12_device_use_descriptor_heap(device) &&
             device->device_info.shader_maximal_reconvergence_features.shaderMaximalReconvergence &&
