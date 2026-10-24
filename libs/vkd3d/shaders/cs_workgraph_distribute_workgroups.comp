@@ -45,12 +45,34 @@ layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer Nod
 	uint data[];
 };
 
+// amdgpu-wddm fork: struct vkd3d_workgraph_output_guard.
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer OutputGuard
+{
+	uint payload_capacity;
+	uint packed_capacity;
+	uvec2 reserved0;
+	uint dropped_records;
+	uint reserved1;
+	uvec2 sink;
+};
+
+// amdgpu-wddm fork: struct vkd3d_workgraph_lost_records.
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer LostRecords
+{
+	uint events;
+	uint records_lo;
+	uint records_hi;
+	uint padding;
+};
+
 layout(push_constant, std430) uniform Registers
 {
 	NodeAtomics atomics;
 	IndirectCommandsBuffer commands;
 	DividersOrAmplification dividers;
 	NodeShareMapping node_share_mapping;
+	OutputGuard output_guard;
+	LostRecords lost_records;
 	uint num_nodes;
 } registers;
 
@@ -189,7 +211,19 @@ void main()
 	// Also, have a single thread emit the fused expander kernel.
 	if (subgroupElect())
 	{
-		uint fused = registers.atomics.fused_atomic;
+		// amdgpu-wddm fork: the node output allocator counts entries past the capacity, but does not write them.
+		uint fused = min(registers.atomics.fused_atomic, registers.output_guard.packed_capacity);
+
+		// amdgpu-wddm fork: the records of the previous level that did not fit go to the report of the state object.
+		uint dropped = registers.output_guard.dropped_records;
+		if (dropped != 0u)
+		{
+			registers.output_guard.dropped_records = 0u;
+			uint old = atomicAdd(registers.lost_records.records_lo, dropped);
+			if (old + dropped < old)
+				atomicAdd(registers.lost_records.records_hi, 1u);
+			atomicAdd(registers.lost_records.events, 1u);
+		}
 
 		const uint FUSE_LIMIT = REQUIRE_WG_DIVIDER ? 0xffffu : 0xffffffu;
 

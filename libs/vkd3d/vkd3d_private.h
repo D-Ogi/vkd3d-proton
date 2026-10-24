@@ -5560,7 +5560,28 @@ struct vkd3d_workgraph_workgroups_args
     VkDeviceAddress commands_va;
     VkDeviceAddress dividers_va;
     VkDeviceAddress node_share_mapping_va;
+    /* amdgpu-wddm fork: struct vkd3d_workgraph_output_guard of the execution, and
+     * struct vkd3d_workgraph_lost_records of the state object. */
+    VkDeviceAddress output_guard_va;
+    VkDeviceAddress lost_records_va;
     uint32_t num_nodes;
+};
+
+/* amdgpu-wddm fork: the output bounds of a work graph level, the last 32 bytes of the required scratch memory, just
+ * before the packed offsets. The node output allocator of dxil-spirv (build_allocate_node_records and
+ * build_increment_node_count) finds it at AllocationOffset - 8 words. An allocation that would take the payload
+ * past payload_capacity, or a packed offset entry past packed_capacity, is not counted: its records go to
+ * dropped_records, its payload to the sink after the payload ring and its packed offset to sink[]. Empty records
+ * count 4 bytes against payload_capacity, so that the records of a level fit in the unrolled offsets.
+ * The workgroup distributor reports dropped_records after each level and clears it. */
+struct vkd3d_workgraph_output_guard
+{
+    uint32_t payload_capacity;
+    uint32_t packed_capacity;
+    uint32_t reserved0[2];
+    uint32_t dropped_records;
+    uint32_t reserved1;
+    uint32_t sink[2];
 };
 
 /* If the implementation supports 16M workgroups (arbitrarily chosen large number),
@@ -5628,8 +5649,10 @@ struct vkd3d_workgraph_multi_gpu_input_prepare_args
     uint32_t padding;
 };
 
-/* amdgpu-wddm fork: the records that the merge slots did not launch, for all executions of a state object. The
- * layout pass adds to it with atomics. The memory is host-visible, so that the CPU can report the loss. */
+/* amdgpu-wddm fork: the records that a work graph did not launch, for all executions of a state object. The
+ * layout pass of the multi GPU input adds the records that the merge slots did not take, and the workgroup
+ * distributor adds the node outputs of a level that did not fit (struct vkd3d_workgraph_output_guard). Each adds
+ * one event. The memory is host-visible, so that the CPU can report the loss. */
 struct vkd3d_workgraph_lost_records
 {
     uint32_t events;
