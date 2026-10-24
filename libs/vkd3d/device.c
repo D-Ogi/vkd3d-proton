@@ -8338,16 +8338,39 @@ cleanup:
     }
 }
 
+STATIC_ASSERT(offsetof(D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER, DriverOpaqueVersioningData) == VK_UUID_SIZE);
+STATIC_ASSERT(sizeof(D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER) == 2 * VK_UUID_SIZE);
+
 static D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE d3d12_device_CheckDriverMatchingIdentifier(d3d12_device_iface *iface,
         D3D12_SERIALIZED_DATA_TYPE serialized_data_type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *identifier)
 {
-    FIXME("iface %p, serialized_data_type %u, identifier %p stub!\n",
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkAccelerationStructureCompatibilityKHR compatibility;
+    VkAccelerationStructureVersionInfoKHR version_info;
+
+    TRACE("iface %p, serialized_data_type %u, identifier %p.\n",
             iface, serialized_data_type, identifier);
 
-    if (serialized_data_type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE)
+    if (serialized_data_type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE ||
+            !d3d12_device_supports_ray_tracing_tier_1_0(device))
         return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
 
-    return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+    /* The identifier is the first 2 * VK_UUID_SIZE bytes of the Vulkan serialized header:
+     * driverUUID, then the compatibility data of vkGetDeviceAccelerationStructureCompatibilityKHR.
+     * This covers TLAS, BLAS and opacity micromap arrays. */
+    if (memcmp(&identifier->DriverOpaqueGUID, device->device_info.vulkan_1_1_properties.driverUUID, VK_UUID_SIZE))
+        return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+
+    memset(&version_info, 0, sizeof(version_info));
+    version_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_VERSION_INFO_KHR;
+    version_info.pVersionData = (const uint8_t *)identifier;
+    VK_CALL(vkGetDeviceAccelerationStructureCompatibilityKHR(device->vk_device, &version_info, &compatibility));
+
+    /* Same driver, so a refusal means another version of it. */
+    return compatibility == VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR ?
+            D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE :
+            D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_SetBackgroundProcessingMode(d3d12_device_iface *iface,

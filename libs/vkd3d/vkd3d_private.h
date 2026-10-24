@@ -7488,6 +7488,9 @@ void vkd3d_acceleration_structure_copy(
         D3D12_GPU_VIRTUAL_ADDRESS dst, VkAccelerationStructureKHR src_as,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode,
         enum vkd3d_rtas_kind rtas_kind);
+void vkd3d_acceleration_structure_deserialize(
+        struct d3d12_command_list *list,
+        D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src);
 
 bool vkd3d_opacity_micromap_convert_inputs(const struct d3d12_device *device,
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *inputs,

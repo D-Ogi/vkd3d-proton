@@ -569,8 +569,24 @@ void vkd3d_acceleration_structure_copy(
         enum vkd3d_rtas_kind rtas_kind)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkCopyAccelerationStructureToMemoryInfoKHR serialize_info;
     VkCopyAccelerationStructureInfoKHR info;
     VkAccelerationStructureKHR dst_as;
+
+    if (mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE)
+    {
+        /* The D3D12 serialized layout (D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER1, then the
+         * BLAS pointers of a TLAS or the D3D12_RAYTRACING_SERIALIZED_BLOCK lists of a BLAS) is the Vulkan
+         * serialized layout, so the destination takes the Vulkan output as is.
+         * The destination is a buffer in UNORDERED_ACCESS state, not an acceleration structure. */
+        memset(&serialize_info, 0, sizeof(serialize_info));
+        serialize_info.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_TO_MEMORY_INFO_KHR;
+        serialize_info.src = src_as;
+        serialize_info.dst.deviceAddress = dst;
+        serialize_info.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_SERIALIZE_KHR;
+        VK_CALL(vkCmdCopyAccelerationStructureToMemoryKHR(list->cmd.vk_command_buffer, &serialize_info));
+        return;
+    }
 
     dst_as = vkd3d_va_map_place_acceleration_structure(&list->device->memory_allocator.va_map, list->device, dst, rtas_kind);
 
@@ -590,6 +606,52 @@ void vkd3d_acceleration_structure_copy(
     info.src = src_as;
 
     VK_CALL(vkCmdCopyAccelerationStructureKHR(list->cmd.vk_command_buffer, &info));
+}
+
+void vkd3d_acceleration_structure_deserialize(
+        struct d3d12_command_list *list,
+        D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkCopyMemoryToAccelerationStructureInfoKHR info;
+    VkAccelerationStructureKHR dst_as;
+    VkDependencyInfo dep_info;
+    VkMemoryBarrier2 barrier;
+
+    /* The serialized data does not tell the host whether it holds a TLAS, a BLAS or an
+     * opacity micromap array, so the kind of the destination stays unknown. */
+    dst_as = vkd3d_va_map_place_acceleration_structure(&list->device->memory_allocator.va_map, list->device,
+            dst, VKD3D_RTAS_KIND_UNKNOWN);
+
+    if (dst_as == VK_NULL_HANDLE)
+    {
+        ERR("Invalid dst address #%"PRIx64" for RTAS deserialize.\n", dst);
+        return;
+    }
+
+    /* The source is in NON_PIXEL_SHADER_RESOURCE state, which gives SHADER_READ in the build stage.
+     * The copy reads the source with TRANSFER_READ, so make prior writes visible to it.
+     * Deserialization is rare, so a full barrier costs nothing that matters. */
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR |
+            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+
+    memset(&dep_info, 0, sizeof(dep_info));
+    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_info.memoryBarrierCount = 1;
+    dep_info.pMemoryBarriers = &barrier;
+    VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
+
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_ACCELERATION_STRUCTURE_INFO_KHR;
+    info.src.deviceAddress = src;
+    info.dst = dst_as;
+    info.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_DESERIALIZE_KHR;
+    VK_CALL(vkCmdCopyMemoryToAccelerationStructureKHR(list->cmd.vk_command_buffer, &info));
 }
 
 struct vkd3d_empty_rtas_build_info

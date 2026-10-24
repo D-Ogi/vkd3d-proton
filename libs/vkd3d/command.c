@@ -23299,6 +23299,17 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyRaytracingAccelerationStruc
     /* We have not observed broken copy -> trace sync in the wild so far.
      * Don't consider this pending RTAS work until we have evidence of real-world breakage. */
 
+    if (mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE)
+    {
+        /* The source holds serialized data, not an acceleration structure. */
+        vkd3d_acceleration_structure_deserialize(list, dst_data, src_data);
+        VKD3D_BREADCRUMB_AUX64(dst_data);
+        VKD3D_BREADCRUMB_AUX64(src_data);
+        VKD3D_BREADCRUMB_AUX32(mode);
+        VKD3D_BREADCRUMB_COMMAND(COPY_RTAS);
+        return;
+    }
+
     vkd3d_va_map_try_read_rtas(&list->device->memory_allocator.va_map,
             list->device, src_data, &src_as, &rtas_kind);
 
