@@ -2878,6 +2878,135 @@ out_pso:
     destroy_workgraph_test_context(&context);
 }
 
+/* The lab flavour of the amdgpu-wddm engine reads AMDGPU_WDDM_WG_LIMITS when it creates a work graph: a small
+ * payload ring and a small limit of packed offset entries let a test fill the payload memory of a level with a
+ * few thousand records. Other engines ignore the variable. */
+static void workgraph_set_limits(const char *value)
+{
+#ifdef _WIN32
+    SetEnvironmentVariableA("AMDGPU_WDDM_WG_LIMITS", value);
+#else
+    if (value)
+        setenv("AMDGPU_WDDM_WG_LIMITS", value, 1);
+    else
+        unsetenv("AMDGPU_WDDM_WG_LIMITS");
+#endif
+}
+
+void test_workgraph_level_output_limits(void)
+{
+    /* The node outputs of a level go to the payload memory of the execution. The amdgpu-wddm engine has a payload
+     * ring of fixed size per level, so outputs can be more than it holds. They must then not be written past the
+     * ring: the engine launches the records that fit, and reports the others. EntryA sends each of its 1536 records
+     * as one 128-byte record to ChildA, which counts it. With "ring=65536", 512 records fit. With "packed=8", 8
+     * allocations fit; a thread launch node allocates once per wave, so 8 x 32 or 8 x 64 records fit. Native drivers
+     * launch all records, so only the sums are checked there. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"EntryA", 0 }, { u"EntryB", 0 } };
+    static const struct workgraph_count_input input = { 0, 0, 1536 };
+    static const struct
+    {
+        const char *limits;
+        unsigned int fit; /* 0: 8 allocations of one wave each. */
+    }
+    tests[] =
+    {
+        { NULL, 1536 },
+        { "ring=65536", 512 },
+        { "packed=8", 0 },
+    };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct workgraph_lost_records lost;
+    uint32_t expected[8], values[8];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *scratch;
+    ID3D12Resource *output;
+    ID3D12StateObject *pso;
+    UINT entry_index[2];
+    uint8_t *records;
+    unsigned int i, j;
+    bool is_engine;
+    UINT size;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    is_engine = workgraph_is_vkd3d_proton(context.device);
+    records = workgraph_create_cpu_count_records(input.count, 1);
+
+    memset(expected, 0, sizeof(expected));
+    workgraph_count_expected(&input, 1, 1, expected);
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("%s", tests[i].limits ? tests[i].limits : "default");
+
+        workgraph_set_limits(tests[i].limits);
+        hr = try_create_workgraph_pso(&context, level_count_dxil, NULL, &pso);
+        workgraph_set_limits(NULL);
+        ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+        if (!pso)
+            continue;
+        if (!workgraph_get_program(pso, &ident, &wg_reqs, entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        {
+            ID3D12StateObject_Release(pso);
+            continue;
+        }
+
+        scratch = workgraph_create_backing_memory(&context, &wg_reqs);
+        output = create_default_buffer(context.context.device, 4 * 1024,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+        dispatch_desc.NodeCPUInput.EntrypointIndex = entry_index[0];
+        dispatch_desc.NodeCPUInput.NumRecords = input.count;
+        dispatch_desc.NodeCPUInput.pRecords = records;
+        dispatch_desc.NodeCPUInput.RecordStrideInBytes = WG_COUNT_RECORD_SIZE;
+        workgraph_record_dispatch(&context, context.context.list, &ident, scratch, wg_reqs.MinSizeInBytes,
+                output, &dispatch_desc);
+        workgraph_read_output(&context, output, values, ARRAY_SIZE(values));
+
+        memset(&lost, 0, sizeof(lost));
+        size = sizeof(lost);
+        hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_status_guid, &size, &lost);
+        if (is_engine)
+        {
+            /* The records that fit are launched with their own data: the tail sum is the launch count. */
+            ok(hr == S_OK && size == sizeof(lost), "The engine does not report lost records, hr #%x.\n", (int)hr);
+            if (tests[i].fit)
+                ok(values[0] == tests[i].fit, "Expected %u launches, got %u.\n", tests[i].fit, values[0]);
+            else
+                ok(values[0] == 8 * 32 || values[0] == 8 * 64, "Expected 8 waves of launches, got %u.\n", values[0]);
+            ok(values[2] == values[0], "Expected tail sum %u, got %u.\n", values[0], values[2]);
+            ok(values[1] >= values[0] && values[1] <= 7 * values[0], "Value sum %u is out of range for %u launches.\n",
+                    values[1], values[0]);
+            ok(lost.records == input.count - values[0], "Expected %u lost records, got %"PRIu64".\n",
+                    input.count - values[0], lost.records);
+            ok(lost.events == (values[0] == input.count ? 0 : 1), "Got %"PRIu64" events with lost records.\n",
+                    lost.events);
+        }
+        else
+        {
+            for (j = 0; j < ARRAY_SIZE(values); j++)
+                ok(values[j] == expected[j], "Value %u: expected %u, got %u.\n", j, expected[j], values[j]);
+        }
+
+        if (scratch)
+            ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+        ID3D12StateObject_Release(pso);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    free(records);
+    destroy_workgraph_test_context(&context);
+}
+
 void test_workgraph_dispatch_failure(void)
 {
     /* The lab flavour of the amdgpu-wddm engine reads AMDGPU_WDDM_WG_FAIL at each scratch memory allocation of a
