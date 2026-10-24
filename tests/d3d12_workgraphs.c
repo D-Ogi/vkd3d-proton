@@ -101,6 +101,7 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/thread_custom_input.h"
 #include "shaders/workgraph/headers/coalesce_custom_input.h"
 #include "shaders/workgraph/headers/two_entry.h"
+#include "shaders/workgraph/headers/rw_entry_input.h"
 
 /* The stride 0 cases are skipped on AMD because they hang the GPU with AMD's own driver. A different driver with
  * the AMD vendor ID can run them: set VKD3D_TEST_WORKGRAPH_AMD_STRIDE_0=1. */
@@ -970,6 +971,175 @@ out:
         ID3D12StateObjectProperties1_Release(props1);
     if (props)
         ID3D12WorkGraphProperties_Release(props);
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+void test_workgraph_rw_entry_input(void)
+{
+    /* An entry point that writes to its input record (RWThreadNodeInputRecord). The shader adds 1 to RWBuf[value]
+     * if it reads back value + 100 after its write, and 0x10000 if it reads another value.
+     * With separate records, each thread must see its own write. With a record stride of 0 all records are one
+     * record in memory: the native NVIDIA driver on Windows lets the threads see each other's writes there, so
+     * only the launch count is checked (each record runs once). The spec makes the writeable part of GPU input
+     * records undefined during graph execution (WorkGraphs.md, D3D12_NODE_GPU_INPUT), so the record data in the
+     * application's buffer is not checked. */
+    static const struct
+    {
+        const char *name;
+        D3D12_DISPATCH_MODE mode;
+        uint32_t stride;
+        uint32_t constant_value; /* UINT32_MAX: record i has the value i. */
+    } tests[] =
+    {
+        { "GPU input, packed", D3D12_DISPATCH_MODE_NODE_GPU_INPUT, 4, UINT32_MAX },
+        { "GPU input, stride 0", D3D12_DISPATCH_MODE_NODE_GPU_INPUT, 0, 7 },
+        { "Multi GPU input, stride 0", D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT, 0, 11 },
+        { "CPU input, packed", D3D12_DISPATCH_MODE_NODE_CPU_INPUT, 4, UINT32_MAX },
+        { "CPU input, stride 0", D3D12_DISPATCH_MODE_NODE_CPU_INPUT, 0, 9 },
+    };
+    enum { NUM_RECORDS = 256 };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    D3D12_MULTI_NODE_GPU_INPUT multi_gpu_input;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    D3D12_SET_PROGRAM_DESC program_desc;
+    D3D12_NODE_GPU_INPUT node_gpu_input;
+    struct resource_readback rb;
+    uint32_t records[NUM_RECORDS];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12Resource *records_buffer;
+    ID3D12Resource *input_multi;
+    ID3D12Resource *scratch;
+    ID3D12Resource *output;
+    ID3D12Resource *input;
+    ID3D12StateObject *pso;
+    unsigned int i, j;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    pso = create_workgraph_pso(&context, rw_entry_input_dxil, u"Dummy", context.default_root_uav_rs);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    check_work_graph_properties(pso, u"Dummy", u"RWEntry", NULL, 4, &ident, &wg_reqs);
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("%s", tests[i].name);
+
+        for (j = 0; j < NUM_RECORDS; j++)
+            records[j] = tests[i].constant_value == UINT32_MAX ? j : tests[i].constant_value;
+
+        /* GPU input records in a default heap buffer, in the shader resource state that the spec asks for. */
+        records_buffer = create_default_buffer(context.context.device, sizeof(records),
+                D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        upload_buffer_data(records_buffer, 0, sizeof(records), records, context.context.queue, context.context.list);
+        reset_command_list(context.context.list, context.context.allocator);
+        transition_resource_state(context.context.list, records_buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        node_gpu_input.EntrypointIndex = 0;
+        node_gpu_input.NumRecords = NUM_RECORDS;
+        node_gpu_input.Records.StartAddress = ID3D12Resource_GetGPUVirtualAddress(records_buffer);
+        node_gpu_input.Records.StrideInBytes = tests[i].stride;
+        input = create_upload_buffer(context.context.device, sizeof(node_gpu_input), &node_gpu_input);
+
+        multi_gpu_input.NumNodeInputs = 1;
+        multi_gpu_input.NodeInputs.StartAddress = ID3D12Resource_GetGPUVirtualAddress(input);
+        multi_gpu_input.NodeInputs.StrideInBytes = 0;
+        input_multi = create_upload_buffer(context.context.device, sizeof(multi_gpu_input), &multi_gpu_input);
+
+        scratch = NULL;
+        if (wg_reqs.MinSizeInBytes)
+        {
+            scratch = create_default_buffer(context.context.device, wg_reqs.MinSizeInBytes,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        }
+        output = create_default_buffer(context.context.device, 1024 * sizeof(uint32_t),
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        ID3D12GraphicsCommandList_SetComputeRootSignature(context.context.list, context.default_root_uav_rs);
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(context.context.list, 0,
+                ID3D12Resource_GetGPUVirtualAddress(output));
+
+        memset(&program_desc, 0, sizeof(program_desc));
+        program_desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+        if (scratch)
+        {
+            program_desc.WorkGraph.BackingMemory.SizeInBytes = wg_reqs.MinSizeInBytes;
+            program_desc.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(scratch);
+        }
+        program_desc.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+        program_desc.WorkGraph.ProgramIdentifier = ident;
+        ID3D12GraphicsCommandList10_SetProgram(context.list, &program_desc);
+
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = tests[i].mode;
+        switch (tests[i].mode)
+        {
+            case D3D12_DISPATCH_MODE_NODE_GPU_INPUT:
+                dispatch_desc.NodeGPUInput = ID3D12Resource_GetGPUVirtualAddress(input);
+                break;
+            case D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT:
+                dispatch_desc.MultiNodeGPUInput = ID3D12Resource_GetGPUVirtualAddress(input_multi);
+                break;
+            default:
+                dispatch_desc.NodeCPUInput.EntrypointIndex = 0;
+                dispatch_desc.NodeCPUInput.NumRecords = NUM_RECORDS;
+                dispatch_desc.NodeCPUInput.pRecords = records;
+                dispatch_desc.NodeCPUInput.RecordStrideInBytes = tests[i].stride;
+                break;
+        }
+        ID3D12GraphicsCommandList10_DispatchGraph(context.list, &dispatch_desc);
+
+        transition_resource_state(context.context.list, output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        get_buffer_readback_with_command_list(output, DXGI_FORMAT_R32_UINT, &rb,
+                context.context.queue, context.context.list);
+        reset_command_list(context.context.list, context.context.allocator);
+
+        if (tests[i].constant_value == UINT32_MAX)
+        {
+            for (j = 0; j < 1024; j++)
+            {
+                uint32_t expected = j < NUM_RECORDS ? 1 : 0;
+                uint32_t v = get_readback_uint(&rb, j, 0, 0);
+                ok(v == expected, "Value %u: expected #%x, got #%x.\n", j, expected, v);
+            }
+        }
+        else
+        {
+            uint32_t launches = 0;
+
+            for (j = 0; j < 1024; j++)
+            {
+                uint32_t v = get_readback_uint(&rb, j, 0, 0);
+                launches += (v & 0xffff) + (v >> 16);
+            }
+            ok(launches == NUM_RECORDS, "Expected %u launches, got %u.\n", NUM_RECORDS, launches);
+        }
+
+        /* The system copies CPU input records, so the application's array does not change. */
+        for (j = 0; j < NUM_RECORDS; j++)
+        {
+            uint32_t expected = tests[i].constant_value == UINT32_MAX ? j : tests[i].constant_value;
+            ok(records[j] == expected, "CPU record %u: expected %u, got %u.\n", j, expected, records[j]);
+        }
+
+        release_resource_readback(&rb);
+        if (scratch)
+            ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+        ID3D12Resource_Release(input_multi);
+        ID3D12Resource_Release(input);
+        ID3D12Resource_Release(records_buffer);
+    }
+    vkd3d_test_set_context(NULL);
+
     ID3D12StateObject_Release(pso);
     destroy_workgraph_test_context(&context);
 }
