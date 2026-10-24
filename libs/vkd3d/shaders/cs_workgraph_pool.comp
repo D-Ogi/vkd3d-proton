@@ -1,0 +1,402 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+// amdgpu-wddm fork: the admission and retention passes of the draining work graph scheduler with record pools. Pool L
+// holds the input records of level L, in two halves. Round r uses half h = r & 1 of every pool: the nodes of level L
+// read half h of pool L and write half h of pool L + 1. The engine records, for each level L of a round:
+//   ADMIT (one invocation, before the distributor of level L, if level L has outputs): for each slot in slot order, it
+//     admits the largest k records that fit the free capacity of pool L + 1, and writes k to admit[]. A record is
+//     admitted as a whole, with all its readers: ceil(k / u) groups take ceil(k / u) x demand. The free capacity is
+//     the capacity of the half less the records of pool L + 1 that were retained in the round before. Sets the
+//     admitted word of the round frame if a record is admitted. If the head of pool L + 1 is above a capacity, the
+//     pass admits no record and sets FAULT_ADMIT_HEAD in the fault word.
+//   RETAIN (after the payload expander of level L, before its nodes):
+//     (a) If level is not 0: the distributor admitted the first k records of each slot (end_elements -
+//         primary_linear_offset is k, and padding0 is the count). The other records of half h of pool L (source) are
+//         copied into half h ^ 1 (target), one dense block per slot at a multiple of 16 bytes, and the pool state of
+//         pool L is written. Empty records stay counts. Half h ^ 1 is free: its records of round r - 1 ran, or moved to
+//         half h in round r - 1.
+//     (b) If inject_level is not 0: the records of pool L + 1 that were retained in round r - 1 are in half h. The pass
+//         gives them to the producers of level L as if they had written them: packed entries of at most 256 records,
+//         the node counts, and the payload and entry counters, so that the producers append after them. It writes the
+//         output guard of pool L + 1. It first checks the whole pool state of pool L + 1 (pool_state_valid). If the
+//         state is not valid, the pass injects no record, writes no entry and no counter, and sets FAULT_INJECT_HEAD
+//         in the fault word: the records of the pool are lost, and the close marks the abandoned record count as a
+//         lower bound.
+//     Lab flavour: if fault_head is not 0, (a) writes an invalid pool state (AMDGPU_WDDM_WG_FAIL=pool-head,
+//     pool-records or pool-slot).
+// The distributor of the level reset the counters before this pass. The layouts are in vkd3d_private.h:
+// struct vkd3d_workgraph_pool_state, struct vkd3d_workgraph_pool_admission, struct vkd3d_workgraph_pool_level_args.
+
+layout(local_size_x = 64) in;
+
+#include "cs_workgraph_data_structures.h"
+
+const uint MODE_ADMIT = 0u;
+const uint MODE_RETAIN = 1u;
+const uint EMPTY_RECORD_BYTES = 4u;
+const uint ENTRY_RECORDS = 256u;
+// VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS, VKD3D_WORKGRAPH_DRAIN_FAULT_ADMIT_HEAD,
+// VKD3D_WORKGRAPH_DRAIN_FAULT_INJECT_HEAD.
+const uint MAX_ROUNDS = 64u;
+const uint FAULT_ADMIT_HEAD = 2u;
+const uint FAULT_INJECT_HEAD = 4u;
+
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer IndirectCommandsBuffer
+{
+	uvec4 expander_execute_total_elements;
+	IndirectCommands indirect_commands[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer UnrolledOffsets
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer SourcePayload
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) writeonly buffer TargetPayload
+{
+	uint data[];
+};
+
+// struct d3d12_wg_payload_expander_meta: the payload stride is the low 16 bits of the second word.
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer NodeTypeMeta
+{
+	uvec2 data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer NodeShareMapping
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer PoolState
+{
+	uvec4 head;
+	uvec2 slots[];
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) buffer NodeAtomics
+{
+	uint payload_atomic;
+	uint fused_atomic;
+	uint node_counts[];
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) writeonly buffer PackedEntries
+{
+	uvec2 data[];
+};
+
+// struct vkd3d_workgraph_output_guard.
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer OutputGuard
+{
+	uint payload_capacity;
+	uint packed_capacity;
+};
+
+struct Admission
+{
+	uint u;
+	uint padding;
+	uint64_t demand[3];
+};
+
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer AdmissionTable
+{
+	Admission data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) writeonly buffer AdmitCounts
+{
+	uint data[];
+};
+
+// struct vkd3d_workgraph_drain_control.
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer Control
+{
+	uint pending[MAX_ROUNDS + 1u];
+	uint executed[3];
+	uint fault;
+	uint closes;
+	uint close_reason;
+	uint admitted;
+};
+
+layout(buffer_reference, buffer_reference_align = 16, std430) readonly buffer LevelArgs
+{
+	IndirectCommandsBuffer commands;
+	UnrolledOffsets offsets;
+	SourcePayload source;
+	TargetPayload target;
+	NodeTypeMeta meta;
+	NodeShareMapping share_mapping;
+	uint64_t pool_states;
+	NodeAtomics atomics;
+	PackedEntries entries;
+	OutputGuard guard;
+	AdmissionTable table;
+	AdmitCounts admit;
+	Control control;
+	uint pool_state_stride;
+	uint level;
+	uint inject_level;
+	uint num_nodes;
+	uint payload_capacity;
+	uint packed_capacity;
+	uint caps[3];
+	uint fault_head;
+};
+
+layout(push_constant, std430) uniform Registers
+{
+	LevelArgs args;
+	uint mode;
+	uint padding;
+} registers;
+
+PoolState pool_state(LevelArgs args, uint level)
+{
+	return PoolState(args.pool_states + uint64_t(level) * uint64_t(args.pool_state_stride));
+}
+
+uint payload_stride(LevelArgs args, uint node_index)
+{
+	return args.meta.data[node_index].y & 0xffffu;
+}
+
+uint64_t free_capacity(uint cap, uint64_t used)
+{
+	return uint64_t(cap) > used ? uint64_t(cap) - used : 0ul;
+}
+
+// The retained records of pool level + 1 came from one half of the pool, so a valid head is at most the capacity of a
+// half: payload bytes, packed entries, and records (one unrolled offset each).
+bool head_in_capacity(LevelArgs args, uvec4 head)
+{
+	return head.x <= args.caps[0] && head.y <= args.caps[1] &&
+		uint64_t(head.z) + uint64_t(head.w) <= uint64_t(args.caps[2]);
+}
+
+void admit(LevelArgs args)
+{
+	uvec4 head = pool_state(args, args.level + 1u).head;
+	uint64_t free_space[3];
+	bool admitted = false;
+
+	// With a valid head, the free capacity is the capacity less the head. An invalid head admits no record, also for a
+	// slot without demand.
+	if (!head_in_capacity(args, head))
+	{
+		for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
+			args.admit.data[node_index] = 0u;
+		atomicOr(args.control.fault, FAULT_ADMIT_HEAD);
+		return;
+	}
+
+	free_space[0] = free_capacity(args.caps[0], uint64_t(head.x));
+	free_space[1] = free_capacity(args.caps[1], uint64_t(head.y));
+	free_space[2] = free_capacity(args.caps[2], uint64_t(head.z) + uint64_t(head.w));
+
+	for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
+	{
+		// A node that shares the input of another reads the records of that node, which admits them for both.
+		if (args.share_mapping.data[node_index] != ~0u)
+		{
+			args.admit.data[node_index] = 0u;
+			continue;
+		}
+
+		uint count = args.atomics.node_counts[node_index];
+		Admission entry = args.table.data[node_index];
+		// The host refuses u = 0; 1 <= u <= 2^32 - 1.
+		uint64_t u = uint64_t(max(entry.u, 1u));
+		uint64_t k = uint64_t(count), groups = 0ul, charged;
+		bool bounded = false;
+
+		// A slot whose records have no demand on the next pool admits every record. Else groups is the number of
+		// groups that fit each component: the free space is at most a capacity, which is below 2^32, so groups is
+		// below 2^32. u is below 2^32, so groups x u fits in 64 bits.
+		for (uint c = 0u; c < 3u; c++)
+		{
+			if (entry.demand[c] == 0ul)
+				continue;
+			uint64_t fit = free_space[c] / entry.demand[c];
+			groups = bounded ? min(groups, fit) : fit;
+			bounded = true;
+		}
+		if (bounded)
+		{
+			k = min(k, groups * u);
+			// ceil(k / u) without k + u - 1. It is at most groups, so charged x demand is at most the free space of
+			// each component: the products do not wrap and the subtractions do not go below 0.
+			charged = k / u + (k % u != 0ul ? 1ul : 0ul);
+			for (uint c = 0u; c < 3u; c++)
+				free_space[c] -= charged * entry.demand[c];
+		}
+
+		args.admit.data[node_index] = uint(k);
+		if (k != 0ul)
+			admitted = true;
+	}
+
+	if (admitted)
+		args.control.admitted = 1u;
+}
+
+void retain(LevelArgs args)
+{
+	PoolState state = pool_state(args, args.level);
+	uint threads = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+	uint tid = gl_GlobalInvocationID.x;
+	uint block = 0u, packed = 0u, records = 0u, empty = 0u;
+
+	for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
+	{
+		if (args.share_mapping.data[node_index] != ~0u)
+		{
+			if (tid == 0u)
+				state.slots[node_index] = uvec2(0u);
+			continue;
+		}
+
+		IndirectCommands cmd = args.commands.indirect_commands[node_index];
+		uint admitted = cmd.end_elements - cmd.primary_linear_offset;
+		uint kept = cmd.padding0 - admitted;
+		uint stride = payload_stride(args, node_index);
+
+		// The lab hook 3 puts the blocks 16 bytes after their place.
+		if (tid == 0u)
+			state.slots[node_index] = uvec2(kept, args.fault_head == 3u && stride != 0u ? block + 16u : block);
+		if (kept == 0u)
+			continue;
+		if (stride == 0u)
+		{
+			empty += kept;
+			continue;
+		}
+
+		// The records were in one payload region of less than 2^32 bytes, so kept x stride fits in 32 bits.
+		uint words = stride >> 2u;
+		uint total_words = kept * words;
+		uint first = cmd.primary_linear_offset + admitted;
+		for (uint w = tid; w < total_words; w += threads)
+		{
+			uint record = w / words;
+			uint word = w - record * words;
+			uint source_offset = args.offsets.data[first + record];
+			args.target.data[(block >> 2u) + w] = args.source.data[(source_offset >> 2u) + word];
+		}
+
+		block = (block + total_words * 4u + 15u) & ~15u;
+		packed += (kept + ENTRY_RECORDS - 1u) / ENTRY_RECORDS;
+		records += kept;
+	}
+
+	uvec4 head = uvec4(block + EMPTY_RECORD_BYTES * empty, packed, records, empty);
+	// The lab hooks: 1 writes payload bytes above every capacity, 2 one record more than the slots hold. 3 changed the
+	// blocks above.
+	if (args.fault_head == 1u)
+		head.x = ~0u;
+	else if (args.fault_head == 2u)
+		head.z += 1u;
+	if (tid == 0u)
+		state.head = head;
+}
+
+// True if the pool state is the state that the retention pass writes: in slot order, each slot that keeps records with
+// a payload has its block at the end of the blocks before it, rounded up to 16 bytes; a slot that reads the input of
+// another node keeps no record; the head gives the bytes of the blocks and of the empty records, the packed entries,
+// the records with a payload and the empty records, and is inside the capacities. The sums are 64-bit, so slot counts
+// near 2^32 do not wrap them.
+bool pool_state_valid(LevelArgs args, PoolState state, uvec4 head)
+{
+	uint64_t block = 0ul, packed = 0ul, records = 0ul, empty = 0ul;
+
+	if (!head_in_capacity(args, head))
+		return false;
+	for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
+	{
+		uvec2 slot = state.slots[node_index];
+		if (slot.x == 0u)
+			continue;
+		if (args.share_mapping.data[node_index] != ~0u)
+			return false;
+		uint stride = payload_stride(args, node_index);
+		if (stride == 0u)
+		{
+			empty += uint64_t(slot.x);
+			continue;
+		}
+		if (uint64_t(slot.y) != block)
+			return false;
+		block = (block + uint64_t(slot.x) * uint64_t(stride) + 15ul) & ~15ul;
+		packed += (uint64_t(slot.x) + uint64_t(ENTRY_RECORDS - 1u)) / uint64_t(ENTRY_RECORDS);
+		records += uint64_t(slot.x);
+	}
+	return block + uint64_t(EMPTY_RECORD_BYTES) * empty == uint64_t(head.x) && packed == uint64_t(head.y) &&
+		records == uint64_t(head.z) && empty == uint64_t(head.w);
+}
+
+void inject(LevelArgs args)
+{
+	PoolState state = pool_state(args, args.inject_level);
+	uvec4 head = state.head;
+	uint packed = 0u;
+
+	// The whole pool state is checked before the pass writes an entry or a counter. The output guard of the pool is
+	// written also for an invalid state. Then the counters stay as the distributor reset them, and the levels run no
+	// record of the pool in this round.
+	bool valid = pool_state_valid(args, state, head);
+	args.guard.payload_capacity = args.payload_capacity;
+	args.guard.packed_capacity = args.packed_capacity;
+	if (!valid)
+	{
+		atomicOr(args.control.fault, FAULT_INJECT_HEAD);
+		return;
+	}
+
+	for (uint node_index = 0u; node_index < args.num_nodes; node_index++)
+	{
+		uvec2 slot = state.slots[node_index];
+		if (slot.x == 0u)
+			continue;
+
+		args.atomics.node_counts[node_index] = slot.x;
+		uint stride = payload_stride(args, node_index);
+		if (stride == 0u)
+			continue;
+
+		for (uint first = 0u; first < slot.x; first += ENTRY_RECORDS)
+		{
+			uint count = min(slot.x - first, ENTRY_RECORDS);
+			args.entries.data[packed++] = uvec2((node_index << 8u) | (count - 1u), slot.y + first * stride);
+		}
+	}
+
+	args.atomics.payload_atomic = head.x;
+	args.atomics.fused_atomic = packed;
+}
+
+void main()
+{
+	LevelArgs args = registers.args;
+
+	if (registers.mode == MODE_ADMIT)
+	{
+		if (gl_GlobalInvocationID.x == 0u)
+			admit(args);
+		return;
+	}
+
+	if (args.level != 0u)
+		retain(args);
+	if (args.inject_level != 0u && gl_GlobalInvocationID.x == 0u)
+		inject(args);
+}

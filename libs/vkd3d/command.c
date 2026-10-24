@@ -2596,6 +2596,15 @@ static void d3d12_command_list_mark_as_invalid(struct d3d12_command_list *list,
     list->is_valid = false;
 }
 
+/* amdgpu-wddm fork: a command that cannot get its memory during recording is not recorded completely. The list must
+ * then not execute, and Close tells the application with E_OUTOFMEMORY. */
+void d3d12_command_list_mark_out_of_memory(struct d3d12_command_list *list, const char *what)
+{
+    ERR("Command list %p: out of memory for %s.\n", list, what);
+    list->is_valid = false;
+    list->is_out_of_memory = true;
+}
+
 static void d3d12_command_list_update_conditional_rendering_state(struct d3d12_command_list *list, bool end)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -2625,6 +2634,13 @@ static void d3d12_command_list_update_conditional_rendering_state(struct d3d12_c
         list->predication.current_enabled = true;
         list->cmd.suspend_resume.block_resume = true;
     }
+}
+
+/* amdgpu-wddm fork: the work graph engine (workgraphs.c) ends the predicate of SetPredication before its own
+ * conditional rendering blocks and begins it again after them. */
+void d3d12_command_list_workgraph_update_predication(struct d3d12_command_list *list, bool end)
+{
+    d3d12_command_list_update_conditional_rendering_state(list, end);
 }
 
 static void d3d12_command_list_check_render_pass_validation(
@@ -2671,6 +2687,7 @@ static HRESULT d3d12_command_list_begin_command_buffer(struct d3d12_command_list
 
     list->is_recording = true;
     list->is_valid = true;
+    list->is_out_of_memory = false;
 
     return S_OK;
 }
@@ -7416,7 +7433,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
     if (!list->is_valid)
     {
         WARN("Error occurred during command list recording.\n");
-        return E_INVALIDARG;
+        return list->is_out_of_memory ? E_OUTOFMEMORY : E_INVALIDARG;
     }
 
     return S_OK;
@@ -24421,6 +24438,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_DispatchGraph(
 {
     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
     TRACE("iface %p, desc %p\n", iface, desc);
+    /* amdgpu-wddm fork: DispatchGraph is an action command, as Dispatch is. This begins a SetPredication block
+     * that is deferred while a render pass resume is still possible, so that the graph is predicated. */
+    d3d12_command_list_check_render_pass_validation(list, NULL, true);
     d3d12_command_list_flush_dgc_batch(list);
     d3d12_command_list_workgraph_dispatch(list, desc);
 }

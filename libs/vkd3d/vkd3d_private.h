@@ -3788,6 +3788,8 @@ struct d3d12_command_list
 
     bool is_recording;
     bool is_valid;
+    /* amdgpu-wddm fork: a recording ran out of memory. Close then returns E_OUTOFMEMORY. */
+    bool is_out_of_memory;
     bool debug_capture;
     bool has_replaced_shaders;
 
@@ -5558,7 +5560,36 @@ struct vkd3d_workgraph_workgroups_args
     VkDeviceAddress commands_va;
     VkDeviceAddress dividers_va;
     VkDeviceAddress node_share_mapping_va;
+    /* amdgpu-wddm fork: struct vkd3d_workgraph_output_guard of the execution, and
+     * struct vkd3d_workgraph_lost_records of the state object. */
+    VkDeviceAddress output_guard_va;
+    VkDeviceAddress lost_records_va;
+    /* amdgpu-wddm fork: the admitted record count of each slot (cs_workgraph_pool.comp, admission), or 0 if every
+     * record is admitted. */
+    VkDeviceAddress admit_va;
     uint32_t num_nodes;
+};
+
+/* amdgpu-wddm fork: the output bounds of a work graph level, the last 32 bytes of the required scratch memory, just
+ * before the packed offsets. The node output allocator of dxil-spirv (build_allocate_node_records and
+ * build_increment_node_count) finds it at AllocationOffset - 8 words. An allocation that would take the payload
+ * past payload_capacity, or a packed offset entry past packed_capacity, is not counted: its records go to the
+ * 64-bit count dropped_records_lo/hi, its payload to the sink after the payload ring and its packed offset to
+ * sink[]. An allocation of more than 256 records or more than 64 KiB - 15 bytes is always dropped, so that the
+ * records of a dropped allocation stay in the sink (VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE). The payload is reserved with a
+ * compare/exchange loop, so the payload counter never goes past payload_capacity. Empty records count 4 bytes against
+ * payload_capacity, so that the records of a level fit in the unrolled offsets.
+ * The workgroup distributor reports the dropped records after each level and clears the count. */
+struct vkd3d_workgraph_output_guard
+{
+    uint32_t payload_capacity;
+    uint32_t packed_capacity;
+    /* VKD3D_WORKGRAPH_LOST_RECORDS_LOWER_BOUND if a dropped count is a lower bound. */
+    uint32_t flags;
+    uint32_t reserved0;
+    uint32_t dropped_records_lo;
+    uint32_t dropped_records_hi;
+    uint32_t sink[2];
 };
 
 /* If the implementation supports 16M workgroups (arbitrarily chosen large number),
@@ -5574,6 +5605,241 @@ struct vkd3d_workgraph_setup_gpu_input_args
     VkDeviceAddress entry_point_mapping_va;
     uint32_t num_entry_points;
 };
+
+/* amdgpu-wddm fork: D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT (cs_workgraph_multi_gpu_input_*.comp).
+ * Each entry point has VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS direct slots, for large inputs that are read in place,
+ * and one merge slot, for the records of all other inputs, copied into the staging range of the backing memory.
+ * An input is large if its records take more than VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE bytes in the staging range.
+ * The shaders have the same number of direct slots. The large size, the staging size and the number of groups are
+ * values of the program, so that the lab flavour can make them small for tests (AMDGPU_WDDM_WG_MULTI_INPUT).
+ * The count arithmetic is in cs_workgraph_multi_gpu_input_math.h. The state buffer (per DispatchGraph call) holds a 16-byte header with the
+ * overflow word, one vkd3d_workgraph_multi_gpu_input_entry per entry point, the input index of each direct slot
+ * (aligned to 16 bytes), then the slots: (DIRECT_SLOTS + 1) D3D12_NODE_GPU_INPUT per entry point, the merge slot
+ * last. Meta push data is limited to 64 bytes. */
+#define VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS 4u
+#define VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE (512u * 1024u)
+#define VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_SIZE (32u * 1024u * 1024u)
+/* The staging range with MaxSizeInBytes of backing memory. The backing memory above MinSizeInBytes makes the staging
+ * range larger, up to this size (WorkGraphs.md, Discovering backing memory size requirements). */
+#define VKD3D_WORKGRAPH_MULTI_INPUT_STAGING_MAX_SIZE (256u * 1024u * 1024u)
+/* Workgroups of the classify and copy passes. Each loops over the inputs, so any number of inputs fits. */
+#define VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS 1024u
+
+enum vkd3d_workgraph_multi_gpu_input_mode
+{
+    VKD3D_WORKGRAPH_MULTI_INPUT_MODE_INIT = 0,
+    VKD3D_WORKGRAPH_MULTI_INPUT_MODE_CLASSIFY = 1,
+    VKD3D_WORKGRAPH_MULTI_INPUT_MODE_LAYOUT = 2,
+};
+
+struct vkd3d_workgraph_multi_gpu_input_entry
+{
+    uint32_t direct_count;
+    uint32_t merged_lo;
+    uint32_t merged_hi;
+    uint32_t cursor;
+    uint32_t fit;
+    uint32_t padding[3];
+};
+
+struct vkd3d_workgraph_multi_gpu_input_prepare_args
+{
+    VkDeviceAddress multi_input_va;
+    VkDeviceAddress record_strides_va;
+    VkDeviceAddress state_va;
+    VkDeviceAddress staging_va;
+    VkDeviceSize staging_capacity;
+    /* struct vkd3d_workgraph_lost_records of the state object. */
+    VkDeviceAddress status_va;
+    uint32_t num_entry_points;
+    uint32_t mode;
+    uint32_t large_size;
+    uint32_t padding;
+};
+
+/* amdgpu-wddm fork: the records that a work graph did not launch, for all executions of a state object. The
+ * layout pass of the multi GPU input adds the records that the merge slots did not take, and the workgroup
+ * distributor adds the node outputs of a level that did not fit (struct vkd3d_workgraph_output_guard). Each adds
+ * one event. The memory is host-visible, so that the CPU can report the loss. */
+struct vkd3d_workgraph_lost_records
+{
+    uint32_t events;
+    uint32_t records_lo;
+    uint32_t records_hi;
+    uint32_t flags;
+};
+
+/* A thread asked for more records than one allocation can hold (not valid), and its count was added as the limit + 1,
+ * so the lost record count is a lower bound. */
+#define VKD3D_WORKGRAPH_LOST_RECORDS_LOWER_BOUND 0x1u
+
+/* amdgpu-wddm fork: the round frame of the draining scheduler (cs_workgraph_drain.comp). After round 1, up to
+ * VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS extra rounds are recorded, each in a conditional rendering block on the pending
+ * word of the round before. The control block is in the backing memory of the execution, only when the program has
+ * extra rounds. pending[r] is written by the pending dispatch of round r (round 1 is r = 0), bit r of executed[] is
+ * set when round r runs. close_reason is a VKD3D_WORKGRAPH_DRAIN_REASON_* value, closes counts the close dispatches
+ * since the last init. */
+#define VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS 64u
+#define VKD3D_WORKGRAPH_DRAIN_REASON_COMPLETE 0u
+#define VKD3D_WORKGRAPH_DRAIN_REASON_EXHAUSTED 1u
+#define VKD3D_WORKGRAPH_DRAIN_REASON_FAULT 2u
+
+/* The bits of the fault word of struct vkd3d_workgraph_drain_control: a round made no progress (the self-check, or the
+ * lab hook drain-stall), and the admission pass or the injection pass of the record pools found a pool head above a
+ * capacity of the pool, or slots that do not add up to its records. */
+#define VKD3D_WORKGRAPH_DRAIN_FAULT_PROGRESS 0x1u
+#define VKD3D_WORKGRAPH_DRAIN_FAULT_ADMIT_HEAD 0x2u
+#define VKD3D_WORKGRAPH_DRAIN_FAULT_INJECT_HEAD 0x4u
+
+struct vkd3d_workgraph_drain_control
+{
+    uint32_t pending[VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS + 1];
+    uint32_t executed[3];
+    /* VKD3D_WORKGRAPH_DRAIN_FAULT_*. The fault bits stay set until the next initialization. */
+    uint32_t fault;
+    uint32_t closes;
+    uint32_t close_reason;
+    /* With record pools: an admission pass of the round admitted a record. The pending dispatch clears it. */
+    uint32_t admitted;
+    /* With record pools: 1 if the pools held records at the pending dispatch of the last round that ran. */
+    uint32_t waiting;
+    uint32_t reserved[3];
+};
+
+/* amdgpu-wddm fork: the work that close abandoned, for all executions of a state object. It is its own record, not
+ * part of struct vkd3d_workgraph_lost_records, which counts the records dropped at allocation. reasons has bit
+ * 1 << reason of each close that abandoned work. items[] are 128-bit counts of waiting work items per reader kind
+ * (groups, coalescing slots, threads), four 32-bit words each, low word first; inputs is the 64-bit count of input
+ * records not taken. records is the 64-bit count of the records that the record pools still held at close (whole
+ * records, each counted once for all its readers). The memory is host-visible, after struct
+ * vkd3d_workgraph_lost_records. */
+#define VKD3D_WORKGRAPH_ABANDONED 0x1u
+/* The record count of struct vkd3d_workgraph_abandoned is a lower bound: a pool with an invalid head lost its
+ * records. */
+#define VKD3D_WORKGRAPH_ABANDONED_LOWER_BOUND 0x2u
+/* The offset of struct vkd3d_workgraph_abandoned in the host-visible allocation. */
+#define VKD3D_WORKGRAPH_ABANDONED_OFFSET 16u
+
+struct vkd3d_workgraph_abandoned
+{
+    uint32_t events;
+    uint32_t reasons;
+    uint32_t last_reason;
+    uint32_t flags;
+    uint32_t items[3][4];
+    uint32_t inputs_lo;
+    uint32_t inputs_hi;
+    uint32_t records_lo;
+    uint32_t records_hi;
+};
+
+enum vkd3d_workgraph_drain_mode
+{
+    VKD3D_WORKGRAPH_DRAIN_MODE_INIT = 0,
+    VKD3D_WORKGRAPH_DRAIN_MODE_PENDING = 1,
+    VKD3D_WORKGRAPH_DRAIN_MODE_CLOSE = 2,
+};
+
+struct vkd3d_workgraph_drain_args
+{
+    VkDeviceAddress control_va;
+    VkDeviceAddress abandoned_va;
+    uint32_t mode;
+    uint32_t round;
+    uint32_t rounds;
+    /* Lab flavour test hooks: the rounds below pending_rounds report waiting work, and stall sets the fault word. */
+    uint32_t pending_rounds;
+    uint32_t stall;
+    uint32_t padding;
+    /* With record pools: the pool states (struct vkd3d_workgraph_pool_state, pool_state_words words each) of pools 1
+     * to pools - 1, from the state of pool 0. 0 without record pools. */
+    VkDeviceAddress pool_states_va;
+    uint32_t pools;
+    uint32_t pool_state_words;
+};
+
+/* amdgpu-wddm fork: the record pools of the draining scheduler (cs_workgraph_pool.comp). The state of pool L, in the
+ * backing memory: the retained head (payload bytes, packed entries, records with a payload, empty records), then for
+ * each slot the retained records and the offset of their block. The stride is a multiple of 16 bytes. */
+struct vkd3d_workgraph_pool_state
+{
+    uint32_t head[4];
+    uint32_t slots[][2];
+};
+
+/* The admission of a slot: u records per group, and the demand of one group on the next pool (payload bytes,
+ * packed entries, unrolled offsets), the sum over the readers of the slot. */
+struct vkd3d_workgraph_pool_admission
+{
+    uint32_t u;
+    uint32_t padding;
+    uint64_t demand[3];
+};
+
+enum vkd3d_workgraph_pool_mode
+{
+    VKD3D_WORKGRAPH_POOL_MODE_ADMIT = 0,
+    VKD3D_WORKGRAPH_POOL_MODE_RETAIN = 1,
+};
+
+/* The addresses and capacities of one level of one round parity, in upload memory. */
+struct vkd3d_workgraph_pool_level_args
+{
+    VkDeviceAddress commands_va;
+    VkDeviceAddress offsets_va;
+    VkDeviceAddress source_va;
+    VkDeviceAddress target_va;
+    VkDeviceAddress meta_va;
+    VkDeviceAddress share_mapping_va;
+    VkDeviceAddress pool_states_va;
+    VkDeviceAddress atomics_va;
+    VkDeviceAddress entries_va;
+    VkDeviceAddress guard_va;
+    VkDeviceAddress table_va;
+    VkDeviceAddress admit_va;
+    /* struct vkd3d_workgraph_drain_control: the admitted word and the fault word. */
+    VkDeviceAddress control_va;
+    uint32_t pool_state_stride;
+    uint32_t level;
+    uint32_t inject_level;
+    uint32_t num_nodes;
+    /* The output guard of pool inject_level. */
+    uint32_t payload_capacity;
+    uint32_t packed_capacity;
+    /* The admission capacity of pool level + 1: payload bytes, packed entries, unrolled offsets. */
+    uint32_t caps[3];
+    /* Lab flavour: not 0 if the retention pass writes an invalid pool state (AMDGPU_WDDM_WG_FAIL=pool-head:<level>:
+     * 1, pool-records:<level>: 2, pool-slot:<level>: 3). */
+    uint32_t fault_head;
+};
+
+struct vkd3d_workgraph_pool_args
+{
+    VkDeviceAddress level_va;
+    uint32_t mode;
+    uint32_t padding;
+};
+
+struct vkd3d_workgraph_multi_gpu_input_copy_args
+{
+    VkDeviceAddress multi_input_va;
+    VkDeviceAddress record_strides_va;
+    VkDeviceAddress state_va;
+    uint32_t num_entry_points;
+};
+
+static inline VkDeviceSize vkd3d_workgraph_multi_gpu_input_slots_offset(uint32_t num_entry_points)
+{
+    VkDeviceSize offset = 16 + (VkDeviceSize)num_entry_points * sizeof(struct vkd3d_workgraph_multi_gpu_input_entry);
+
+    return offset + align64((VkDeviceSize)num_entry_points * VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS *
+            sizeof(uint32_t), 16);
+}
+
+static inline uint32_t vkd3d_workgraph_multi_gpu_input_slot_count(uint32_t num_entry_points)
+{
+    return num_entry_points * (VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS + 1);
+}
 
 struct vkd3d_workgraph_indirect_pipeline
 {
@@ -5594,6 +5860,17 @@ struct vkd3d_workgraph_indirect_ops
     VkPipeline vk_setup_gpu_input_pipeline;
     VkPipeline vk_payload_offset_pipeline;
     VkPipeline vk_complete_compaction_pipeline;
+    VkPipelineLayout vk_multi_gpu_input_prepare_layout;
+    VkPipelineLayout vk_multi_gpu_input_copy_layout;
+    VkPipeline vk_multi_gpu_input_prepare_pipeline;
+    VkPipeline vk_multi_gpu_input_copy_pipeline;
+    VkPipelineLayout vk_drain_layout;
+    VkPipeline vk_drain_pipeline;
+    VkPipelineLayout vk_pool_layout;
+    VkPipeline vk_pool_pipeline;
+    /* amdgpu-wddm fork: the distributor splits the workgroups of a node into a primary dispatch of WG_DIVIDER groups
+     * and a secondary dispatch (REQUIRE_WG_DIVIDER). */
+    bool require_wg_divider;
 };
 
 struct vkd3d_meta_ops
@@ -5690,6 +5967,12 @@ void vkd3d_meta_get_workgraph_setup_gpu_input_pipeline(struct vkd3d_meta_ops *me
 void vkd3d_meta_get_workgraph_payload_offset_pipeline(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_workgraph_meta_pipeline_info *info);
 void vkd3d_meta_get_workgraph_complete_compaction_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *info);
+void vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *prepare, struct vkd3d_workgraph_meta_pipeline_info *copy);
+void vkd3d_meta_get_workgraph_drain_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *info);
+void vkd3d_meta_get_workgraph_pool_pipeline(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_workgraph_meta_pipeline_info *info);
 
 static inline uint32_t vkd3d_meta_get_workgraph_setup_gpu_input_workgroup_size(void)
@@ -6953,16 +7236,31 @@ struct d3d12_wg_state_object
     struct d3d12_wg_state_object_module *modules;
     size_t modules_count;
 
-    /* Very hacky. Allocate huge scratch buffers that can hold execution state.
-     * Generally speaking, these buffers should be allocated in ring-buffers on device. */
-    struct d3d12_wg_state_object_ring unrolled_offsets;
-    struct d3d12_wg_state_object_ring payload[2];
+    /* amdgpu-wddm fork: the payload rings and the unrolled offsets are in the backing memory of each execution
+     * (d3d12_wg_state_object_program), so that executions on parallel queues do not share them. */
+
+    /* amdgpu-wddm fork: struct vkd3d_workgraph_lost_records, mapped. lost_events_reported is the events count
+     * of the last ERR line. */
+    struct d3d12_wg_state_object_ring lost_records;
+    struct vkd3d_workgraph_lost_records *lost_records_host;
+    uint32_t lost_events_reported;
+    /* amdgpu-wddm fork: struct vkd3d_workgraph_abandoned in the same allocation, mapped, with its address, and the
+     * events count of the last ERR line about it. */
+    struct vkd3d_workgraph_abandoned *abandoned_host;
+    VkDeviceAddress abandoned_va;
+    uint32_t abandoned_events_reported;
+    /* amdgpu-wddm fork, lab flavour: the calls of the predication hook (AMDGPU_WDDM_WG_FAIL=drain-hook) and the
+     * engine conditional rendering blocks that found the predicate of SetPredication active. */
+    uint32_t drain_hook_calls;
+    uint32_t drain_violations;
 
     struct vkd3d_private_store private_store;
 };
 
 void d3d12_command_list_workgraph_initialize_scratch(struct d3d12_command_list *list);
 void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, const D3D12_DISPATCH_GRAPH_DESC *desc);
+void d3d12_command_list_workgraph_update_predication(struct d3d12_command_list *list, bool end);
+void d3d12_command_list_mark_out_of_memory(struct d3d12_command_list *list, const char *what);
 
 static inline struct d3d12_wg_state_object *wg_impl_from_ID3D12StateObject(ID3D12StateObject *iface)
 {

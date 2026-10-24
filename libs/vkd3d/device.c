@@ -594,6 +594,8 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
 #include "config_flag_decl.h"
     {"breadcrumbs_sync", VKD3D_CONFIG_FLAG_INIT_STATIC(.BREADCRUMBS = 1, .BREADCRUMBS_SYNC = 1)},
     {"breadcrumbs_trace", VKD3D_CONFIG_FLAG_INIT_STATIC(.BREADCRUMBS = 1, .BREADCRUMBS_TRACE = 1)},
+    /* amdgpu-wddm fork: work graphs need the descriptor heap path (d3d12_device_supports_workgraphs). */
+    {"workgraphs", VKD3D_CONFIG_FLAG_INIT_STATIC(.WORKGRAPHS = 1, .DESCRIPTOR_HEAP = 1)},
 #undef VKD3D_DECL_CONFIG
 #undef VKD3D_DECL_CONFIG_PLAIN
 };
@@ -9911,7 +9913,11 @@ bool d3d12_device_supports_workgraphs(const struct d3d12_device *device)
 {
     /* Thread nodes currently need wave32 to function correctly since the API limits for thread nodes
      * match wave32 expectations (8 nodes per thread * 32 threads = 256 max nodes). */
+    /* amdgpu-wddm fork: VKD3D_CONFIG=workgraphs enables work graphs alone. enable_experimental_features also
+     * enables other features (SM 6.9, maintenance8 behaviour), which a device must not report for this one.
+     * The device conditions below stay the same for every switch. */
     return (VKD3D_CONFIG_FLAG_IS_SET(ENABLE_EXPERIMENTAL_FEATURES) ||
+            VKD3D_CONFIG_FLAG_IS_SET(WORKGRAPHS) ||
             vkd3d_debug_control_is_test_suite()) &&
             d3d12_device_use_descriptor_heap(device) &&
             device->device_info.shader_maximal_reconvergence_features.shaderMaximalReconvergence &&

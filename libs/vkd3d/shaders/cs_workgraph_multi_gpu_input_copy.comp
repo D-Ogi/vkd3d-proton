@@ -1,0 +1,192 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "cs_workgraph_multi_gpu_input_math.h"
+
+// amdgpu-wddm fork: the copy pass of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT, after the passes of
+// cs_workgraph_multi_gpu_input_prepare.comp. Each workgroup takes batches of 64 inputs in turn.
+// An input that is not in a direct slot of its entry point is merged: it gets a part of the merge slot's staging
+// range, and the workgroup copies its records there, at the record size aligned to 4 bytes. A source stride of 0
+// repeats one record. Records that do not fit are not copied, so memory outside the staging range is never written.
+// The order of the records in the merge slot is not defined, as the order of records in a work graph is not defined.
+layout(local_size_x = 64) in;
+
+const uint DIRECT_SLOTS = 4u;
+
+struct GPUInput
+{
+	uint entry_point_index;
+	uint num_records;
+	uint64_t records_va;
+	uint64_t records_stride;
+};
+
+struct EntryState
+{
+	uint direct_count;
+	uint merged_lo;
+	uint merged_hi;
+	uint cursor;
+	uint fit;
+	uint padding0;
+	uint padding1;
+	uint padding2;
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer MultiInput
+{
+	uint num_node_inputs;
+	uint padding;
+	uint64_t inputs_va;
+	uint64_t inputs_stride;
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer InputRef
+{
+	GPUInput value;
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer Strides
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer State
+{
+	uint overflow;
+	uint padding[3];
+	EntryState entries[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer SlotSources
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer Slots
+{
+	GPUInput data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) buffer Dword
+{
+	uint value;
+};
+
+// struct vkd3d_workgraph_multi_gpu_input_copy_args.
+layout(push_constant) uniform Registers
+{
+	MultiInput multi_input;
+	Strides record_strides;
+	uint64_t state_va;
+	uint num_entry_points;
+} registers;
+
+// One entry per invocation of the workgroup: the copy that the input of that invocation needs.
+shared uint shared_count[64];
+shared uint shared_first[64];
+shared uint shared_stride[64];
+shared uint64_t shared_src_va[64];
+shared uint64_t shared_src_stride[64];
+shared uint64_t shared_dst_va[64];
+
+// Takes up to num records of the merge range of entry point e. The cursor never goes past the fit, so it cannot
+// wrap however many inputs there are.
+uint reserve(State state, uint e, uint num, out uint first)
+{
+	uint fit = state.entries[e].fit;
+	uint old = atomicAdd(state.entries[e].cursor, 0u);
+
+	for (;;)
+	{
+		uint count;
+
+		first = old;
+		count = wg_math_reserve_count(old, fit, num);
+		if (count == 0u)
+			return 0u;
+		uint seen = atomicCompSwap(state.entries[e].cursor, old, old + count);
+		if (seen == old)
+			return count;
+		old = seen;
+	}
+}
+
+void main()
+{
+	State state = State(registers.state_va);
+	uint num_entries = registers.num_entry_points;
+	uint64_t sources_va = registers.state_va + 16ul + 32ul * uint64_t(num_entries);
+	SlotSources sources = SlotSources(sources_va);
+	Slots slots = Slots(sources_va + ((4ul * uint64_t(num_entries) * uint64_t(DIRECT_SLOTS) + 15ul) & ~15ul));
+	uint64_t num_inputs = uint64_t(registers.multi_input.num_node_inputs);
+	uint64_t group_size = uint64_t(gl_WorkGroupSize.x);
+	uint lane = gl_LocalInvocationIndex;
+
+	// Each invocation looks at one input, then the workgroup copies the merged inputs of the batch together.
+	// The loop index is 64-bit, so that it cannot wrap for up to 2^32 - 1 inputs.
+	for (uint64_t base = uint64_t(gl_WorkGroupID.x) * group_size; base < num_inputs;
+			base += uint64_t(gl_NumWorkGroups.x) * group_size)
+	{
+		uint64_t i = base + uint64_t(lane);
+		uint count = 0u;
+
+		if (i < num_inputs)
+		{
+			GPUInput node_input = InputRef(registers.multi_input.inputs_va + i * registers.multi_input.inputs_stride).value;
+			uint e = node_input.entry_point_index;
+
+			if (e < num_entries && node_input.num_records != 0u && registers.record_strides.data[e] != 0u)
+			{
+				bool direct = false;
+				uint first = 0u;
+
+				for (uint k = 0u; k < DIRECT_SLOTS; k++)
+					if (sources.data[e * DIRECT_SLOTS + k] == uint(i))
+						direct = true;
+
+				if (!direct)
+				{
+					GPUInput merge = slots.data[e * (DIRECT_SLOTS + 1u) + DIRECT_SLOTS];
+					count = reserve(state, e, node_input.num_records, first);
+					shared_first[lane] = first;
+					shared_stride[lane] = uint(merge.records_stride);
+					shared_src_va[lane] = node_input.records_va;
+					shared_src_stride[lane] = node_input.records_stride;
+					shared_dst_va[lane] = merge.records_va;
+				}
+			}
+		}
+		shared_count[lane] = count;
+
+		barrier();
+
+		for (uint k = 0u; k < gl_WorkGroupSize.x; k++)
+		{
+			uint copy_count = shared_count[k];
+			if (copy_count == 0u)
+				continue;
+
+			uint stride = shared_stride[k];
+			uint dwords = stride / 4u;
+			uint64_t src_va = shared_src_va[k];
+			uint64_t src_stride = shared_src_stride[k];
+			uint64_t dst_va = shared_dst_va[k] + uint64_t(shared_first[k]) * uint64_t(stride);
+			// copy_count * dwords is at most the staging capacity in dwords.
+			uint total = copy_count * dwords;
+
+			for (uint t = lane; t < total; t += gl_WorkGroupSize.x)
+			{
+				uint record = t / dwords;
+				uint dword = t - record * dwords;
+				Dword src = Dword(src_va + uint64_t(record) * src_stride + uint64_t(dword) * 4ul);
+				Dword dst = Dword(dst_va + uint64_t(record) * uint64_t(stride) + uint64_t(dword) * 4ul);
+				dst.value = src.value;
+			}
+		}
+
+		// The shared values of the next batch must not be written before all invocations have read these.
+		barrier();
+	}
+}

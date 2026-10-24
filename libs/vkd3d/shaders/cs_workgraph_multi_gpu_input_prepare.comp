@@ -1,0 +1,281 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "cs_workgraph_multi_gpu_input_math.h"
+
+// amdgpu-wddm fork: the preparation passes of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT.
+// The number of inputs and their record counts are only in GPU memory. Each entry point gets
+// DIRECT_SLOTS direct slots and one merge slot, each a D3D12_NODE_GPU_INPUT that the NODE_GPU_INPUT path executes.
+// A direct slot is a copy of one large input of the application: its records are read in place, so it has no size
+// limit. All other inputs of the entry point go to the merge slot: cs_workgraph_multi_gpu_input_copy.comp copies
+// their records into the staging range of the backing memory, at the record size aligned to 4 bytes.
+// An empty record (record size 0) needs no copy: the merge slot only has the sum of the counts.
+// Records are lost only if the merged records of the entry points do not fit in the staging range, or if the merged
+// count of an entry point is more than 2^32 - 1. The overflow word of the state is then set, and the lost records
+// are added to the struct vkd3d_workgraph_lost_records of the state object, which the CPU reports.
+// The mode selects the pass:
+//   MODE_INIT (one workgroup): clears the state and the slots.
+//   MODE_CLASSIFY (any number of workgroups): puts large inputs into the direct slots and sums the counts of the
+//     other inputs per entry point, in 64 bits.
+//   MODE_LAYOUT (one workgroup): gives each merge slot its part of the staging range.
+// The state layout is in vkd3d_private.h (vkd3d_workgraph_multi_gpu_input_*_offset).
+layout(local_size_x = 64) in;
+
+const uint MODE_INIT = 0u;
+const uint MODE_CLASSIFY = 1u;
+const uint MODE_LAYOUT = 2u;
+// VKD3D_WORKGRAPH_MULTI_INPUT_DIRECT_SLOTS.
+const uint DIRECT_SLOTS = 4u;
+
+// D3D12_NODE_GPU_INPUT, 24 bytes.
+struct GPUInput
+{
+	uint entry_point_index;
+	uint num_records;
+	uint64_t records_va;
+	uint64_t records_stride;
+};
+
+// struct vkd3d_workgraph_multi_gpu_input_entry, 32 bytes.
+struct EntryState
+{
+	uint direct_count;
+	uint merged_lo;
+	uint merged_hi;
+	uint cursor;
+	uint fit;
+	uint padding0;
+	uint padding1;
+	uint padding2;
+};
+
+// D3D12_MULTI_NODE_GPU_INPUT, 24 bytes.
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer MultiInput
+{
+	uint num_node_inputs;
+	uint padding;
+	uint64_t inputs_va;
+	uint64_t inputs_stride;
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) readonly buffer InputRef
+{
+	GPUInput value;
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) readonly buffer Strides
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer State
+{
+	uint overflow;
+	uint padding[3];
+	EntryState entries[];
+};
+
+layout(buffer_reference, buffer_reference_align = 4, std430) buffer SlotSources
+{
+	uint data[];
+};
+
+layout(buffer_reference, buffer_reference_align = 8, std430) buffer Slots
+{
+	GPUInput data[];
+};
+
+// struct vkd3d_workgraph_lost_records.
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer LostRecords
+{
+	uint events;
+	uint records_lo;
+	uint records_hi;
+	uint padding;
+};
+
+// struct vkd3d_workgraph_multi_gpu_input_prepare_args.
+layout(push_constant) uniform Registers
+{
+	MultiInput multi_input;
+	Strides record_strides;
+	uint64_t state_va;
+	uint64_t staging_va;
+	uint64_t staging_capacity;
+	uint64_t lost_records_va;
+	uint num_entry_points;
+	uint mode;
+	uint large_size;
+	uint padding;
+} registers;
+
+uint64_t slot_sources_va()
+{
+	return registers.state_va + 16ul + 32ul * uint64_t(registers.num_entry_points);
+}
+
+uint64_t slots_va()
+{
+	uint64_t size = (4ul * uint64_t(registers.num_entry_points) * uint64_t(DIRECT_SLOTS) + 15ul) & ~15ul;
+	return slot_sources_va() + size;
+}
+
+// Adds a 64-bit value with two 32-bit atomics. The sum of all additions is exact.
+void add_merged(State state, uint e, uint64_t value)
+{
+	uint lo = uint(value);
+	uint hi = uint(value >> 32);
+	uint old = atomicAdd(state.entries[e].merged_lo, lo);
+	hi += wg_math_add_carry(old, lo);
+	if (hi != 0u)
+		atomicAdd(state.entries[e].merged_hi, hi);
+}
+
+void init(State state)
+{
+	SlotSources sources = SlotSources(slot_sources_va());
+	Slots slots = Slots(slots_va());
+	uint num_entries = registers.num_entry_points;
+
+	if (gl_LocalInvocationIndex == 0u)
+		state.overflow = 0u;
+
+	for (uint e = gl_LocalInvocationIndex; e < num_entries; e += gl_WorkGroupSize.x)
+	{
+		state.entries[e].direct_count = 0u;
+		state.entries[e].merged_lo = 0u;
+		state.entries[e].merged_hi = 0u;
+		state.entries[e].cursor = 0u;
+		state.entries[e].fit = 0u;
+
+		for (uint k = 0u; k <= DIRECT_SLOTS; k++)
+		{
+			GPUInput empty;
+			empty.entry_point_index = e;
+			empty.num_records = 0u;
+			empty.records_va = 0ul;
+			empty.records_stride = 0ul;
+			slots.data[e * (DIRECT_SLOTS + 1u) + k] = empty;
+			if (k < DIRECT_SLOTS)
+				sources.data[e * DIRECT_SLOTS + k] = ~0u;
+		}
+	}
+}
+
+void classify(State state)
+{
+	SlotSources sources = SlotSources(slot_sources_va());
+	Slots slots = Slots(slots_va());
+	uint64_t num_inputs = uint64_t(registers.multi_input.num_node_inputs);
+	uint64_t inputs_va = registers.multi_input.inputs_va;
+	uint64_t inputs_stride = registers.multi_input.inputs_stride;
+	uint64_t threads = uint64_t(gl_NumWorkGroups.x) * uint64_t(gl_WorkGroupSize.x);
+	uint num_entries = registers.num_entry_points;
+	uint acc_entry = ~0u;
+	uint64_t acc = 0ul;
+
+	// The loop index is 64-bit, so that it cannot wrap for up to 2^32 - 1 inputs.
+	for (uint64_t i = uint64_t(gl_GlobalInvocationID.x); i < num_inputs; i += threads)
+	{
+		GPUInput node_input = InputRef(inputs_va + i * inputs_stride).value;
+		uint e = node_input.entry_point_index;
+
+		// An entry point index out of range is an application error. Such an input is ignored.
+		if (e >= num_entries || node_input.num_records == 0u)
+			continue;
+
+		if (wg_math_is_large(node_input.num_records, registers.record_strides.data[e], registers.large_size))
+		{
+			uint rank = DIRECT_SLOTS;
+
+			// Read first, so that the count stays near DIRECT_SLOTS and cannot wrap.
+			if (atomicAdd(state.entries[e].direct_count, 0u) < DIRECT_SLOTS)
+				rank = atomicAdd(state.entries[e].direct_count, 1u);
+			if (rank < DIRECT_SLOTS)
+			{
+				node_input.entry_point_index = e;
+				slots.data[e * (DIRECT_SLOTS + 1u) + rank] = node_input;
+				sources.data[e * DIRECT_SLOTS + rank] = uint(i);
+				continue;
+			}
+		}
+
+		// A merged input. Add up the counts per entry point in this invocation first, so that an input array
+		// with a stride of 0 does not do one atomic operation per input.
+		if (e != acc_entry)
+		{
+			if (acc_entry != ~0u)
+				add_merged(state, acc_entry, acc);
+			acc_entry = e;
+			acc = 0ul;
+		}
+		acc += uint64_t(node_input.num_records);
+	}
+
+	if (acc_entry != ~0u)
+		add_merged(state, acc_entry, acc);
+}
+
+void layout_merge_slots(State state)
+{
+	Slots slots = Slots(slots_va());
+	uint num_entries = registers.num_entry_points;
+	uint64_t offset = 0ul;
+	uint64_t lost = 0ul;
+	uint overflow = 0u;
+
+	if (gl_LocalInvocationIndex != 0u)
+		return;
+
+	for (uint e = 0u; e < num_entries; e++)
+	{
+		uint stride = registers.record_strides.data[e];
+		uint64_t merged = (uint64_t(state.entries[e].merged_hi) << 32) | uint64_t(state.entries[e].merged_lo);
+		uint64_t count = wg_math_merge_count(merged, stride, wg_math_room(registers.staging_capacity, offset));
+
+		if (count < merged)
+		{
+			overflow = 1u;
+			lost += merged - count;
+		}
+
+		state.entries[e].fit = uint(count);
+		state.entries[e].cursor = 0u;
+
+		GPUInput merge;
+		merge.entry_point_index = e;
+		merge.num_records = uint(count);
+		merge.records_va = registers.staging_va + offset;
+		merge.records_stride = uint64_t(stride);
+		slots.data[e * (DIRECT_SLOTS + 1u) + DIRECT_SLOTS] = merge;
+
+		offset = wg_math_next_offset(offset, count, stride);
+	}
+
+	state.overflow = overflow;
+
+	if (overflow != 0u && registers.lost_records_va != 0ul)
+	{
+		LostRecords lost_records = LostRecords(registers.lost_records_va);
+		uint lo = uint(lost);
+		uint hi = uint(lost >> 32);
+		uint old = atomicAdd(lost_records.records_lo, lo);
+		hi += wg_math_add_carry(old, lo);
+		if (hi != 0u)
+			atomicAdd(lost_records.records_hi, hi);
+		atomicAdd(lost_records.events, 1u);
+	}
+}
+
+void main()
+{
+	State state = State(registers.state_va);
+
+	if (registers.mode == MODE_INIT)
+		init(state);
+	else if (registers.mode == MODE_CLASSIFY)
+		classify(state);
+	else if (registers.mode == MODE_LAYOUT)
+		layout_merge_slots(state);
+}

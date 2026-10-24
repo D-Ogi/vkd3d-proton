@@ -74,3 +74,5 @@ VKD3D_DECL_CONFIG("debug_wave64_simulation", DEBUG_WAVE64_SIMULATION)
 VKD3D_DECL_CONFIG("fail_unsupported_state_template", FAIL_UNSUPPORTED_STATE_TEMPLATE)
 VKD3D_DECL_CONFIG("ignore_shared_fence", IGNORE_SHARED_FENCE)
 VKD3D_DECL_CONFIG("adreno_7xx_extra_compat", ADRENO_7XX_EXTRA_COMPAT)
+/* amdgpu-wddm fork: work graphs without the other experimental features (d3d12_device_supports_workgraphs). */
+VKD3D_DECL_CONFIG_PLAIN(WORKGRAPHS)

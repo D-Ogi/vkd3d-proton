@@ -2194,6 +2194,7 @@ static void vkd3d_shader_dxil_dup_node_input(struct vkd3d_shader_library_entry_p
     input->dispatch_grid_is_upper_bound = node_input->dispatch_grid_is_upper_bound == DXIL_SPV_TRUE;
     input->node_track_rw_input_sharing = node_input->node_track_rw_input_sharing == DXIL_SPV_TRUE;
     input->is_program_entry = node_input->is_program_entry == DXIL_SPV_TRUE;
+    input->record_size = node_input->record_size;
 }
 
 static void vkd3d_shader_dxil_dup_node_output(struct vkd3d_shader_library_entry_point *entry,
@@ -2236,6 +2237,7 @@ static bool vkd3d_dxil_build_entry(struct vkd3d_shader_library_entry_point *entr
     entry->stage = convert_stage(stage);
     entry->pipeline_variant_index = UINT32_MAX;
     entry->stage_index = UINT32_MAX;
+    entry->export_index = UINT32_MAX;
     return true;
 }
 
@@ -2455,6 +2457,7 @@ int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(
                 new_entry.stage = convert_stage(stage);
                 new_entry.pipeline_variant_index = UINT32_MAX;
                 new_entry.stage_index = UINT32_MAX;
+                new_entry.export_index = UINT32_MAX;
 
                 if (stage == DXIL_SPV_STAGE_COMPUTE)
                 {
@@ -2465,6 +2468,10 @@ int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(
 
                     if (dxil_spv_parsed_blob_get_entry_index_by_name(blob, ascii_entry, &entry_index) == DXIL_SPV_SUCCESS)
                     {
+                        if (dxil_spv_parsed_blob_get_entry_point_export_index(blob, entry_index,
+                                &new_entry.export_index) != DXIL_SPV_SUCCESS)
+                            new_entry.export_index = UINT32_MAX;
+
                         if (dxil_spv_parsed_blob_get_entry_point_node_input(blob, entry_index, &node_input_data) == DXIL_SPV_SUCCESS)
                             vkd3d_shader_dxil_dup_node_input(&new_entry, &node_input_data);
 
@@ -2516,6 +2523,10 @@ int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(
                 dxil_spv_node_output_data node_output_data;
                 dxil_spv_node_input_data node_input_data;
                 unsigned int num_outputs;
+
+                if (dxil_spv_parsed_blob_get_entry_point_export_index(blob, i,
+                        &new_entry.export_index) != DXIL_SPV_SUCCESS)
+                    new_entry.export_index = UINT32_MAX;
 
                 if (dxil_spv_parsed_blob_get_entry_point_node_input(blob, i, &node_input_data) == DXIL_SPV_SUCCESS)
                     vkd3d_shader_dxil_dup_node_input(&new_entry, &node_input_data);
