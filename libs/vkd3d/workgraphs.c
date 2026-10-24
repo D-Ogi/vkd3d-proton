@@ -1212,7 +1212,23 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
             in_program[program->slot_entry[program->levels[i].shared_nodes[j].node_pipeline_index]] = true;
     }
 
-    /* Listed entry points first, then every node in export order. */
+    /* Population order: the explicitly defined nodes, then the listed entry points, then every node in export
+     * order (INCLUDE_ALL_AVAILABLE_NODES). Each node is followed by its outputs, depth first. */
+    for (i = 0; i < program->explicit_defined_nodes_count; i++)
+    {
+        const struct vkd3d_shader_library_entry_point *defined;
+
+        if (program->explicit_defined_nodes[i].NodeType != D3D12_NODE_TYPE_SHADER)
+            continue;
+        defined = d3d12_wg_state_object_find_exported_entry_point(data,
+                program->explicit_defined_nodes[i].Shader.Shader);
+        if (defined)
+        {
+            d3d12_wg_state_object_population_visit(data, in_program, visited, order, &order_count,
+                    defined - data->entry_points);
+        }
+    }
+
     for (i = 0; i < program->explicit_entry_point_count; i++)
     {
         node_index = d3d12_work_graph_find_node_by_id_wchar(data->entry_points, data->entry_points_count,
