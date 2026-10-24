@@ -2167,12 +2167,26 @@ static HRESULT d3d12_wg_state_object_compile_pipeline(
         assert(tmp->spec_data[i] != UINT32_MAX);
 
         /* amdgpu-wddm fork: a recursive output goes to the slot of the next depth. At the last depth
-         * the node must not recurse (GetRemainingRecursionLevels() is 0), so the slot stays. */
-        if (tmp->spec_data[i] == program->slot_entry[entry_point_index] && entry->node_input->recursion_factor)
+         * the node must not recurse (GetRemainingRecursionLevels() is 0), so the slot stays.
+         * The shader adds the array element to the spec constant. In an output array that holds the node
+         * itself, only the element of the node is a valid target: a node must not target another node of its
+         * own array (WorkGraphs.md, Node array constraints). So the constant is set to put that element on
+         * the depth slot, in uint arithmetic. */
+        if (entry->node_input->recursion_factor)
         {
-            tmp->spec_data[i] = d3d12_wg_state_object_program_depth_slot(program,
-                    program->slot_entry[entry_point_index],
-                    min(program->slot_depth[entry_point_index] + 1, entry->node_input->recursion_factor));
+            for (j = 0; j < node_array_size; j++)
+            {
+                if (d3d12_work_graph_find_node_by_id(data->entry_points, data->entry_points_count,
+                        entry->node_outputs[i].node_id, entry->node_outputs[i].node_array_index + j) ==
+                        program->slot_entry[entry_point_index])
+                {
+                    tmp->spec_data[i] = d3d12_wg_state_object_program_depth_slot(program,
+                            program->slot_entry[entry_point_index],
+                            min(program->slot_depth[entry_point_index] + 1,
+                                    entry->node_input->recursion_factor)) - j;
+                    break;
+                }
+            }
         }
     }
 
