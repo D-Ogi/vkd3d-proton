@@ -3630,6 +3630,7 @@ static void d3d12_command_list_workgraph_execute_entry_cpu(
 {
     struct vkd3d_scratch_allocation payload_scratch;
     VkDeviceSize payload_size;
+    uint32_t record_size;
     uint32_t node_index;
     unsigned int i;
 
@@ -3643,9 +3644,17 @@ static void d3d12_command_list_workgraph_execute_entry_cpu(
     }
 
     node_index = program->levels[0].nodes[desc->EntrypointIndex];
-    payload_size = desc->NumRecords * desc->RecordStrideInBytes;
+    record_size = wg_state->entry_points[node_index].node_input->payload_stride;
     if (desc->RecordStrideInBytes == 0)
-        payload_size = wg_state->entry_points[node_index].node_input->payload_stride;
+        payload_size = record_size;
+    else if (record_size)
+    {
+        /* amdgpu-wddm fork: the last record needs only its own size. A full stride for it can read past the
+         * end of the application's array. */
+        payload_size = (VkDeviceSize)(desc->NumRecords - 1) * desc->RecordStrideInBytes + record_size;
+    }
+    else
+        payload_size = (VkDeviceSize)desc->NumRecords * desc->RecordStrideInBytes;
 
     if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
             VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD, payload_size, 64, ~0u, &payload_scratch))
