@@ -43,6 +43,9 @@
 #define VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE (64ull * 1024)
 /* The node output allocator computes payload offsets in 32 bits. */
 STATIC_ASSERT(VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE <= UINT32_MAX);
+STATIC_ASSERT(sizeof(struct vkd3d_workgraph_lost_records) <= VKD3D_WORKGRAPH_ABANDONED_OFFSET);
+STATIC_ASSERT(sizeof(struct vkd3d_workgraph_drain_control) == 72 * sizeof(uint32_t));
+STATIC_ASSERT(sizeof(struct vkd3d_workgraph_abandoned) == 20 * sizeof(uint32_t));
 /* The packed offsets of the payloads, after the required scratch memory: their size with MinSizeInBytes and with
  * MaxSizeInBytes of backing memory. The sizes are arbitrary. */
 #define VKD3D_WORKGRAPH_PACKED_OFFSETS_MIN_SIZE (64ull * 1024 * 1024)
@@ -90,6 +93,25 @@ static const GUID amdgpu_wddm_wg_status_guid =
  * first program, for test_workgraph_output_bounds. The ranges exist only with AMDGPU_WDDM_WG_LIMITS=canary=1. */
 static const GUID amdgpu_wddm_wg_canary_guid =
         { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x06 } };
+
+/* amdgpu-wddm fork, lab flavour only: GetPrivateData with this GUID gives struct amdgpu_wddm_wg_drain of the first
+ * program, for test_workgraph_drain_rounds. control_offset is the offset of struct vkd3d_workgraph_drain_control in
+ * the backing memory, valid only if rounds is not 0. */
+static const GUID amdgpu_wddm_wg_drain_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x07 } };
+
+struct amdgpu_wddm_wg_drain
+{
+    uint32_t rounds;
+    uint32_t pending_rounds;
+    uint64_t control_offset;
+    uint32_t abandoned_events;
+    uint32_t abandoned_reasons;
+    uint32_t abandoned_last_reason;
+    uint32_t abandoned_flags;
+    uint32_t hook_calls;
+    uint32_t violations;
+};
 #endif
 
 /* amdgpu-wddm fork, lab flavour: the canary ranges of a program, offsets from the start of the backing memory.
@@ -126,6 +148,10 @@ struct d3d12_wg_multi_input_config
     uint32_t packed_limit;
     /* canary=1: a canary range after each payload sink and after the unrolled offsets. */
     bool canaries;
+    /* rounds=<n> (0 to VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS): the extra rounds of the draining scheduler.
+     * pending=<k> (test hook): the pending dispatches of the rounds below k report waiting work. */
+    uint32_t drain_rounds;
+    uint32_t drain_pending;
     uint32_t large_size;
     uint32_t groups;
 };
@@ -142,6 +168,8 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
     config->ring_size = VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE;
     config->packed_limit = UINT32_MAX;
     config->canaries = false;
+    config->drain_rounds = 0;
+    config->drain_pending = 0;
     config->large_size = VKD3D_WORKGRAPH_MULTI_INPUT_LARGE_SIZE;
     config->groups = VKD3D_WORKGRAPH_MULTI_INPUT_GROUPS;
 
@@ -161,12 +189,17 @@ static void d3d12_wg_get_multi_input_config(struct d3d12_wg_multi_input_config *
                 config->packed_limit = n;
             else if (!strcmp(p, "canary=1"))
                 config->canaries = true;
+            else if (!strncmp(p, "rounds=", 7) && (n = strtoull(p + 7, NULL, 0)) <= VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS)
+                config->drain_rounds = n;
+            else if (!strncmp(p, "pending=", 8) && (n = strtoull(p + 8, NULL, 0)) <= VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS + 1)
+                config->drain_pending = n;
             else
                 WARN("Ignoring %s in AMDGPU_WDDM_WG_LIMITS.\n", p);
         }
 
-        WARN("Work graph limits: payload ring %"PRIu64" bytes, packed offset limit %u, canaries %u.\n",
-                config->ring_size, config->packed_limit, config->canaries);
+        WARN("Work graph limits: payload ring %"PRIu64" bytes, packed offset limit %u, canaries %u, "
+                "extra rounds %u, pending hook %u.\n", config->ring_size, config->packed_limit, config->canaries,
+                config->drain_rounds, config->drain_pending);
     }
 
     if (!vkd3d_get_env_var("AMDGPU_WDDM_WG_MULTI_INPUT", value, sizeof(value)))
@@ -347,6 +380,13 @@ struct d3d12_wg_state_object_program
     VkDeviceSize payload1_scratch_size;
     VkDeviceSize unrolled_offsets_scratch_offset;
     VkDeviceSize unrolled_offsets_scratch_size;
+    /* amdgpu-wddm fork: struct vkd3d_workgraph_drain_control, before the output guard, only if drain_rounds is not 0.
+     * drain_rounds is the number of extra rounds, drain_pending the lab test hook (AMDGPU_WDDM_WG_LIMITS). */
+    VkDeviceSize drain_control_scratch_offset;
+    VkDeviceSize drain_control_scratch_size;
+    uint32_t drain_rounds;
+    uint32_t drain_pending;
+    struct vkd3d_workgraph_meta_pipeline_info drain;
     /* amdgpu-wddm fork: struct vkd3d_workgraph_output_guard, the last range of the required scratch memory. */
     VkDeviceSize output_guard_scratch_offset;
     VkDeviceSize output_guard_scratch_size;
@@ -1821,6 +1861,42 @@ static void d3d12_wg_state_object_report_lost_records(struct d3d12_wg_state_obje
             "the count is a lower bound." : "");
 }
 
+/* amdgpu-wddm fork: an ERR line when close abandoned work since the last line, at the same points as the lost
+ * records. The item counts are 128-bit, printed in hexadecimal, so that they are exact. */
+static void d3d12_wg_state_object_report_abandoned(struct d3d12_wg_state_object *state_object)
+{
+    volatile struct vkd3d_workgraph_abandoned *abandoned = state_object->abandoned_host;
+    static const char * const kinds[] = { "groups", "coalescing slots", "threads" };
+    uint32_t events, reported, reasons;
+    bool exhausted, fault;
+    char items[3][64];
+    unsigned int i;
+
+    if (!abandoned)
+        return;
+    events = abandoned->events;
+    reported = vkd3d_atomic_uint32_load_explicit(&state_object->abandoned_events_reported, vkd3d_memory_order_relaxed);
+    if (events == reported)
+        return;
+    if (vkd3d_atomic_uint32_compare_exchange(&state_object->abandoned_events_reported, reported, events,
+            vkd3d_memory_order_relaxed, vkd3d_memory_order_relaxed) != reported)
+        return;
+
+    reasons = abandoned->reasons;
+    for (i = 0; i < ARRAY_SIZE(items); i++)
+    {
+        snprintf(items[i], sizeof(items[i]), "%s 0x%08x%08x%08x%08x", kinds[i], abandoned->items[i][3],
+                abandoned->items[i][2], abandoned->items[i][1], abandoned->items[i][0]);
+    }
+    exhausted = !!(reasons & (1u << VKD3D_WORKGRAPH_DRAIN_REASON_EXHAUSTED));
+    fault = !!(reasons & (1u << VKD3D_WORKGRAPH_DRAIN_REASON_FAULT));
+    ERR("Work graph %p: %u times work was abandoned when the rounds ended (%s%s%s). Waiting work: %s, %s, %s, "
+            "input records not taken %"PRIu64".\n", (void *)state_object, events,
+            exhausted ? "the last round had waiting work" : "", exhausted && fault ? ", " : "",
+            fault ? "a round made no progress" : "",
+            items[0], items[1], items[2], ((uint64_t)abandoned->inputs_hi << 32) | abandoned->inputs_lo);
+}
+
 static void d3d12_wg_state_object_dec_ref(struct d3d12_wg_state_object *state_object)
 {
     unsigned int refcount = InterlockedDecrement(&state_object->internal_refcount);
@@ -1831,6 +1907,7 @@ static void d3d12_wg_state_object_dec_ref(struct d3d12_wg_state_object *state_ob
     {
         struct d3d12_device *device = state_object->device;
         d3d12_wg_state_object_report_lost_records(state_object);
+        d3d12_wg_state_object_report_abandoned(state_object);
         vkd3d_private_store_destroy(&state_object->private_store);
         d3d12_wg_state_object_cleanup(state_object);
         vkd3d_free(state_object);
@@ -1928,6 +2005,42 @@ static HRESULT STDMETHODCALLTYPE d3d12_wg_state_object_GetPrivateData(ID3D12Stat
             memcpy(data, &canaries, sizeof(canaries));
         }
         *data_size = sizeof(canaries);
+        return S_OK;
+    }
+
+    /* amdgpu-wddm fork, lab flavour: the round frame of the first program, for tests. */
+    if (IsEqualGUID(guid, &amdgpu_wddm_wg_drain_guid))
+    {
+        volatile struct vkd3d_workgraph_abandoned *abandoned = state_object->abandoned_host;
+        struct amdgpu_wddm_wg_drain drain;
+
+        if (!data_size)
+            return E_INVALIDARG;
+        if (data && *data_size < sizeof(drain))
+            return E_INVALIDARG;
+        if (data)
+        {
+            memset(&drain, 0, sizeof(drain));
+            if (state_object->programs_count)
+            {
+                drain.rounds = state_object->programs[0].drain_rounds;
+                drain.pending_rounds = state_object->programs[0].drain_pending;
+                drain.control_offset = state_object->programs[0].drain_control_scratch_offset;
+            }
+            if (abandoned)
+            {
+                drain.abandoned_events = abandoned->events;
+                drain.abandoned_reasons = abandoned->reasons;
+                drain.abandoned_last_reason = abandoned->last_reason;
+                drain.abandoned_flags = abandoned->flags;
+            }
+            drain.hook_calls = vkd3d_atomic_uint32_load_explicit(&state_object->drain_hook_calls,
+                    vkd3d_memory_order_relaxed);
+            drain.violations = vkd3d_atomic_uint32_load_explicit(&state_object->drain_violations,
+                    vkd3d_memory_order_relaxed);
+            memcpy(data, &drain, sizeof(drain));
+        }
+        *data_size = sizeof(drain);
         return S_OK;
     }
 #endif
@@ -2813,6 +2926,20 @@ static HRESULT d3d12_wg_state_object_compile_program(
                 program->unrolled_offsets_scratch_size - canary_size;
         program->canary_count = VKD3D_WORKGRAPH_CANARY_COUNT;
     }
+    /* The extra rounds are conditional rendering blocks. Without conditional rendering there is only round 1. Without
+     * extra rounds the layout does not change. */
+    program->drain_rounds = multi_input_config.drain_rounds;
+    program->drain_pending = multi_input_config.drain_pending;
+    if (program->drain_rounds && !object->device->device_info.conditional_rendering_features.conditionalRendering)
+    {
+        WARN("No conditional rendering, ignoring %u extra rounds.\n", program->drain_rounds);
+        program->drain_rounds = 0;
+    }
+    if (program->drain_rounds)
+    {
+        alloc_scratch(drain_control_scratch, sizeof(struct vkd3d_workgraph_drain_control));
+        vkd3d_meta_get_workgraph_drain_pipeline(&object->device->meta_ops, &program->drain);
+    }
     /* The output guard ends where the packed offsets start. */
     alloc_scratch(output_guard_scratch, sizeof(struct vkd3d_workgraph_output_guard));
     program->payload_ring_size = multi_input_config.ring_size;
@@ -3027,9 +3154,11 @@ static HRESULT d3d12_wg_state_object_allocate_lost_records(struct d3d12_wg_state
     HRESULT hr;
     VkResult vr;
 
+    /* struct vkd3d_workgraph_abandoned follows struct vkd3d_workgraph_lost_records. */
     if (FAILED(hr = vkd3d_create_buffer_explicit_usage(object->device,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            sizeof(struct vkd3d_workgraph_lost_records), "workgraph-lost-records", &ring->vk_buffer)))
+            VKD3D_WORKGRAPH_ABANDONED_OFFSET + sizeof(struct vkd3d_workgraph_abandoned), "workgraph-lost-records",
+            &ring->vk_buffer)))
         return hr;
 
     if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(object->device, ring->vk_buffer,
@@ -3040,8 +3169,10 @@ static HRESULT d3d12_wg_state_object_allocate_lost_records(struct d3d12_wg_state
         return hresult_from_vk_result(vr);
 
     object->lost_records_host = ptr;
-    memset(ptr, 0, sizeof(struct vkd3d_workgraph_lost_records));
+    object->abandoned_host = (void *)((uint8_t *)ptr + VKD3D_WORKGRAPH_ABANDONED_OFFSET);
+    memset(ptr, 0, VKD3D_WORKGRAPH_ABANDONED_OFFSET + sizeof(struct vkd3d_workgraph_abandoned));
     ring->va = vkd3d_get_buffer_device_address(object->device, ring->vk_buffer);
+    object->abandoned_va = ring->va + VKD3D_WORKGRAPH_ABANDONED_OFFSET;
     return S_OK;
 }
 
@@ -4356,14 +4487,168 @@ static bool d3d12_command_list_workgraph_execute_entry_level(
     }
 }
 
+/* amdgpu-wddm fork: the round frame of the draining scheduler (option C). After round 1 the engine records
+ * program->drain_rounds extra rounds, each in a conditional rendering block on the pending word of the round before.
+ * The engine owns conditional rendering from B0 to B6: B0 ends the predicate of SetPredication and keeps its state,
+ * and sets enabled_on_command_buffer to false, so that no helper begins the application block inside an engine
+ * block (d3d12_command_list_update_conditional_rendering_state returns at once then). Round 1 runs in an engine block
+ * on the application's predicate, if there is one. B6 restores the state and begins the application block again
+ * if it was active. Only dispatches and barriers go into the blocks: a copy or a fill is not predicated. */
+struct d3d12_wg_drain_predication
+{
+    bool was_active;
+    bool enabled_on_command_buffer;
+    bool block_resume;
+};
+
+static void d3d12_command_list_workgraph_drain_suppress(struct d3d12_command_list *list,
+        struct d3d12_wg_drain_predication *saved)
+{
+    /* was_active first: ending the block sets current_enabled to false. */
+    saved->was_active = list->predication.current_enabled;
+    d3d12_command_list_workgraph_update_predication(list, true);
+    saved->enabled_on_command_buffer = list->predication.enabled_on_command_buffer;
+    saved->block_resume = list->cmd.suspend_resume.block_resume;
+    list->predication.enabled_on_command_buffer = false;
+}
+
+static void d3d12_command_list_workgraph_drain_restore(struct d3d12_command_list *list,
+        const struct d3d12_wg_drain_predication *saved)
+{
+    list->predication.enabled_on_command_buffer = saved->enabled_on_command_buffer;
+    list->cmd.suspend_resume.block_resume = saved->block_resume;
+    if (saved->was_active)
+        d3d12_command_list_workgraph_update_predication(list, false);
+}
+
+static void d3d12_command_list_workgraph_drain_barrier(struct d3d12_command_list *list)
+{
+    d3d12_command_list_workgraph_barrier(list,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+            VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT);
+}
+
+static void d3d12_command_list_workgraph_emit_drain(struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object *state, const struct d3d12_wg_state_object_program *program,
+        enum vkd3d_workgraph_drain_mode mode, uint32_t round)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    struct vkd3d_workgraph_drain_args args;
+
+    memset(&args, 0, sizeof(args));
+    args.control_va = list->wg_state.BackingMemory.StartAddress + program->drain_control_scratch_offset;
+    args.abandoned_va = state->abandoned_va;
+    args.mode = mode;
+    args.round = round;
+    args.rounds = program->drain_rounds;
+    args.pending_rounds = program->drain_pending;
+    /* "drain-stall:<r>" makes round r a round without progress. */
+    args.stall = mode == VKD3D_WORKGRAPH_DRAIN_MODE_PENDING && d3d12_wg_fault_injected("drain-stall", round);
+
+    VK_CALL(vkCmdBindPipeline(list->cmd.vk_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            program->drain.vk_pipeline));
+    d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer, program->drain.vk_pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT, sizeof(args), &args);
+    VK_CALL(vkCmdDispatch(list->cmd.vk_command_buffer, 1, 1, 1));
+    VKD3D_BREADCRUMB_TAG("drain");
+    VKD3D_BREADCRUMB_AUX32(mode);
+    VKD3D_BREADCRUMB_AUX32(round);
+    VKD3D_BREADCRUMB_COMMAND(WORKGRAPH_META);
+}
+
+static void d3d12_command_list_workgraph_drain_begin(struct d3d12_command_list *list,
+        struct d3d12_wg_state_object *state, VkBuffer vk_buffer, VkDeviceSize offset)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkConditionalRenderingBeginInfoEXT begin_info;
+
+    /* "drain-hook" tries to begin the application block inside the engine scope, as a helper could. */
+    if (d3d12_wg_fault_injected("drain-hook", UINT_MAX))
+    {
+        vkd3d_atomic_uint32_increment(&state->drain_hook_calls, vkd3d_memory_order_relaxed);
+        d3d12_command_list_workgraph_update_predication(list, false);
+    }
+
+    /* Conditional rendering blocks do not nest. An active application block here is an engine defect. */
+    if (list->predication.current_enabled)
+    {
+        ERR("The predicate of SetPredication is active in a work graph round, ending it.\n");
+        vkd3d_atomic_uint32_increment(&state->drain_violations, vkd3d_memory_order_relaxed);
+        d3d12_command_list_workgraph_update_predication(list, true);
+    }
+
+    begin_info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
+    begin_info.pNext = NULL;
+    begin_info.buffer = vk_buffer;
+    begin_info.offset = offset;
+    begin_info.flags = 0;
+    VK_CALL(vkCmdBeginConditionalRenderingEXT(list->cmd.vk_command_buffer, &begin_info));
+}
+
+static void d3d12_command_list_workgraph_drain_end(struct d3d12_command_list *list)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+
+    VK_CALL(vkCmdEndConditionalRenderingEXT(list->cmd.vk_command_buffer));
+}
+
+/* The end of round 1 and the extra rounds, then close. Round r (round 1 is r = 0) ends with the pending dispatch
+ * that writes pending[r]. Extra round r runs levels 1 to num_levels - 1 under pending[r - 1]; the entry level runs only
+ * in round 1. */
+static void d3d12_command_list_workgraph_drain_rounds(struct d3d12_command_list *list,
+        struct d3d12_wg_state_object *state, const struct d3d12_wg_state_object_program *program,
+        const struct vkd3d_unique_resource *backing, VkDeviceAddress vk_root_parameter_buffer_va, bool *block)
+{
+    VkDeviceSize control_offset;
+    uint32_t r, i;
+
+    control_offset = list->wg_state.BackingMemory.StartAddress - backing->va + program->drain_control_scratch_offset;
+
+    d3d12_command_list_workgraph_emit_drain(list, state, program, VKD3D_WORKGRAPH_DRAIN_MODE_PENDING, 0);
+    if (*block)
+    {
+        d3d12_command_list_workgraph_drain_end(list);
+        *block = false;
+    }
+
+    for (r = 1; r <= program->drain_rounds; r++)
+    {
+        /* B3: the pending word for the predicate, and the state of the round before for the round. */
+        d3d12_command_list_workgraph_drain_barrier(list);
+        d3d12_command_list_workgraph_drain_begin(list, state, backing->vk_buffer,
+                control_offset + offsetof(struct vkd3d_workgraph_drain_control, pending) +
+                (r - 1) * sizeof(uint32_t));
+        for (i = 1; i < program->num_levels; i++)
+        {
+            d3d12_command_list_workgraph_execute_level(list, state, program, i,
+                    d3d12_wg_payload_va(list, program, i & 1), d3d12_wg_payload_va(list, program, (i & 1) ^ 1),
+                    vk_root_parameter_buffer_va);
+        }
+        d3d12_command_list_workgraph_emit_drain(list, state, program, VKD3D_WORKGRAPH_DRAIN_MODE_PENDING, r);
+        d3d12_command_list_workgraph_drain_end(list);
+    }
+
+    /* B4, close outside every block, then B5 for the next DispatchGraph on this backing memory. */
+    d3d12_command_list_workgraph_barrier(list, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    d3d12_command_list_workgraph_emit_drain(list, state, program, VKD3D_WORKGRAPH_DRAIN_MODE_CLOSE, 0);
+    d3d12_command_list_workgraph_drain_barrier(list);
+}
+
 void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, const D3D12_DISPATCH_GRAPH_DESC *desc)
 {
+    struct d3d12_wg_drain_predication drain_predication;
+    const struct vkd3d_unique_resource *backing = NULL;
     const struct d3d12_wg_state_object_program *program;
     struct vkd3d_scratch_allocation root_param_scratch;
     struct d3d12_wg_state_object *wg_state;
     uint32_t wg_state_program_index;
+    bool block = false;
     uint32_t i;
 
+    memset(&drain_predication, 0, sizeof(drain_predication));
     wg_state = (struct d3d12_wg_state_object *)(uintptr_t)list->wg_state.ProgramIdentifier.OpaqueData[1];
     wg_state_program_index = (uint32_t)list->wg_state.ProgramIdentifier.OpaqueData[0];
 
@@ -4375,6 +4660,7 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
 
     d3d12_wg_scratch_fault_reset();
     d3d12_wg_state_object_report_lost_records(wg_state);
+    d3d12_wg_state_object_report_abandoned(wg_state);
 
     d3d12_command_list_end_current_render_pass(list, false);
     d3d12_command_list_debug_mark_begin_region(list, "WGDispatch");
@@ -4406,6 +4692,24 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
     d3d12_command_list_fetch_root_parameter_data(list, &list->compute_bindings, root_param_scratch.host_ptr);
     /* TODO: For mesh nodes, may have to fetch graphics root parameter data. */
 
+    if (program->drain_rounds && !(backing = vkd3d_va_map_deref(&list->device->memory_allocator.va_map,
+            list->wg_state.BackingMemory.StartAddress)))
+        WARN("No resource at the backing memory, running round 1 only.\n");
+
+    if (backing)
+    {
+        /* B0, init, B1, then round 1 in a block on the application's predicate. */
+        d3d12_command_list_workgraph_drain_suppress(list, &drain_predication);
+        d3d12_command_list_workgraph_emit_drain(list, wg_state, program, VKD3D_WORKGRAPH_DRAIN_MODE_INIT, 0);
+        d3d12_command_list_workgraph_drain_barrier(list);
+        if (drain_predication.enabled_on_command_buffer)
+        {
+            d3d12_command_list_workgraph_drain_begin(list, wg_state, list->predication.vk_buffer,
+                    list->predication.vk_buffer_offset);
+            block = true;
+        }
+    }
+
     if (!d3d12_command_list_workgraph_execute_entry_level(list, wg_state, program, desc,
             root_param_scratch.va))
         goto out;
@@ -4417,6 +4721,14 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
                 root_param_scratch.va);
     }
 
+    if (backing)
+        d3d12_command_list_workgraph_drain_rounds(list, wg_state, program, backing, root_param_scratch.va, &block);
+
 out:
+    /* After a failure the list does not execute; the block still ends, and B6 restores the predicate state. */
+    if (block)
+        d3d12_command_list_workgraph_drain_end(list);
+    if (backing)
+        d3d12_command_list_workgraph_drain_restore(list, &drain_predication);
     d3d12_command_list_debug_mark_end_region(list);
 }

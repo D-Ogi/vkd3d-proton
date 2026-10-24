@@ -2636,6 +2636,13 @@ static void d3d12_command_list_update_conditional_rendering_state(struct d3d12_c
     }
 }
 
+/* amdgpu-wddm fork: the work graph engine (workgraphs.c) ends the predicate of SetPredication before its own
+ * conditional rendering blocks and begins it again after them. */
+void d3d12_command_list_workgraph_update_predication(struct d3d12_command_list *list, bool end)
+{
+    d3d12_command_list_update_conditional_rendering_state(list, end);
+}
+
 static void d3d12_command_list_check_render_pass_validation(
         struct d3d12_command_list *list, const char *user_driven_tag, bool action_command)
 {

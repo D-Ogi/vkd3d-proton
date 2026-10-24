@@ -2444,6 +2444,18 @@ static HRESULT vkd3d_workgraph_ops_init(struct vkd3d_workgraph_indirect_ops *wor
             NULL, true, NULL, &workgraph_ops->vk_multi_gpu_input_copy_pipeline)))
         return hresult_from_vk_result(vr);
 
+    /* amdgpu-wddm fork: the round frame of the draining scheduler. */
+    push_range.size = sizeof(struct vkd3d_workgraph_drain_args);
+    if ((vr = vkd3d_meta_create_pipeline_layout(device,
+            0, NULL, &push_range,
+            &workgraph_ops->vk_drain_layout)))
+        return hresult_from_vk_result(vr);
+
+    if ((vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_workgraph_drain),
+            cs_workgraph_drain, workgraph_ops->vk_drain_layout,
+            NULL, true, NULL, &workgraph_ops->vk_drain_pipeline)))
+        return hresult_from_vk_result(vr);
+
     return S_OK;
 }
 
@@ -2508,6 +2520,15 @@ static void vkd3d_workgraph_ops_cleanup(struct vkd3d_workgraph_indirect_ops *wor
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, workgraph_ops->vk_multi_gpu_input_copy_layout, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_multi_gpu_input_prepare_pipeline, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_multi_gpu_input_copy_pipeline, NULL));
+    VK_CALL(vkDestroyPipelineLayout(device->vk_device, workgraph_ops->vk_drain_layout, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device, workgraph_ops->vk_drain_pipeline, NULL));
+}
+
+void vkd3d_meta_get_workgraph_drain_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *info)
+{
+    info->vk_pipeline_layout = meta_ops->workgraph.vk_drain_layout;
+    info->vk_pipeline = meta_ops->workgraph.vk_drain_pipeline;
 }
 
 void vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(struct vkd3d_meta_ops *meta_ops,

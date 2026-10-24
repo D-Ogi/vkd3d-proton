@@ -1,0 +1,109 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+
+// amdgpu-wddm fork: the round frame of the draining work graph scheduler. After round 1, the engine records up to
+// MAX_ROUNDS extra rounds, each in a conditional rendering block on the pending word of the round before. One
+// invocation. The mode selects the pass:
+//   MODE_INIT: clears the control block. It runs outside every conditional block, before round 1.
+//   MODE_PENDING: the last dispatch of round r. It sets bit r of the executed mask and writes pending[r]: 1 if work
+//     is waiting, 0 if not or if the fault word is set. A skipped round writes nothing.
+//   MODE_CLOSE: runs outside every conditional block, after the last round. It writes the close reason and counts the
+//     close. If work is left (pending[rounds] is not 0) or the fault word is set, it adds one event to the abandonment
+//     record of the state object.
+// The layouts are struct vkd3d_workgraph_drain_control and struct vkd3d_workgraph_abandoned in vkd3d_private.h.
+layout(local_size_x = 1) in;
+
+const uint MODE_INIT = 0u;
+const uint MODE_PENDING = 1u;
+const uint MODE_CLOSE = 2u;
+// VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS.
+const uint MAX_ROUNDS = 64u;
+const uint REASON_COMPLETE = 0u;
+const uint REASON_EXHAUSTED = 1u;
+const uint REASON_FAULT = 2u;
+// VKD3D_WORKGRAPH_ABANDONED.
+const uint ABANDONED = 1u;
+
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer Control
+{
+	uint pending[MAX_ROUNDS + 1u];
+	uint executed[3];
+	uint fault;
+	uint closes;
+	uint close_reason;
+	uint padding;
+};
+
+layout(buffer_reference, buffer_reference_align = 16, std430) buffer Abandoned
+{
+	uint events;
+	uint reasons;
+	uint last_reason;
+	uint flags;
+	uint items[12];
+	uint inputs_lo;
+	uint inputs_hi;
+	uint padding[2];
+};
+
+layout(push_constant, std430) uniform Registers
+{
+	Control control;
+	Abandoned abandoned;
+	uint mode;
+	uint round;
+	uint rounds;
+	uint pending_rounds;
+	uint stall;
+} registers;
+
+void main()
+{
+	Control control = registers.control;
+	uint i, reason, waiting;
+
+	if (registers.mode == MODE_INIT)
+	{
+		for (i = 0u; i <= MAX_ROUNDS; i++)
+			control.pending[i] = 0u;
+		for (i = 0u; i < 3u; i++)
+			control.executed[i] = 0u;
+		control.fault = 0u;
+		control.closes = 0u;
+		control.close_reason = REASON_COMPLETE;
+	}
+	else if (registers.mode == MODE_PENDING)
+	{
+		control.executed[registers.round >> 5u] |= 1u << (registers.round & 31u);
+
+		// The lab flavour injects a round without progress: the self-check sets the sticky fault word.
+		if (registers.stall != 0u)
+			control.fault = 1u;
+
+		// Until the pools exist, only the lab hook reports waiting work.
+		waiting = registers.round < registers.pending_rounds ? 1u : 0u;
+		if (control.fault != 0u)
+			waiting = 0u;
+		control.pending[registers.round] = waiting;
+	}
+	else if (registers.mode == MODE_CLOSE)
+	{
+		if (control.fault != 0u)
+			reason = REASON_FAULT;
+		else if (control.pending[registers.rounds] != 0u)
+			reason = REASON_EXHAUSTED;
+		else
+			reason = REASON_COMPLETE;
+
+		control.close_reason = reason;
+		control.closes += 1u;
+
+		if (reason != REASON_COMPLETE)
+		{
+			atomicAdd(registers.abandoned.events, 1u);
+			atomicOr(registers.abandoned.reasons, 1u << reason);
+			atomicExchange(registers.abandoned.last_reason, reason);
+			atomicOr(registers.abandoned.flags, ABANDONED);
+		}
+	}
+}

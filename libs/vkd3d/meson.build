@@ -64,6 +64,7 @@ vkd3d_shaders =[
   'shaders/cs_workgraph_setup_gpu_input.comp',
   'shaders/cs_workgraph_multi_gpu_input_prepare.comp',
   'shaders/cs_workgraph_multi_gpu_input_copy.comp',
+  'shaders/cs_workgraph_drain.comp',
 
   'shaders/cs_gdeflate.comp',
   'shaders/cs_gdeflate_prepare.comp',

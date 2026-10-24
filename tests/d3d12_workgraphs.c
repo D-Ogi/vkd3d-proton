@@ -122,6 +122,7 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/output_counts.h"
 #include "shaders/workgraph/headers/output_index_bounds.h"
 #include "shaders/workgraph/headers/output_zero_counts.h"
+#include "shaders/workgraph/headers/drain_dispatch.h"
 #include "shaders/workgraph/headers/level_sinks.h"
 #include "shaders/workgraph/headers/empty_count64.h"
 
@@ -4319,6 +4320,394 @@ void test_workgraph_predication(void)
     ID3D12Resource_Release(predicates);
     ID3D12GraphicsCommandList10_Release(list10);
     ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+/* The lab flavour of the amdgpu-wddm engine gives the round frame of a work graph through GetPrivateData with this
+ * GUID (amdgpu_wddm_wg_drain_guid in libs/vkd3d/workgraphs.c). */
+static const GUID workgraph_drain_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x07 } };
+
+struct workgraph_drain_info
+{
+    uint32_t rounds; /* Extra rounds after round 1 (AMDGPU_WDDM_WG_LIMITS=rounds=<n>). */
+    uint32_t pending_rounds; /* The pending dispatches of the rounds below this report waiting work (pending=<k>). */
+    uint64_t control_offset; /* struct workgraph_drain_control in the backing memory. */
+    uint32_t abandoned_events;
+    uint32_t abandoned_reasons; /* Bit 1 << reason of each close that abandoned work. */
+    uint32_t abandoned_last_reason;
+    uint32_t abandoned_flags;
+    uint32_t hook_calls; /* Calls of the predication hook (AMDGPU_WDDM_WG_FAIL=drain-hook). */
+    uint32_t violations; /* Engine blocks that found the predicate of SetPredication active. */
+};
+
+#define WG_DRAIN_MAX_ROUNDS 64u
+#define WG_DRAIN_REASON_COMPLETE 0u
+#define WG_DRAIN_REASON_EXHAUSTED 1u
+#define WG_DRAIN_REASON_FAULT 2u
+#define WG_DRAIN_ABANDONED 1u
+#define WG_DRAIN_NO_STALL (~0u)
+
+/* struct vkd3d_workgraph_drain_control of the engine. */
+struct workgraph_drain_control
+{
+    uint32_t pending[WG_DRAIN_MAX_ROUNDS + 1];
+    uint32_t executed[3];
+    uint32_t fault;
+    uint32_t closes;
+    uint32_t close_reason;
+    uint32_t padding;
+};
+
+/* Checks the control block after one DispatchGraph with "rounds" extra rounds and the pending hook pending_rounds.
+ * Round 1 is r = 0. run is false if the predicate of SetPredication skipped the call. stall is the round of
+ * "drain-stall:<r>", or WG_DRAIN_NO_STALL. Returns the close reason. */
+static unsigned int workgraph_check_drain_control(const struct workgraph_drain_control *control,
+        unsigned int rounds, unsigned int pending_rounds, unsigned int stall, bool run)
+{
+    unsigned int r, last, reason;
+    bool executed, fault = false;
+    uint32_t expected;
+
+    /* Round r + 1 runs if pending[r] is 1, which the hook makes true for r < pending_rounds. A stall ends the
+     * rounds in its own round. */
+    last = pending_rounds < rounds ? pending_rounds : rounds;
+    if (run && stall <= last)
+    {
+        last = stall;
+        fault = true;
+    }
+
+    for (r = 0; r <= WG_DRAIN_MAX_ROUNDS; r++)
+    {
+        executed = run && r <= last;
+        ok(!!(control->executed[r / 32] & (1u << (r % 32))) == executed, "Round %u: expected executed %u.\n",
+                r, executed);
+        expected = executed && r < pending_rounds && !(fault && r == last);
+        ok(control->pending[r] == expected, "Round %u: expected pending %u, got %u.\n", r, expected,
+                control->pending[r]);
+    }
+
+    if (fault)
+        reason = WG_DRAIN_REASON_FAULT;
+    else if (run && last == rounds && rounds < pending_rounds)
+        reason = WG_DRAIN_REASON_EXHAUSTED;
+    else
+        reason = WG_DRAIN_REASON_COMPLETE;
+    ok(control->fault == fault, "Expected fault %u, got %u.\n", fault, control->fault);
+    ok(control->closes == 1, "Expected 1 close, got %u.\n", control->closes);
+    ok(control->close_reason == reason, "Expected close reason %u, got %u.\n", reason, control->close_reason);
+    return reason;
+}
+
+struct workgraph_drain_call
+{
+    const char *fault; /* AMDGPU_WDDM_WG_FAIL while the call is recorded, or NULL. */
+    unsigned int predicate; /* As in struct workgraph_predicate_step. */
+    D3D12_PREDICATION_OP op;
+    bool same_backing; /* The call uses the backing memory of the call before, without the INITIALIZE flag. */
+};
+
+#define WG_DRAIN_MAX_CALLS 3
+
+struct workgraph_drain_case
+{
+    const char *limits;
+    unsigned int rounds, pending_rounds;
+    bool direct; /* A copy comes before the first SetPredication, so that it is not deferred. */
+    struct workgraph_drain_call calls[WG_DRAIN_MAX_CALLS];
+    unsigned int call_count;
+};
+
+/* Records the calls of one case in one command list, each DispatchGraph of level_sinks followed by an ordinary
+ * Dispatch of drain_dispatch with the same predicate, and checks the records of each call, the Dispatch, 64 KiB after
+ * each backing memory and, on the engine, the control block and the reports. */
+static void workgraph_run_drain_case(struct test_context_workgraph *context, ID3D12PipelineState *cs_pso,
+        ID3D12Resource *predicates, unsigned int index, const struct workgraph_drain_case *test)
+{
+    static const D3D12_NODE_ID entry_id = { u"Entry", 0 };
+    ID3D12Resource *backing[WG_DRAIN_MAX_CALLS], *output[WG_DRAIN_MAX_CALLS], *copy_src, *copy_dst;
+    unsigned int i, damaged, stall, hook_calls, events, reasons, reason;
+    struct workgraph_drain_control control;
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    ID3D12GraphicsCommandList10 *list10;
+    D3D12_SET_PROGRAM_DESC program_desc;
+    struct workgraph_drain_info info;
+    ID3D12GraphicsCommandList *list;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    bool run[WG_DRAIN_MAX_CALLS];
+    uint32_t values[16 + 512];
+    uint32_t *tail_pattern;
+    ID3D12StateObject *pso;
+    uint32_t params = 0;
+    bool has_drain;
+    UINT entry_index;
+    UINT size;
+    HRESULT hr;
+
+    list = context->context.list;
+    workgraph_set_limits(test->limits);
+    hr = try_create_workgraph_pso(context, level_sinks_dxil, NULL, &pso);
+    workgraph_set_limits(NULL);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+        return;
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, &entry_index, &entry_id, 1))
+    {
+        ID3D12StateObject_Release(pso);
+        return;
+    }
+
+    memset(&info, 0, sizeof(info));
+    size = sizeof(info);
+    has_drain = SUCCEEDED(ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &size, &info));
+    if (has_drain)
+    {
+        ok(size == sizeof(info), "Got size %u.\n", size);
+        ok(info.rounds == test->rounds, "Expected %u extra rounds, got %u.\n", test->rounds, info.rounds);
+        ok(info.pending_rounds == test->pending_rounds, "Expected pending hook %u, got %u.\n",
+                test->pending_rounds, info.pending_rounds);
+        ok(info.control_offset + sizeof(control) <= wg_reqs.MinSizeInBytes,
+                "The control block at %#"PRIx64" is not inside %#"PRIx64" bytes.\n", info.control_offset,
+                (uint64_t)wg_reqs.MinSizeInBytes);
+    }
+
+    /* 64 KiB more than the backing memory that the graph gets, with a pattern that nothing may write. */
+    tail_pattern = malloc(64 * 1024);
+    for (i = 0; i < 64 * 1024 / sizeof(uint32_t); i++)
+        tail_pattern[i] = 0x7a11c0deu;
+    for (i = 0; i < test->call_count; i++)
+    {
+        backing[i] = NULL;
+        if (!test->calls[i].same_backing || !i)
+        {
+            backing[i] = create_default_buffer(context->context.device, wg_reqs.MinSizeInBytes + 64 * 1024,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            upload_buffer_data(backing[i], wg_reqs.MinSizeInBytes, 64 * 1024, tail_pattern, context->context.queue,
+                    list);
+            reset_command_list(list, context->context.allocator);
+        }
+        output[i] = create_default_buffer(context->context.device, sizeof(values),
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
+    free(tail_pattern);
+
+    copy_src = create_default_buffer(context->context.device, 256, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    copy_dst = create_default_buffer(context->context.device, 256, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+    hr = ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList10, (void **)&list10);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12GraphicsCommandList10, hr #%x.\n", (int)hr);
+
+    memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+    dispatch_desc.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+    dispatch_desc.NodeCPUInput.EntrypointIndex = entry_index;
+    dispatch_desc.NodeCPUInput.NumRecords = 1;
+    dispatch_desc.NodeCPUInput.pRecords = &params;
+    dispatch_desc.NodeCPUInput.RecordStrideInBytes = sizeof(params);
+
+    if (test->direct)
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, copy_dst, 0, copy_src, 0, 256);
+    for (i = 0; i < test->call_count; i++)
+    {
+        const struct workgraph_drain_call *call = &test->calls[i];
+
+        if (!backing[i])
+            backing[i] = backing[i - 1];
+        run[i] = call->predicate == WG_PREDICATE_NONE ||
+                (call->predicate == 8) == (call->op == D3D12_PREDICATION_OP_EQUAL_ZERO);
+
+        if (call->predicate == WG_PREDICATE_NONE)
+            ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        else
+            ID3D12GraphicsCommandList_SetPredication(list, predicates, call->predicate, call->op);
+
+        ID3D12GraphicsCommandList_SetComputeRootSignature(list, context->default_root_uav_rs);
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0,
+                ID3D12Resource_GetGPUVirtualAddress(output[i]));
+        memset(&program_desc, 0, sizeof(program_desc));
+        program_desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+        program_desc.WorkGraph.BackingMemory.SizeInBytes = wg_reqs.MinSizeInBytes;
+        program_desc.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(backing[i]);
+        program_desc.WorkGraph.Flags = call->same_backing ? D3D12_SET_WORK_GRAPH_FLAG_NONE :
+                D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+        program_desc.WorkGraph.ProgramIdentifier = ident;
+        ID3D12GraphicsCommandList10_SetProgram(list10, &program_desc);
+
+        workgraph_set_fault(call->fault);
+        ID3D12GraphicsCommandList10_DispatchGraph(list10, &dispatch_desc);
+        workgraph_set_fault(NULL);
+        uav_barrier(list, NULL);
+
+        ID3D12GraphicsCommandList_SetPipelineState(list, cs_pso);
+        ID3D12GraphicsCommandList_SetComputeRootSignature(list, context->default_root_uav_rs);
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0,
+                ID3D12Resource_GetGPUVirtualAddress(output[i]));
+        ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+        uav_barrier(list, NULL);
+    }
+    ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    ID3D12GraphicsCommandList10_Release(list10);
+
+    hook_calls = events = reasons = 0;
+    for (i = 0; i < test->call_count; i++)
+    {
+        const struct workgraph_drain_call *call = &test->calls[i];
+
+        /* The first read back executes the list. */
+        workgraph_read_output(context, output[i], values, ARRAY_SIZE(values));
+        ok(values[0] == (run[i] ? 4096 : 0), "Call %u: expected %u records, got %u.\n", i, run[i] ? 4096 : 0,
+                values[0]);
+        ok(values[2] == 0, "Call %u: %u records have wrong contents.\n", i, values[2]);
+        ok(values[3] == 0, "Call %u: %u records arrived more than once.\n", i, values[3]);
+        ok(values[8] == run[i], "Call %u: expected %u launches of the Dispatch after it, got %u.\n", i, run[i],
+                values[8]);
+
+        stall = WG_DRAIN_NO_STALL;
+        if (call->fault && !strncmp(call->fault, "drain-stall:", 12))
+            stall = atoi(call->fault + 12);
+        /* An engine block on the predicate of SetPredication in round 1, and one for each extra round. */
+        if (call->fault && !strcmp(call->fault, "drain-hook"))
+            hook_calls += (call->predicate != WG_PREDICATE_NONE) + test->rounds;
+
+        /* The control block of a backing memory shows its last call. */
+        if (has_drain && test->rounds && (i + 1 == test->call_count || !test->calls[i + 1].same_backing))
+        {
+            vkd3d_test_set_context("Test %u, %s, call %u", index, test->limits, i);
+            workgraph_read_buffer_range(context, backing[i], info.control_offset, sizeof(control),
+                    (uint32_t *)&control);
+            reason = workgraph_check_drain_control(&control, test->rounds, test->pending_rounds, stall, run[i]);
+        }
+        else
+        {
+            reason = WG_DRAIN_REASON_COMPLETE;
+            if (run[i] && stall != WG_DRAIN_NO_STALL)
+                reason = WG_DRAIN_REASON_FAULT;
+            else if (run[i] && test->rounds < test->pending_rounds)
+                reason = WG_DRAIN_REASON_EXHAUSTED;
+        }
+        if (reason != WG_DRAIN_REASON_COMPLETE)
+        {
+            events++;
+            reasons |= 1u << reason;
+        }
+    }
+
+    for (i = 0; i < test->call_count; i++)
+    {
+        if (i && backing[i] == backing[i - 1])
+            continue;
+        damaged = workgraph_count_damaged_words(context, backing[i], wg_reqs.MinSizeInBytes, 64 * 1024, 0x7a11c0deu);
+        ok(!damaged, "%u words after backing memory %u were written.\n", damaged, i);
+    }
+
+    if (has_drain && test->rounds)
+    {
+        size = sizeof(info);
+        hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_drain_guid, &size, &info);
+        ok(hr == S_OK, "Failed to get the round frame, hr #%x.\n", (int)hr);
+        ok(info.abandoned_events == events, "Expected %u abandonment events, got %u.\n", events,
+                info.abandoned_events);
+        ok(info.abandoned_reasons == reasons, "Expected reasons %#x, got %#x.\n", reasons, info.abandoned_reasons);
+        ok(info.abandoned_flags == (events ? WG_DRAIN_ABANDONED : 0), "Got flags %#x.\n", info.abandoned_flags);
+        ok(info.hook_calls == hook_calls, "Expected %u hook calls, got %u.\n", hook_calls, info.hook_calls);
+        ok(!info.violations, "%u engine blocks found the predicate of SetPredication active.\n", info.violations);
+    }
+
+    for (i = 0; i < test->call_count; i++)
+    {
+        if (!i || backing[i] != backing[i - 1])
+            ID3D12Resource_Release(backing[i]);
+        ID3D12Resource_Release(output[i]);
+    }
+    ID3D12Resource_Release(copy_dst);
+    ID3D12Resource_Release(copy_src);
+    ID3D12StateObject_Release(pso);
+}
+
+void test_workgraph_drain_rounds(void)
+{
+    /* The lab flavour of the amdgpu-wddm engine records "rounds" extra rounds after round 1 of a DispatchGraph, each
+     * in a conditional rendering block on the pending word of the round before (AMDGPU_WDDM_WG_LIMITS=rounds=<n>).
+     * Until the engine keeps work across rounds, the hook pending=<k> makes rounds 1 to k report waiting work, and an
+     * extra round runs the levels after the entry level again with nothing to do. The records of each call must not
+     * change. AMDGPU_WDDM_WG_FAIL=drain-stall:<r> makes round r a round without progress (the self-check sets the
+     * fault word and later rounds do not run), and drain-hook tries to begin the predicate of SetPredication inside
+     * each engine block, which the engine must suppress. Each DispatchGraph is followed by an ordinary Dispatch that
+     * must be predicated as the DispatchGraph. Other drivers ignore the switches and must give the same records. Each
+     * call launches 4096 Leaf records; the largest case runs 65 rounds of 2 levels. */
+#define CALL(fault, predicate, op, same) { fault, predicate, op, same }
+#define NONE WG_PREDICATE_NONE
+#define EQ D3D12_PREDICATION_OP_EQUAL_ZERO
+#define NE D3D12_PREDICATION_OP_NOT_EQUAL_ZERO
+    static const struct workgraph_drain_case tests[] =
+    {
+        /* Rounds and the pending hook: k < R, k = R, k = R + 1 (R exhausted), k = 0, R = 64. */
+        { "canary=1", 0, 0, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=1,canary=1", 1, 0, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=1,pending=1,canary=1", 1, 1, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=1,pending=2,canary=1", 1, 2, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=4,pending=2,canary=1", 4, 2, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=4,pending=4,canary=1", 4, 4, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=4,pending=5,canary=1", 4, 5, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=64,pending=64,canary=1", 64, 64, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        { "rounds=64,pending=65,canary=1", 64, 65, false, { CALL(NULL, NONE, EQ, false) }, 1 },
+        /* A round without progress in round 1, a middle round and the last round. */
+        { "rounds=4,pending=5,canary=1", 4, 5, false, { CALL("drain-stall:0", NONE, EQ, false) }, 1 },
+        { "rounds=4,pending=5,canary=1", 4, 5, false, { CALL("drain-stall:2", NONE, EQ, false) }, 1 },
+        { "rounds=4,pending=5,canary=1", 4, 5, false, { CALL("drain-stall:4", NONE, EQ, false) }, 1 },
+        /* After a fault and after R exhausted, the next call on the same backing memory starts from init. */
+        { "rounds=2,pending=2,canary=1", 2, 2, false,
+                { CALL("drain-stall:1", NONE, EQ, false), CALL(NULL, NONE, EQ, true) }, 2 },
+        { "rounds=1,pending=2,canary=1", 1, 2, false,
+                { CALL(NULL, NONE, EQ, false), CALL(NULL, NONE, EQ, true) }, 2 },
+        /* SetPredication false, true, false with both operations, deferred and direct; the skipped calls do not
+         * run round 1 and so no extra round. */
+        { "rounds=2,pending=2,canary=1", 2, 2, false,
+                { CALL(NULL, 0, EQ, false), CALL(NULL, 8, EQ, false), CALL(NULL, 0, EQ, false) }, 3 },
+        { "rounds=2,pending=2,canary=1", 2, 2, true,
+                { CALL(NULL, 0, EQ, false), CALL(NULL, 8, EQ, false), CALL(NULL, 0, EQ, false) }, 3 },
+        { "rounds=2,pending=2,canary=1", 2, 2, false,
+                { CALL(NULL, 8, NE, false), CALL(NULL, 0, NE, false), CALL(NULL, 8, NE, false) }, 3 },
+        { "rounds=2,pending=2,canary=1", 2, 2, true,
+                { CALL(NULL, 8, NE, false), CALL(NULL, 0, NE, false), CALL(NULL, 8, NE, false) }, 3 },
+        /* The hook inside the engine blocks, with a true and a false predicate and without one. */
+        { "rounds=2,pending=2,canary=1", 2, 2, false,
+                { CALL("drain-hook", 8, EQ, false), CALL("drain-hook", 0, EQ, false),
+                CALL("drain-hook", NONE, EQ, false) }, 3 },
+        { "rounds=2,pending=2,canary=1", 2, 2, true,
+                { CALL("drain-hook", 0, NE, false), CALL("drain-hook", 8, NE, false) }, 2 },
+    };
+#undef NE
+#undef EQ
+#undef NONE
+#undef CALL
+    static const uint64_t predicate_values[2] = {0, 1};
+    struct test_context_workgraph context;
+    ID3D12PipelineState *cs_pso;
+    ID3D12Resource *predicates;
+    unsigned int i;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    cs_pso = create_compute_pipeline_state(context.context.device, context.default_root_uav_rs,
+            drain_dispatch_dxil);
+    predicates = create_upload_buffer(context.context.device, sizeof(predicate_values), predicate_values);
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("Test %u, %s", i, tests[i].limits);
+        workgraph_run_drain_case(&context, cs_pso, predicates, i, &tests[i]);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+    ID3D12Resource_Release(predicates);
+    ID3D12PipelineState_Release(cs_pso);
     destroy_workgraph_test_context(&context);
 }
 

@@ -5670,6 +5670,67 @@ struct vkd3d_workgraph_lost_records
  * so the lost record count is a lower bound. */
 #define VKD3D_WORKGRAPH_LOST_RECORDS_LOWER_BOUND 0x1u
 
+/* amdgpu-wddm fork: the round frame of the draining scheduler (cs_workgraph_drain.comp). After round 1, up to
+ * VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS extra rounds are recorded, each in a conditional rendering block on the pending
+ * word of the round before. The control block is in the backing memory of the execution, only when the program has
+ * extra rounds. pending[r] is written by the pending dispatch of round r (round 1 is r = 0), bit r of executed[] is
+ * set when round r runs. close_reason is a VKD3D_WORKGRAPH_DRAIN_REASON_* value, closes counts the close dispatches
+ * since the last init. */
+#define VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS 64u
+#define VKD3D_WORKGRAPH_DRAIN_REASON_COMPLETE 0u
+#define VKD3D_WORKGRAPH_DRAIN_REASON_EXHAUSTED 1u
+#define VKD3D_WORKGRAPH_DRAIN_REASON_FAULT 2u
+
+struct vkd3d_workgraph_drain_control
+{
+    uint32_t pending[VKD3D_WORKGRAPH_DRAIN_MAX_ROUNDS + 1];
+    uint32_t executed[3];
+    uint32_t fault;
+    uint32_t closes;
+    uint32_t close_reason;
+    uint32_t padding;
+};
+
+/* amdgpu-wddm fork: the work that close abandoned, for all executions of a state object. It is its own record, not
+ * part of struct vkd3d_workgraph_lost_records, which counts the records dropped at allocation. reasons has bit
+ * 1 << reason of each close that abandoned work. items[] are 128-bit counts of waiting work items per reader kind
+ * (groups, coalescing slots, threads), four 32-bit words each, low word first; inputs is the 64-bit count of input
+ * records not taken. The memory is host-visible, after struct vkd3d_workgraph_lost_records. */
+#define VKD3D_WORKGRAPH_ABANDONED 0x1u
+/* The offset of struct vkd3d_workgraph_abandoned in the host-visible allocation. */
+#define VKD3D_WORKGRAPH_ABANDONED_OFFSET 16u
+
+struct vkd3d_workgraph_abandoned
+{
+    uint32_t events;
+    uint32_t reasons;
+    uint32_t last_reason;
+    uint32_t flags;
+    uint32_t items[3][4];
+    uint32_t inputs_lo;
+    uint32_t inputs_hi;
+    uint32_t padding[2];
+};
+
+enum vkd3d_workgraph_drain_mode
+{
+    VKD3D_WORKGRAPH_DRAIN_MODE_INIT = 0,
+    VKD3D_WORKGRAPH_DRAIN_MODE_PENDING = 1,
+    VKD3D_WORKGRAPH_DRAIN_MODE_CLOSE = 2,
+};
+
+struct vkd3d_workgraph_drain_args
+{
+    VkDeviceAddress control_va;
+    VkDeviceAddress abandoned_va;
+    uint32_t mode;
+    uint32_t round;
+    uint32_t rounds;
+    /* Lab flavour test hooks: the rounds below pending_rounds report waiting work, and stall sets the fault word. */
+    uint32_t pending_rounds;
+    uint32_t stall;
+};
+
 struct vkd3d_workgraph_multi_gpu_input_copy_args
 {
     VkDeviceAddress multi_input_va;
@@ -5714,6 +5775,8 @@ struct vkd3d_workgraph_indirect_ops
     VkPipelineLayout vk_multi_gpu_input_copy_layout;
     VkPipeline vk_multi_gpu_input_prepare_pipeline;
     VkPipeline vk_multi_gpu_input_copy_pipeline;
+    VkPipelineLayout vk_drain_layout;
+    VkPipeline vk_drain_pipeline;
 };
 
 struct vkd3d_meta_ops
@@ -5813,6 +5876,8 @@ void vkd3d_meta_get_workgraph_complete_compaction_pipeline(struct vkd3d_meta_ops
         struct vkd3d_workgraph_meta_pipeline_info *info);
 void vkd3d_meta_get_workgraph_multi_gpu_input_pipelines(struct vkd3d_meta_ops *meta_ops,
         struct vkd3d_workgraph_meta_pipeline_info *prepare, struct vkd3d_workgraph_meta_pipeline_info *copy);
+void vkd3d_meta_get_workgraph_drain_pipeline(struct vkd3d_meta_ops *meta_ops,
+        struct vkd3d_workgraph_meta_pipeline_info *info);
 
 static inline uint32_t vkd3d_meta_get_workgraph_setup_gpu_input_workgroup_size(void)
 {
@@ -7083,12 +7148,22 @@ struct d3d12_wg_state_object
     struct d3d12_wg_state_object_ring lost_records;
     struct vkd3d_workgraph_lost_records *lost_records_host;
     uint32_t lost_events_reported;
+    /* amdgpu-wddm fork: struct vkd3d_workgraph_abandoned in the same allocation, mapped, with its address, and the
+     * events count of the last ERR line about it. */
+    struct vkd3d_workgraph_abandoned *abandoned_host;
+    VkDeviceAddress abandoned_va;
+    uint32_t abandoned_events_reported;
+    /* amdgpu-wddm fork, lab flavour: the calls of the predication hook (AMDGPU_WDDM_WG_FAIL=drain-hook) and the
+     * engine conditional rendering blocks that found the predicate of SetPredication active. */
+    uint32_t drain_hook_calls;
+    uint32_t drain_violations;
 
     struct vkd3d_private_store private_store;
 };
 
 void d3d12_command_list_workgraph_initialize_scratch(struct d3d12_command_list *list);
 void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, const D3D12_DISPATCH_GRAPH_DESC *desc);
+void d3d12_command_list_workgraph_update_predication(struct d3d12_command_list *list, bool end);
 void d3d12_command_list_mark_out_of_memory(struct d3d12_command_list *list, const char *what);
 
 static inline struct d3d12_wg_state_object *wg_impl_from_ID3D12StateObject(ID3D12StateObject *iface)

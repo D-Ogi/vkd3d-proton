@@ -496,6 +496,7 @@ decl_test(test_workgraph_output_zero_counts);
 decl_test(test_workgraph_level_sinks);
 decl_test(test_workgraph_canary_admission);
 decl_test(test_workgraph_predication);
+decl_test(test_workgraph_drain_rounds);
 decl_test(test_workgraph_dispatch_failure);
 decl_test(test_workgraph_broadcast_input);
 decl_test(test_workgraph_thread_input);
