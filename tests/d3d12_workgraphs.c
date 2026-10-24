@@ -100,6 +100,7 @@ static void destroy_workgraph_test_context(struct test_context_workgraph *contex
 #include "shaders/workgraph/headers/broadcast_custom_input.h"
 #include "shaders/workgraph/headers/thread_custom_input.h"
 #include "shaders/workgraph/headers/coalesce_custom_input.h"
+#include "shaders/workgraph/headers/two_entry.h"
 
 static void check_work_graph_properties(ID3D12StateObject *pso,
         LPCWSTR expected_program_name, LPCWSTR expected_entry_node, LPCWSTR expected_leaf_node,
@@ -727,6 +728,241 @@ void test_workgraph_basic(void)
     ID3D12StateObject_Release(pso);
     destroy_workgraph_test_context(&context);
     vkd3d_test_set_context(NULL);
+}
+
+/* Separate from test_workgraph_basic, so that it also runs on a native driver that fails the empty CPU input cases there. */
+void test_workgraph_gpu_input_stride(void)
+{
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct test_context_workgraph context;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    ID3D12StateObject *pso;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    pso = create_workgraph_pso(&context, basic_dxil, u"Dummy", context.default_root_uav_rs);
+    check_work_graph_properties(pso, u"Dummy", u"BroadcastNode", NULL,
+        12 /* implied struct with uint3 SV_DispatchGrid*/, &ident, &wg_reqs);
+
+    {
+        /* Records that are not packed: a 12 byte record at a stride of 16 bytes. The fourth uint is padding. */
+        const uint32_t records[] = { 2, 1, 2, 7, 2, 2, 2, 7, 1, 2, 1, 7 };
+        struct workgraph_test_desc desc;
+        memset(&desc, 0, sizeof(desc));
+
+        desc.expected_cb = basic_expected;
+        desc.num_graph_dispatches = 2;
+        desc.num_multi_instances = 1;
+        desc.num_records = 3;
+        desc.record_size = sizeof(records);
+        desc.record_stride = 16;
+        desc.records = records;
+        desc.num_threads[0] = 2;
+        desc.num_threads[1] = 3;
+        desc.num_threads[2] = 4;
+        /* Bugged on WARP. */
+        desc.is_bug = use_warp_device;
+
+        desc.mode = D3D12_DISPATCH_MODE_NODE_GPU_INPUT;
+        vkd3d_test_set_context("GPU Input - multi + stride 16");
+        execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
+        desc.mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+        desc.num_multi_instances = 2;
+        vkd3d_test_set_context("Multi GPU Input - multi + stride 16");
+        execute_workgraph_test(&context, pso, &ident, &wg_reqs, &desc);
+    }
+
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+    vkd3d_test_set_context(NULL);
+}
+
+static uint32_t two_entry_grid_covers(const uint32_t *grid, uint32_t value_index)
+{
+    uint32_t x, y, z;
+
+    x = value_index % 10;
+    y = (value_index / 10) % 10;
+    z = value_index / 100;
+    return x < grid[0] * 2 && y < grid[1] * 3 && z < grid[2] * 4;
+}
+
+void test_workgraph_multi_node_gpu_input_entries(void)
+{
+    /* One D3D12_MULTI_NODE_GPU_INPUT with inputs to two different entry points. EntryA adds 1 and EntryB adds
+     * 0x10000 per thread. The inputs have different record strides (16 with padding, 12, and 0 to repeat one record),
+     * and the input array itself has a stride of 32 bytes for a 24 byte D3D12_NODE_GPU_INPUT. */
+    static const uint32_t records_a[] = { 1, 2, 2, 9, 2, 1, 1, 9 };
+    static const uint32_t records_b[] = { 2, 2, 2, 1, 1, 1, 2, 1, 2 };
+    static const D3D12_NODE_ID entry_a_id = { u"EntryA", 0 };
+    static const D3D12_NODE_ID entry_b_id = { u"EntryB", 0 };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    ID3D12StateObjectProperties1 *props1 = NULL;
+    D3D12_MULTI_NODE_GPU_INPUT multi_gpu_input;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    ID3D12WorkGraphProperties *props = NULL;
+    D3D12_SET_PROGRAM_DESC program_desc;
+    D3D12_NODE_GPU_INPUT node_inputs[3];
+    uint8_t input_array[3 * 32];
+    ID3D12Resource *records_buffer;
+    D3D12_GPU_VIRTUAL_ADDRESS va;
+    ID3D12Resource *scratch = NULL;
+    ID3D12Resource *input_multi;
+    struct resource_readback rb;
+    D3D12_PROGRAM_IDENTIFIER ident;
+    UINT index_a, index_b, num_inputs;
+    ID3D12Resource *output;
+    ID3D12Resource *inputs;
+    uint8_t records[80];
+    ID3D12StateObject *pso;
+    unsigned int i, j;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    pso = create_workgraph_pso(&context, two_entry_dxil, u"Dummy", context.default_root_uav_rs);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+    ok(SUCCEEDED(hr), "Failed to query work graph props, hr #%x.\n", (int)hr);
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12StateObjectProperties1, (void **)&props1);
+    ok(SUCCEEDED(hr), "Failed to query SOP1, hr #%x.\n", (int)hr);
+    if (!props || !props1)
+        goto out;
+
+    ok(ID3D12WorkGraphProperties_GetNumEntrypoints(props, 0) == 2, "Expected 2 entry points, got %u.\n",
+            ID3D12WorkGraphProperties_GetNumEntrypoints(props, 0));
+    /* The order of the entry points is not defined, so look up both. */
+    index_a = ID3D12WorkGraphProperties_GetEntrypointIndex(props, 0, entry_a_id);
+    index_b = ID3D12WorkGraphProperties_GetEntrypointIndex(props, 0, entry_b_id);
+    ok(index_a < 2 && index_b < 2 && index_a != index_b, "Unexpected entry point indices %u, %u.\n", index_a, index_b);
+    if (index_a >= 2 || index_b >= 2 || index_a == index_b)
+        goto out;
+
+    ident = ID3D12StateObjectProperties1_GetProgramIdentifier(props1, u"Dummy");
+    memset(&wg_reqs, 0, sizeof(wg_reqs));
+    ID3D12WorkGraphProperties_GetWorkGraphMemoryRequirements(props, 0, &wg_reqs);
+
+    memset(records, 0, sizeof(records));
+    memcpy(records, records_a, sizeof(records_a));
+    memcpy(records + 32, records_b, sizeof(records_b));
+    records_buffer = create_upload_buffer(context.context.device, sizeof(records), records);
+    va = ID3D12Resource_GetGPUVirtualAddress(records_buffer);
+
+    /* EntryA: 2 records at stride 16. EntryB: 3 records at stride 12. EntryA again: 1 record at stride 0, repeated 3 times. */
+    node_inputs[0].EntrypointIndex = index_a;
+    node_inputs[0].NumRecords = 2;
+    node_inputs[0].Records.StartAddress = va;
+    node_inputs[0].Records.StrideInBytes = 16;
+    node_inputs[1].EntrypointIndex = index_b;
+    node_inputs[1].NumRecords = 3;
+    node_inputs[1].Records.StartAddress = va + 32;
+    node_inputs[1].Records.StrideInBytes = 12;
+    node_inputs[2].EntrypointIndex = index_a;
+    node_inputs[2].NumRecords = 3;
+    node_inputs[2].Records.StartAddress = va + 16;
+    node_inputs[2].Records.StrideInBytes = 0;
+
+    memset(input_array, 0, sizeof(input_array));
+    for (i = 0; i < ARRAY_SIZE(node_inputs); i++)
+        memcpy(input_array + 32 * i, &node_inputs[i], sizeof(node_inputs[i]));
+    inputs = create_upload_buffer(context.context.device, sizeof(input_array), input_array);
+
+    /* First one input per entry point, then a third input that targets EntryA again. */
+    for (num_inputs = 2; num_inputs <= ARRAY_SIZE(node_inputs); num_inputs++)
+    {
+        vkd3d_test_set_context(num_inputs == 2 ? "two entry points" : "two entry points, EntryA twice");
+
+        multi_gpu_input.NumNodeInputs = num_inputs;
+        multi_gpu_input.NodeInputs.StartAddress = ID3D12Resource_GetGPUVirtualAddress(inputs);
+        multi_gpu_input.NodeInputs.StrideInBytes = 32;
+        input_multi = create_upload_buffer(context.context.device, sizeof(multi_gpu_input), &multi_gpu_input);
+
+        scratch = NULL;
+        if (wg_reqs.MinSizeInBytes)
+        {
+            scratch = create_default_buffer(context.context.device, wg_reqs.MinSizeInBytes,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        }
+
+        output = create_default_buffer(context.context.device, 1024 * sizeof(uint32_t),
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        ID3D12GraphicsCommandList_SetComputeRootSignature(context.context.list, context.default_root_uav_rs);
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(context.context.list, 0,
+                ID3D12Resource_GetGPUVirtualAddress(output));
+
+        memset(&program_desc, 0, sizeof(program_desc));
+        program_desc.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+        if (scratch)
+        {
+            program_desc.WorkGraph.BackingMemory.SizeInBytes = wg_reqs.MinSizeInBytes;
+            program_desc.WorkGraph.BackingMemory.StartAddress = ID3D12Resource_GetGPUVirtualAddress(scratch);
+        }
+        program_desc.WorkGraph.Flags = D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE;
+        program_desc.WorkGraph.ProgramIdentifier = ident;
+        ID3D12GraphicsCommandList10_SetProgram(context.list, &program_desc);
+
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+        dispatch_desc.MultiNodeGPUInput = ID3D12Resource_GetGPUVirtualAddress(input_multi);
+        for (i = 0; i < 2; i++)
+            ID3D12GraphicsCommandList10_DispatchGraph(context.list, &dispatch_desc);
+
+        transition_resource_state(context.context.list, output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        get_buffer_readback_with_command_list(output, DXGI_FORMAT_R32_UINT, &rb,
+                context.context.queue, context.context.list);
+        reset_command_list(context.context.list, context.context.allocator);
+
+        for (i = 0; i < 1024; i++)
+        {
+            uint32_t expected = 0;
+            uint32_t v;
+
+            for (j = 0; j < 2; j++)
+                if (two_entry_grid_covers(&records_a[4 * j], i))
+                    expected += 1;
+            for (j = 0; j < 3; j++)
+                if (two_entry_grid_covers(&records_b[3 * j], i))
+                    expected += 0x10000;
+            if (num_inputs > 2 && two_entry_grid_covers(&records_a[4], i))
+                expected += 3;
+            /* Two DispatchGraph calls. */
+            expected *= 2;
+
+            v = get_readback_uint(&rb, i, 0, 0);
+            /* The NVIDIA driver on Windows gives a wrong count when two inputs with different strides target
+             * the same entry point (measured on an RTX 4090). The spec allows several inputs to the same node. */
+            bug_if(use_warp_device || (num_inputs > 2 && is_nvidia_windows_device(context.context.device)))
+            ok(expected == v, "Value %u: expected #%x, got #%x.\n", i, expected, v);
+        }
+
+        release_resource_readback(&rb);
+        if (scratch)
+            ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+        ID3D12Resource_Release(input_multi);
+    }
+    vkd3d_test_set_context(NULL);
+
+    ID3D12Resource_Release(inputs);
+    ID3D12Resource_Release(records_buffer);
+
+out:
+    if (props1)
+        ID3D12StateObjectProperties1_Release(props1);
+    if (props)
+        ID3D12WorkGraphProperties_Release(props);
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
 }
 
 void test_workgraph_broadcast_input(void)
