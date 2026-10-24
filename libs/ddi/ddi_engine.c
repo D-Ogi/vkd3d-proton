@@ -66,22 +66,16 @@ static BOOL bc250_prepare_cache_directory(void)
 }
 
 /* A command signature that changes state needs device generated commands. Without them vkd3d-proton
- * creates the signature and ExecuteIndirect then executes nothing; a driver has to refuse the signature.
- * descriptor_heap: the device takes the VK_EXT_descriptor_heap path, which work graphs need
- * (d3d12_device_supports_workgraphs). The flag only enables the extension. vkd3d_bindless_state_init_heap() still
- * decides from the physical device, and an ICD without the extension or its limits gets the earlier path. The
- * shader interface key includes the path (vkd3d_compute_shader_interface_key), so a disk cache from the earlier
- * path is not used. Work graphs stay off here until the lab accepts them; VKD3D_CONFIG=workgraphs enables them
- * per process. */
+ * creates the signature and ExecuteIndirect then executes nothing; a driver has to refuse the signature. */
 static BOOL CALLBACK bc250_set_config_defaults(PINIT_ONCE once, void *param, void **context)
 {
     (void)once;
     (void)param;
     (void)context;
     if (bc250_prepare_cache_directory())
-        vkd3d_config_set_embedder_defaults("descriptor_heap,fail_unsupported_state_template");
+        vkd3d_config_set_embedder_defaults("fail_unsupported_state_template");
     else
-        vkd3d_config_set_embedder_defaults("descriptor_heap,pipeline_library_app_cache,fail_unsupported_state_template");
+        vkd3d_config_set_embedder_defaults("pipeline_library_app_cache,fail_unsupported_state_template");
     return TRUE;
 }
 
