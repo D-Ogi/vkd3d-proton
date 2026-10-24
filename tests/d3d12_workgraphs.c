@@ -4425,6 +4425,32 @@ static const char *workgraph_drain_info_error(HRESULT hr, UINT size, const struc
     return NULL;
 }
 
+/* VKD3D_TEST_WORKGRAPH_DRAIN=frame requires the lab diagnostics of the draining scheduler (the round frame and the
+ * pools), "none" requires that there are none (the release flavour or a native driver). If it is not set, they are
+ * required on the amdgpu-wddm engine. Returns false, after a failure, if the value or the device is wrong. */
+static bool workgraph_drain_expected(ID3D12Device5 *device, bool *frame)
+{
+    const char *env = getenv("VKD3D_TEST_WORKGRAPH_DRAIN");
+    bool is_engine = workgraph_is_vkd3d_proton(device);
+
+    if (!env || !env[0])
+        *frame = is_engine;
+    else if (!strcmp(env, "frame") || !strcmp(env, "none"))
+        *frame = !strcmp(env, "frame");
+    else
+    {
+        ok(false, "Unknown VKD3D_TEST_WORKGRAPH_DRAIN=%s.\n", env);
+        return false;
+    }
+    if (*frame && !is_engine)
+    {
+        ok(false, "The draining scheduler diagnostics need the amdgpu-wddm engine.\n");
+        return false;
+    }
+    trace("Draining scheduler diagnostics %s.\n", *frame ? "required" : "not expected");
+    return true;
+}
+
 /* Negative controls of workgraph_drain_info_error, on the CPU only: each reply must be refused. */
 static void workgraph_check_drain_admission(void)
 {
@@ -4780,37 +4806,19 @@ void test_workgraph_drain_rounds(void)
     struct test_context_workgraph context;
     ID3D12PipelineState *cs_pso;
     ID3D12Resource *predicates;
-    bool is_engine, frame;
-    const char *env;
     unsigned int i;
+    bool frame;
     HRESULT hr;
 
     workgraph_check_drain_admission();
 
     if (!init_workgraph_test_context(&context))
         return;
-
-    /* VKD3D_TEST_WORKGRAPH_DRAIN=frame requires the round frame, "none" requires that there is none (the release
-     * flavour or a native driver). If it is not set, the round frame is required on the amdgpu-wddm engine. */
-    is_engine = workgraph_is_vkd3d_proton(context.device);
-    env = getenv("VKD3D_TEST_WORKGRAPH_DRAIN");
-    if (!env || !env[0])
-        frame = is_engine;
-    else if (!strcmp(env, "frame") || !strcmp(env, "none"))
-        frame = !strcmp(env, "frame");
-    else
+    if (!workgraph_drain_expected(context.device, &frame))
     {
-        ok(false, "Unknown VKD3D_TEST_WORKGRAPH_DRAIN=%s.\n", env);
         destroy_workgraph_test_context(&context);
         return;
     }
-    if (frame && !is_engine)
-    {
-        ok(false, "The round frame needs the amdgpu-wddm engine.\n");
-        destroy_workgraph_test_context(&context);
-        return;
-    }
-    trace("Round frame %s.\n", frame ? "required" : "not expected");
 
     cs_pso = create_compute_pipeline_state(context.context.device, context.default_root_uav_rs,
             drain_dispatch_dxil);
@@ -5600,5 +5608,351 @@ void test_workgraph_local_root_signature(void)
     ID3D12Resource_Release(output);
     ID3D12Resource_Release(local);
     ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
+/* The lab flavour of the amdgpu-wddm engine gives the record pools of the draining scheduler through GetPrivateData
+ * with this GUID (amdgpu_wddm_wg_pool_guid in libs/vkd3d/workgraphs.c). */
+static const GUID workgraph_pool_guid =
+        { 0x5c2e9a41, 0x7d3b, 0x4f0e, { 0x9a, 0x61, 0x2b, 0x8e, 0x4d, 0x17, 0xc3, 0x08 } };
+
+#define WG_POOL_LEVELS 32
+#define WG_POOL_PAYLOAD 0
+#define WG_POOL_ENTRIES 1
+#define WG_POOL_COMPONENTS 4
+
+struct workgraph_pool_region
+{
+    uint64_t offset;
+    uint64_t size;
+};
+
+/* struct amdgpu_wddm_wg_pools of the engine. Pool L (1 <= L < pools) holds the input records of level L. w[L] is W of
+ * pool L: payload bytes, then packed entries, unrolled offsets and record headers in records. */
+struct workgraph_pools
+{
+    uint32_t valid;
+    uint32_t pools;
+    uint64_t fixed_size;
+    uint64_t staging_size;
+    uint64_t arena_payload;
+    uint64_t min_size;
+    uint64_t max_size;
+    uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS];
+    struct
+    {
+        uint64_t size;
+        uint64_t used;
+        struct workgraph_pool_region fixed;
+        struct workgraph_pool_region empty_state;
+        struct workgraph_pool_region isolated[WG_POOL_LEVELS][2][WG_POOL_COMPONENTS];
+        struct workgraph_pool_region arena[2][WG_POOL_COMPONENTS];
+        struct workgraph_pool_region staging;
+    } layouts[3];
+};
+
+/* One output declaration of a producer, from the HLSL source of the graph. */
+struct workgraph_pool_decl
+{
+    unsigned int pool; /* The level of the producer + 1. */
+    unsigned int producer; /* The outputs of one producer add up. */
+    bool thread; /* The producer is a thread launch node: one item is a wave of up to 64 threads. */
+    uint32_t max_records; /* MaxRecords, or the shared budget for MaxRecordsSharedWith. */
+    uint32_t record_size; /* The largest record of its targets. */
+    unsigned int shares; /* 1 + the index of the declaration whose budget it shares (MaxRecordsSharedWith), or 0. */
+};
+
+#define WG_POOL_MAX_DECLS 8
+
+struct workgraph_pool_graph
+{
+    const char *name;
+    const D3D12_SHADER_BYTECODE *code;
+    unsigned int levels;
+    struct workgraph_pool_decl decls[WG_POOL_MAX_DECLS];
+    unsigned int decl_count;
+};
+
+static const unsigned int workgraph_pool_unit[WG_POOL_COMPONENTS] = { 1, 8, 4, 16 };
+static const unsigned int workgraph_pool_alignment[WG_POOL_COMPONENTS] = { 16, 8, 4, 16 };
+
+/* W of each pool from the declarations. With exact true, a MaxRecordsSharedWith set is charged once, with its budget
+ * and its largest record (the spec bound). With exact false, each declaration is charged on its own (the engine's
+ * rule, because the shader metadata does not say which declarations share a budget). */
+static void workgraph_pool_oracle(const struct workgraph_pool_graph *graph, bool exact,
+        uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS])
+{
+    uint64_t item[WG_POOL_COMPONENTS], payload, records, stride;
+    const struct workgraph_pool_decl *decl, *other;
+    unsigned int producer, i, j, c, pool;
+    bool found;
+
+    memset(w, 0, sizeof(uint64_t) * WG_POOL_LEVELS * WG_POOL_COMPONENTS);
+    for (producer = 0; producer < WG_POOL_MAX_DECLS; producer++)
+    {
+        memset(item, 0, sizeof(item));
+        found = false;
+        pool = 0;
+        for (i = 0; i < graph->decl_count; i++)
+        {
+            decl = &graph->decls[i];
+            if (decl->producer != producer)
+                continue;
+            found = true;
+            pool = decl->pool;
+            if (exact && decl->shares)
+                continue;
+            records = decl->max_records;
+            stride = (decl->record_size + 15) & ~15u;
+            if (exact)
+            {
+                for (j = 0; j < graph->decl_count; j++)
+                {
+                    other = &graph->decls[j];
+                    if (other->shares == i + 1)
+                        stride = max(stride, (other->record_size + 15) & ~15u);
+                }
+            }
+            payload = records * stride;
+            if (decl->thread)
+            {
+                payload *= 64;
+                records *= 64;
+            }
+            item[WG_POOL_PAYLOAD] += payload;
+            for (c = WG_POOL_ENTRIES; c < WG_POOL_COMPONENTS; c++)
+                item[c] += records;
+        }
+        if (!found)
+            continue;
+        for (c = 0; c < WG_POOL_COMPONENTS; c++)
+            w[pool][c] = max(w[pool][c], item[c]);
+    }
+}
+
+/* Checks one region: aligned, at or after *end, inside used bytes. */
+static bool workgraph_check_pool_region(const struct workgraph_pool_region *region, uint64_t alignment, uint64_t used,
+        uint64_t *end, const char *what)
+{
+    bool valid = !(region->offset % alignment) && region->offset >= *end && region->offset <= used &&
+            region->size <= used - region->offset;
+
+    ok(valid, "%s at %#"PRIx64", %#"PRIx64" bytes: not aligned, overlapping or outside %#"PRIx64" bytes.\n", what,
+            region->offset, region->size, used);
+    if (valid)
+        *end = region->offset + region->size;
+    return valid;
+}
+
+static void workgraph_check_pool_layouts(const struct workgraph_pool_graph *graph, const struct workgraph_pools *pools,
+        const uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS], const uint64_t exact[WG_POOL_LEVELS][WG_POOL_COMPONENTS])
+{
+    uint64_t end, bytes, records, unit, arena_records[3], sum_payload = 0, sum_records = 0;
+    unsigned int n, level, half, c;
+    char what[64];
+
+    for (level = 1; level < graph->levels; level++)
+    {
+        sum_payload += w[level][WG_POOL_PAYLOAD];
+        sum_records += w[level][WG_POOL_ENTRIES];
+    }
+    unit = sum_records ? ((sum_payload + sum_records - 1) / sum_records + 15) & ~(uint64_t)15 : 0;
+    ok(pools->arena_payload == unit, "Expected %"PRIu64" payload bytes per arena record, got %"PRIu64".\n", unit,
+            pools->arena_payload);
+
+    for (n = 0; n < ARRAY_SIZE(pools->layouts); n++)
+    {
+        const uint64_t expected_used = min(pools->layouts[n].size, pools->max_size);
+
+        vkd3d_test_set_context("%s, layout %u", graph->name, n);
+        arena_records[n] = 0;
+        ok(pools->layouts[n].used == expected_used, "Expected %#"PRIx64" bytes used, got %#"PRIx64".\n",
+                expected_used, pools->layouts[n].used);
+        if (pools->layouts[n].used != expected_used)
+            continue;
+
+        end = 0;
+        workgraph_check_pool_region(&pools->layouts[n].fixed, 64, expected_used, &end, "Fixed bookkeeping");
+        ok(pools->layouts[n].fixed.size == pools->fixed_size, "Got fixed size %#"PRIx64".\n",
+                pools->layouts[n].fixed.size);
+        workgraph_check_pool_region(&pools->layouts[n].empty_state, 16, expected_used, &end, "Empty-record state");
+        ok(!pools->layouts[n].empty_state.size, "Got empty-record state size %#"PRIx64".\n",
+                pools->layouts[n].empty_state.size);
+
+        for (level = 1; level < graph->levels; level++)
+        {
+            for (half = 0; half < 2; half++)
+            {
+                for (c = 0; c < WG_POOL_COMPONENTS; c++)
+                {
+                    const struct workgraph_pool_region *region = &pools->layouts[n].isolated[level][half][c];
+
+                    sprintf(what, "Pool %u half %u component %u", level, half, c);
+                    workgraph_check_pool_region(region, workgraph_pool_alignment[c], expected_used, &end, what);
+                    bytes = w[level][c] * workgraph_pool_unit[c];
+                    ok(region->size == bytes, "%s: expected %#"PRIx64" bytes, got %#"PRIx64".\n", what, bytes,
+                            region->size);
+                    ok(region->size >= exact[level][c] * workgraph_pool_unit[c],
+                            "%s: %#"PRIx64" bytes is below the spec bound.\n", what, region->size);
+                }
+            }
+        }
+        for (level = graph->levels; level < WG_POOL_LEVELS; level++)
+            for (half = 0; half < 2; half++)
+                for (c = 0; c < WG_POOL_COMPONENTS; c++)
+                    ok(!pools->layouts[n].isolated[level][half][c].size, "Pool %u after the last level has %#"PRIx64
+                            " bytes.\n", level, pools->layouts[n].isolated[level][half][c].size);
+
+        /* The two arena halves hold the same number of records in each component. */
+        records = unit ? pools->layouts[n].arena[0][WG_POOL_PAYLOAD].size / unit : 0;
+        for (half = 0; half < 2; half++)
+        {
+            for (c = 0; c < WG_POOL_COMPONENTS; c++)
+            {
+                const struct workgraph_pool_region *region = &pools->layouts[n].arena[half][c];
+
+                sprintf(what, "Arena half %u component %u", half, c);
+                workgraph_check_pool_region(region, workgraph_pool_alignment[c], expected_used, &end, what);
+                bytes = records * (c == WG_POOL_PAYLOAD ? unit : workgraph_pool_unit[c]);
+                ok(region->size == bytes, "%s: expected %#"PRIx64" bytes, got %#"PRIx64".\n", what, bytes,
+                        region->size);
+            }
+        }
+        arena_records[n] = records;
+
+        workgraph_check_pool_region(&pools->layouts[n].staging, 16, expected_used, &end, "Staging");
+        ok(pools->layouts[n].staging.size == pools->staging_size, "Got staging size %#"PRIx64".\n",
+                pools->layouts[n].staging.size);
+        ok(pools->layouts[n].staging.offset == ((expected_used - pools->staging_size) & ~(uint64_t)15),
+                "Got staging at %#"PRIx64".\n", pools->layouts[n].staging.offset);
+    }
+    vkd3d_test_set_context("%s", graph->name);
+
+    /* At Min the arena is what the granularity leaves; one more granule gives it more records if there are pools. */
+    ok(arena_records[0] < 65536 / 2 / (unit ? unit : 1) + 1, "Got %"PRIu64" arena records at Min.\n",
+            arena_records[0]);
+    if (unit && pools->layouts[1].size <= pools->max_size)
+        ok(arena_records[1] > arena_records[0], "Expected more arena records at Min + 64 KiB, got %"PRIu64".\n",
+                arena_records[1]);
+    ok(arena_records[2] >= arena_records[1], "Got %"PRIu64" arena records at Max.\n", arena_records[2]);
+}
+
+void test_workgraph_drain_layout(void)
+{
+    /* The lab flavour of the amdgpu-wddm engine computes the record pools of the draining scheduler at state object
+     * creation: W of each pool (the worst-case output of one producer item into it, componentwise maximum over the
+     * producers), and a layout of the backing memory for each size between Min and Max. Execution does not use them
+     * yet, so the memory requirements do not change. The test computes W from the declarations of the HLSL source,
+     * independently of the engine, and checks W and the layouts at Min, Min + 64 KiB and Max: every region aligned,
+     * in order, inside the backing size, the isolated shares of each pool equal to its W, and the two halves equal.
+     * Nothing is dispatched. */
+#include "shaders/workgraph/headers/basic_recursion.h"
+#include "shaders/workgraph/headers/shared_inputs.h"
+#include "shaders/workgraph/headers/two_level_broadcast_node_array.h"
+#include "shaders/workgraph/headers/two_level_thread.h"
+    static const struct workgraph_pool_graph graphs[] =
+    {
+        /* Entry -> Mid (MaxRecords 1, 4 bytes) -> Leaf (MaxRecords 64, 256 bytes). */
+        { "level_sinks", &level_sinks_dxil, 3,
+                { { 1, 0, false, 1, 4 }, { 2, 1, false, 64, 256 } }, 2 },
+        /* Two entry points (broadcasting), each MaxRecords 64 of 4 bytes into Child. */
+        { "output_zero_counts", &output_zero_counts_dxil, 2,
+                { { 1, 0, false, 64, 4 }, { 1, 1, false, 64, 4 } }, 2 },
+        /* A thread launch entry with MaxRecords 2 into Recursive, which recurses 6 times with MaxRecords 2: level 7,
+         * the last depth, writes nothing. */
+        { "basic_recursion", &basic_recursion_dxil, 8,
+                { { 1, 0, true, 2, 4 }, { 2, 1, true, 2, 4 }, { 3, 2, true, 2, 4 }, { 4, 3, true, 2, 4 },
+                { 5, 4, true, 2, 4 }, { 6, 5, true, 2, 4 }, { 7, 6, true, 2, 4 } }, 7 },
+        /* A thread launch entry with MaxRecords 1 of 8 bytes into Broadcast, whose input TappedInput shares. */
+        { "shared_inputs", &shared_inputs_dxil, 2, { { 1, 0, true, 1, 8 } }, 1 },
+        /* MaxRecords 8 for a node array of 2 nodes with 12-byte records. */
+        { "two_level_broadcast_node_array", &two_level_broadcast_node_array_dxil, 2,
+                { { 1, 0, false, 8, 12 } }, 1 },
+        /* MaxRecords 256 of 8 bytes, and MaxRecordsSharedWith it of 8 bytes. */
+        { "two_level_thread", &two_level_thread_dxil, 2,
+                { { 1, 0, false, 256, 8 }, { 1, 0, false, 256, 8, 1 } }, 2 },
+    };
+    uint64_t w[WG_POOL_LEVELS][WG_POOL_COMPONENTS], exact[WG_POOL_LEVELS][WG_POOL_COMPONENTS];
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct test_context_workgraph context;
+    struct workgraph_pools *pools;
+    ID3D12StateObject *pso;
+    unsigned int i, level, c;
+    ID3D12WorkGraphProperties *props;
+    bool frame;
+    UINT size;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    if (!workgraph_drain_expected(context.device, &frame))
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+
+    pools = malloc(sizeof(*pools));
+    for (i = 0; i < ARRAY_SIZE(graphs); i++)
+    {
+        const struct workgraph_pool_graph *graph = &graphs[i];
+
+        vkd3d_test_set_context("%s", graph->name);
+        hr = try_create_workgraph_pso(&context, *graph->code, NULL, &pso);
+        ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+        if (!pso)
+            continue;
+
+        hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+        ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+        memset(&wg_reqs, 0, sizeof(wg_reqs));
+        ID3D12WorkGraphProperties_GetWorkGraphMemoryRequirements(props, 0, &wg_reqs);
+        ID3D12WorkGraphProperties_Release(props);
+
+        memset(pools, 0, sizeof(*pools));
+        size = sizeof(*pools);
+        hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_pool_guid, &size, pools);
+        if (!frame)
+        {
+            ok(FAILED(hr), "Got the record pools, but none were expected.\n");
+            ID3D12StateObject_Release(pso);
+            continue;
+        }
+        ok(hr == S_OK && size == sizeof(*pools) && pools->valid && pools->pools == graph->levels,
+                "Record pools: hr #%x, size %u, valid %u, %u levels.\n", (int)hr, size, pools->valid, pools->pools);
+        if (hr != S_OK || size != sizeof(*pools) || !pools->valid || pools->pools != graph->levels)
+        {
+            ID3D12StateObject_Release(pso);
+            continue;
+        }
+
+        workgraph_pool_oracle(graph, false, w);
+        workgraph_pool_oracle(graph, true, exact);
+        for (level = 0; level < WG_POOL_LEVELS; level++)
+        {
+            for (c = 0; c < WG_POOL_COMPONENTS; c++)
+            {
+                ok(pools->w[level][c] == w[level][c], "Pool %u component %u: expected W %"PRIu64", got %"PRIu64".\n",
+                        level, c, w[level][c], pools->w[level][c]);
+                ok(w[level][c] >= exact[level][c], "Pool %u component %u: W %"PRIu64" is below the spec bound %"
+                        PRIu64".\n", level, c, w[level][c], exact[level][c]);
+            }
+        }
+
+        /* Min is a multiple of 64 KiB, and Max is the requirement of today, or Min if it is larger. */
+        ok(pools->min_size && !(pools->min_size % 65536), "Got Min %#"PRIx64".\n", pools->min_size);
+        ok(pools->max_size == max(pools->min_size, (uint64_t)wg_reqs.MaxSizeInBytes),
+                "Got Max %#"PRIx64", requirement %#"PRIx64".\n", pools->max_size, (uint64_t)wg_reqs.MaxSizeInBytes);
+        ok(pools->layouts[0].size == pools->min_size && pools->layouts[1].size == pools->min_size + 65536 &&
+                pools->layouts[2].size == pools->max_size, "Got layout sizes %#"PRIx64", %#"PRIx64", %#"PRIx64".\n",
+                pools->layouts[0].size, pools->layouts[1].size, pools->layouts[2].size);
+        trace("%s: Min %#"PRIx64", Max %#"PRIx64", requirements %#"PRIx64" to %#"PRIx64".\n", graph->name,
+                pools->min_size, pools->max_size, (uint64_t)wg_reqs.MinSizeInBytes, (uint64_t)wg_reqs.MaxSizeInBytes);
+        workgraph_check_pool_layouts(graph, pools, w, exact);
+
+        ID3D12StateObject_Release(pso);
+    }
+    vkd3d_test_set_context(NULL);
+
+    free(pools);
     destroy_workgraph_test_context(&context);
 }
