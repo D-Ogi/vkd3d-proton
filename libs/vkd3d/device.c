@@ -9381,7 +9381,10 @@ static D3D12_RAYTRACING_TIER d3d12_device_determine_ray_tracing_tier(struct d3d1
         }
     }
 
-    if (tier == D3D12_RAYTRACING_TIER_1_1 && info->supports_opacity_micromap)
+    /* Tier 1.2 adds opacity micromaps and shader execution reordering (fork change: upstream asks for the
+     * micromaps only). A device without SER stays at tier 1.1 also when it supports micromaps. */
+    if (tier == D3D12_RAYTRACING_TIER_1_1 && info->supports_opacity_micromap &&
+            info->invocation_reorder_features.rayTracingInvocationReorder)
     {
         INFO("DXR 1.2 support enabled.\n");
         tier = D3D12_RAYTRACING_TIER_1_2;
