@@ -145,8 +145,18 @@ struct d3d12_wg_state_object_program
     const D3D12_NODE *explicit_defined_nodes;
     size_t explicit_defined_nodes_count;
 
-    /* amdgpu-wddm fork: local root arguments table index per entry point, after auto-assignment. */
+    /* amdgpu-wddm fork: local root arguments table index per slot, after auto-assignment. */
     uint32_t *local_root_table_indices;
+
+    /* amdgpu-wddm fork: recursion depth slots. Slot i < num_nodes is entry point i at recursion depth 0.
+     * A node with [NodeMaxRecursionDepth(R)] gets R more slots, for depth 1 to R, from recursion_slot_base.
+     * A record of a recursive node goes to the slot of its depth, so that one dispatch of a slot holds
+     * records of one depth only, also when the node is reached at different levels of the graph.
+     * num_pipelines is the number of slots. */
+    unsigned int num_nodes;
+    uint32_t *slot_entry;
+    uint32_t *slot_depth;
+    uint32_t *recursion_slot_base;
 };
 
 struct d3d12_wg_state_object_module
@@ -217,6 +227,9 @@ static void d3d12_wg_state_object_free_programs(
         vkd3d_free(programs[i].share_mapping);
         vkd3d_free(programs[i].payload_expander_meta);
         vkd3d_free(programs[i].local_root_table_indices);
+        vkd3d_free(programs[i].slot_entry);
+        vkd3d_free(programs[i].slot_depth);
+        vkd3d_free(programs[i].recursion_slot_base);
     }
     vkd3d_free(programs);
 }
@@ -501,7 +514,7 @@ static HRESULT d3d12_wg_state_object_program_add_outputs_to_level(
     unsigned int i, j;
     HRESULT hr;
 
-    entry = &data->entry_points[entry_point_index];
+    entry = &data->entry_points[program->slot_entry[entry_point_index]];
 
     for (i = 0; i < entry->node_outputs_count; i++)
     {
@@ -523,7 +536,7 @@ static HRESULT d3d12_wg_state_object_program_add_outputs_to_level(
                     output->node_id, output->node_array_index + j);
 
             /* We handle recursion separately. */
-            if (node_index == entry_point_index)
+            if (node_index == program->slot_entry[entry_point_index])
                 continue;
 
             if (node_index == UINT32_MAX)
@@ -563,7 +576,7 @@ static HRESULT d3d12_wg_state_object_program_add_node_to_level(
         return E_INVALIDARG;
     }
 
-    entry = &data->entry_points[entry_point_index];
+    entry = &data->entry_points[program->slot_entry[entry_point_index]];
 
     exec = &program->levels[level];
     for (i = 0; i < exec->nodes_count; i++)
@@ -577,10 +590,11 @@ static HRESULT d3d12_wg_state_object_program_add_node_to_level(
 
     if (!is_recursing)
     {
+        /* amdgpu-wddm fork: depth i + 1 of this chain runs from its own slot. */
         for (i = 0; i < entry->node_input->recursion_factor; i++)
         {
             if (FAILED(hr = d3d12_wg_state_object_program_add_node_to_level(
-                    program, data, entry_point_index,
+                    program, data, program->recursion_slot_base[entry_point_index] + i,
                     level + 1 + i, true)))
             {
                 return hr;
@@ -874,6 +888,61 @@ static HRESULT d3d12_wg_state_object_apply_node_overrides(
     return S_OK;
 }
 
+/* amdgpu-wddm fork: see the recursion depth slots in struct d3d12_wg_state_object_program. */
+static HRESULT d3d12_wg_state_object_program_init_slots(
+        struct d3d12_wg_state_object_program *program,
+        const struct d3d12_wg_state_object_data *data)
+{
+    unsigned int num_slots, slot, depth;
+    uint32_t factor;
+    size_t i;
+
+    num_slots = data->entry_points_count;
+    for (i = 0; i < data->entry_points_count; i++)
+        if (data->entry_points[i].node_input)
+            num_slots += data->entry_points[i].node_input->recursion_factor;
+
+    program->num_nodes = data->entry_points_count;
+    program->num_pipelines = num_slots;
+    program->slot_entry = vkd3d_malloc(max(num_slots, 1) * sizeof(*program->slot_entry));
+    program->slot_depth = vkd3d_malloc(max(num_slots, 1) * sizeof(*program->slot_depth));
+    program->recursion_slot_base = vkd3d_malloc(max(data->entry_points_count, 1) *
+            sizeof(*program->recursion_slot_base));
+    if (!program->slot_entry || !program->slot_depth || !program->recursion_slot_base)
+        return E_OUTOFMEMORY;
+
+    for (i = 0; i < data->entry_points_count; i++)
+    {
+        program->slot_entry[i] = i;
+        program->slot_depth[i] = 0;
+        program->recursion_slot_base[i] = UINT32_MAX;
+    }
+
+    slot = data->entry_points_count;
+    for (i = 0; i < data->entry_points_count; i++)
+    {
+        factor = data->entry_points[i].node_input ? data->entry_points[i].node_input->recursion_factor : 0;
+        if (!factor)
+            continue;
+
+        program->recursion_slot_base[i] = slot;
+        for (depth = 1; depth <= factor; depth++, slot++)
+        {
+            program->slot_entry[slot] = i;
+            program->slot_depth[slot] = depth;
+        }
+    }
+
+    return S_OK;
+}
+
+/* amdgpu-wddm fork: the slot that holds the records of entry point entry_index at recursion depth depth. */
+static uint32_t d3d12_wg_state_object_program_depth_slot(
+        const struct d3d12_wg_state_object_program *program, uint32_t entry_index, uint32_t depth)
+{
+    return depth ? program->recursion_slot_base[entry_index] + depth - 1 : entry_index;
+}
+
 static HRESULT d3d12_wg_state_object_resolve_entry_points_explicit(struct d3d12_wg_state_object *object,
         struct d3d12_wg_state_object_data *data,
         struct d3d12_wg_state_object_program *program)
@@ -1063,10 +1132,10 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
     size_t i, j;
     bool used;
 
-    if (!(indices = vkd3d_malloc(max(count, 1) * sizeof(*indices))))
+    if (!(indices = vkd3d_malloc(max(program->num_pipelines, 1) * sizeof(*indices))))
         return E_OUTOFMEMORY;
     program->local_root_table_indices = indices;
-    for (i = 0; i < count; i++)
+    for (i = 0; i < program->num_pipelines; i++)
         indices[i] = UINT32_MAX;
 
     in_program = vkd3d_calloc(max(count, 1), sizeof(*in_program));
@@ -1081,9 +1150,9 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
     for (i = 0; i < program->num_levels; i++)
     {
         for (j = 0; j < program->levels[i].nodes_count; j++)
-            in_program[program->levels[i].nodes[j]] = true;
+            in_program[program->slot_entry[program->levels[i].nodes[j]]] = true;
         for (j = 0; j < program->levels[i].shared_nodes_count; j++)
-            in_program[program->levels[i].shared_nodes[j].node_pipeline_index] = true;
+            in_program[program->slot_entry[program->levels[i].shared_nodes[j].node_pipeline_index]] = true;
     }
 
     /* Listed entry points first, then every node in export order. */
@@ -1136,6 +1205,10 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
                 data->entry_points[node_index].node_input->node_id,
                 data->entry_points[node_index].node_input->node_array_index, candidate);
     }
+
+    /* A depth slot uses the table entry of its node. */
+    for (i = count; i < program->num_pipelines; i++)
+        indices[i] = indices[program->slot_entry[i]];
 
 out:
     vkd3d_free(in_program);
@@ -1606,7 +1679,7 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNumNodes(
     program = &object->programs[WorkGraphIndex];
 
     count = 0;
-    for (i = 0; i < program->num_pipelines; i++)
+    for (i = 0; i < program->num_nodes; i++)
     {
         if (program->pipelines[i].vk_non_entry_pipeline != VK_NULL_HANDLE ||
             program->pipelines[i].vk_cpu_node_entry_pipeline != VK_NULL_HANDLE)
@@ -1623,7 +1696,7 @@ static unsigned int d3d12_work_graph_properties_node_index_to_entry(
     unsigned int count, i;
     count = 0;
 
-    for (i = 0; i < program->num_pipelines; i++)
+    for (i = 0; i < program->num_nodes; i++)
     {
         if (program->pipelines[i].vk_non_entry_pipeline != VK_NULL_HANDLE ||
             program->pipelines[i].vk_cpu_node_entry_pipeline != VK_NULL_HANDLE)
@@ -1701,7 +1774,7 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNodeIndex(
     program = &object->programs[WorkGraphIndex];
     count = 0;
 
-    for (i = 0; i < program->num_pipelines; i++)
+    for (i = 0; i < program->num_nodes; i++)
     {
         if (program->pipelines[i].vk_non_entry_pipeline != VK_NULL_HANDLE ||
             program->pipelines[i].vk_cpu_node_entry_pipeline != VK_NULL_HANDLE)
@@ -1956,7 +2029,7 @@ static HRESULT d3d12_wg_state_object_compile_pipeline(
     pipeline_info.stage.pName = "main";
     pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    entry = &data->entry_points[entry_point_index];
+    entry = &data->entry_points[program->slot_entry[entry_point_index]];
     is_broadcast = entry->node_input->launch_type == VKD3D_SHADER_NODE_LAUNCH_TYPE_BROADCASTING;
 
     /* TODO: These can be overridden during compilation. */
@@ -1976,9 +2049,9 @@ static HRESULT d3d12_wg_state_object_compile_pipeline(
     vkd3d_array_reserve((void **)&tmp->spec_data, &tmp->spec_data_size, tmp->spec_data_count, sizeof(*tmp->spec_data));
     vkd3d_array_reserve((void **)&tmp->map_entries, &tmp->map_entries_size, tmp->spec_data_count, sizeof(*tmp->map_entries));
 
-    pipeline_info.stage.module = object->modules[entry_point_index].vk_module;
-    if (object->modules[entry_point_index].mappings)
-        pipeline_info.stage.pNext = &object->modules[entry_point_index].mappings->mapping_info;
+    pipeline_info.stage.module = object->modules[program->slot_entry[entry_point_index]].vk_module;
+    if (object->modules[program->slot_entry[entry_point_index]].mappings)
+        pipeline_info.stage.pNext = &object->modules[program->slot_entry[entry_point_index]].mappings->mapping_info;
 
     memset(&flags2, 0, sizeof(flags2));
     flags2.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO;
@@ -2019,6 +2092,15 @@ static HRESULT d3d12_wg_state_object_compile_pipeline(
 
         /* This should be impossible since we validated earlier. */
         assert(tmp->spec_data[i] != UINT32_MAX);
+
+        /* amdgpu-wddm fork: a recursive output goes to the slot of the next depth. At the last depth
+         * the node must not recurse (GetRemainingRecursionLevels() is 0), so the slot stays. */
+        if (tmp->spec_data[i] == program->slot_entry[entry_point_index] && entry->node_input->recursion_factor)
+        {
+            tmp->spec_data[i] = d3d12_wg_state_object_program_depth_slot(program,
+                    program->slot_entry[entry_point_index],
+                    min(program->slot_depth[entry_point_index] + 1, entry->node_input->recursion_factor));
+        }
     }
 
     spec_constant_index = entry->node_outputs_count;
@@ -2162,7 +2244,7 @@ static bool d3d12_wg_state_object_program_can_compact_broadcast_nodes(
         for (i = 0; i < program->levels[level].shared_nodes_count; i++)
         {
             node_index = program->levels[level].shared_nodes[i].node_payload_index;
-            node_input = data->entry_points[node_index].node_input;
+            node_input = data->entry_points[program->slot_entry[node_index]].node_input;
             if (node_input && node_input->dispatch_grid_is_upper_bound)
                 return false;
         }
@@ -2170,7 +2252,7 @@ static bool d3d12_wg_state_object_program_can_compact_broadcast_nodes(
         for (i = 0; i < program->levels[level].nodes_count; i++)
         {
             node_index = program->levels[level].nodes[i];
-            node_input = data->entry_points[node_index].node_input;
+            node_input = data->entry_points[program->slot_entry[node_index]].node_input;
             if (node_input && node_input->dispatch_grid_is_upper_bound)
                 can_compact = true;
         }
@@ -2191,8 +2273,7 @@ static HRESULT d3d12_wg_state_object_compile_program(
     unsigned int i;
 
     memset(&tmp, 0, sizeof(tmp));
-    program->pipelines = vkd3d_calloc(data->entry_points_count, sizeof(*program->pipelines));
-    program->num_pipelines = data->entry_points_count;
+    program->pipelines = vkd3d_calloc(program->num_pipelines, sizeof(*program->pipelines));
     program->coalesce_dividers_or_amp = vkd3d_calloc(program->num_pipelines, sizeof(int32_t));
     program->share_mapping = vkd3d_malloc(program->num_pipelines * sizeof(uint32_t));
     program->payload_expander_meta = vkd3d_calloc(program->num_pipelines, sizeof(struct d3d12_wg_payload_expander_meta));
@@ -2205,7 +2286,7 @@ static HRESULT d3d12_wg_state_object_compile_program(
 
     for (i = 0; i < program->num_pipelines; i++)
     {
-        const struct vkd3d_shader_node_input_data *node_input = data->entry_points[i].node_input;
+        const struct vkd3d_shader_node_input_data *node_input = data->entry_points[program->slot_entry[i]].node_input;
         struct d3d12_wg_payload_expander_meta *meta;
         uint32_t node_index;
 
@@ -2263,7 +2344,7 @@ static HRESULT d3d12_wg_state_object_compile_program(
         meta->group_compact_broadcast = node_input->dispatch_grid_is_upper_bound &&
                 program->compact_broadcast_nodes_with_max_grid;
 
-        if (node_input->node_share_input_id && *node_input->node_share_input_id != '\0')
+        if (i < program->num_nodes && node_input->node_share_input_id && *node_input->node_share_input_id != '\0')
         {
             node_index = d3d12_work_graph_find_node_by_id(
                     data->entry_points, data->entry_points_count,
@@ -2292,12 +2373,12 @@ static HRESULT d3d12_wg_state_object_compile_program(
     program->member##_size = (size); \
     scratch_offset += program->member##_size
 
-    alloc_scratch(counters_scratch, (2 + data->entry_points_count) * sizeof(uint32_t));
+    alloc_scratch(counters_scratch, (2 + program->num_pipelines) * sizeof(uint32_t));
     alloc_scratch(indirect_commands_scratch_base,
-            data->entry_points_count * sizeof(struct d3d12_workgraph_indirect_command) + WG_INDIRECT_COMMAND_OFFSET);
-    alloc_scratch(dividers_scratch, data->entry_points_count * sizeof(uint32_t));
-    alloc_scratch(share_mapping_scratch, data->entry_points_count * sizeof(uint32_t));
-    alloc_scratch(payload_expander_scratch, data->entry_points_count * sizeof(struct d3d12_wg_payload_expander_meta));
+            program->num_pipelines * sizeof(struct d3d12_workgraph_indirect_command) + WG_INDIRECT_COMMAND_OFFSET);
+    alloc_scratch(dividers_scratch, program->num_pipelines * sizeof(uint32_t));
+    alloc_scratch(share_mapping_scratch, program->num_pipelines * sizeof(uint32_t));
+    alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
 #undef alloc_scratch
 
     program->required_scratch_size = scratch_offset;
@@ -2531,6 +2612,9 @@ static HRESULT d3d12_wg_state_object_compile_programs(
         if (FAILED(hr = d3d12_wg_state_object_apply_node_overrides(data, program)))
             return hr;
 
+        if (FAILED(hr = d3d12_wg_state_object_program_init_slots(program, data)))
+            return hr;
+
         if (program->explicit_entry_point_count)
         {
             if (FAILED(hr = d3d12_wg_state_object_resolve_entry_points_explicit(object, data, program)))
@@ -2736,36 +2820,19 @@ void d3d12_command_list_workgraph_initialize_scratch(struct d3d12_command_list *
     d3d12_command_list_debug_mark_end_region(list);
 }
 
+/* amdgpu-wddm fork: a slot holds the records of one recursion depth, see struct d3d12_wg_state_object_program.
+ * The count does not depend on the level, because a node can be reached at different levels of the graph. */
 static unsigned int d3d12_command_list_workgraph_remaining_levels(
+        const struct d3d12_wg_state_object *state,
         const struct d3d12_wg_state_object_program *program,
-        unsigned int level,
         unsigned int node_index)
 {
-    /* This could be precomputed if need be. */
+    const struct vkd3d_shader_node_input_data *node_input;
 
-    unsigned int end_level;
-    unsigned int i;
-
-    /* Increment the recursion factor as long as we can find the same node duplicated in next level as well. */
-    for (end_level = level + 1; end_level < program->num_levels; end_level++)
-    {
-        for (i = 0; i < program->levels[end_level].nodes_count; i++)
-            if (program->levels[end_level].nodes[i] == node_index)
-                break;
-
-        if (i == program->levels[end_level].nodes_count)
-            break;
-    }
-
-    /* This is slightly questionable. I'm not sure if we technically need to track different recursion states
-     * per level. E.g. assume 3 nodes: A, B and C, where C is recursive.
-     * A -> B
-     * A -> C
-     * B -> C
-     * In this situation, inputs coming from B would execute at a different recursion level from A.
-     * Hopefully we don't need to care about this situation. In that case we'd have to invent virtual nodes,
-     * but let's only care about this hypothetical scenario if someone actually relies on that. */
-    return end_level - level - 1;
+    node_input = state->entry_points[program->slot_entry[node_index]].node_input;
+    if (!node_input->recursion_factor)
+        return 0;
+    return node_input->recursion_factor - program->slot_depth[node_index];
 }
 
 static void d3d12_command_list_workgraph_execute_node_cpu_entry(struct d3d12_command_list *list,
@@ -2789,11 +2856,11 @@ static void d3d12_command_list_workgraph_execute_node_cpu_entry(struct d3d12_com
     d3d12_command_list_update_global_descriptor_heap(list);
     push.root_parameter_bda = vk_root_parameter_buffer_va;
 
-    node_input = state->entry_points[node_index].node_input;
+    node_input = state->entry_points[program->slot_entry[node_index]].node_input;
 
     push.node_payload_bda = input_payload;
     push.node_payload_output_bda = output_payload;
-    push.node_remaining_recursion_levels = d3d12_command_list_workgraph_remaining_levels(program, 0, node_index);
+    push.node_remaining_recursion_levels = d3d12_command_list_workgraph_remaining_levels(state, program, node_index);
 
     push.node_payload_stride_or_offsets_bda = desc->RecordStrideInBytes;
     if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
@@ -3021,7 +3088,7 @@ static void d3d12_command_list_emit_distribute_workgroups(struct d3d12_command_l
     args.commands_va = program->indirect_commands_scratch_base_offset + list->wg_state.BackingMemory.StartAddress;
     args.dividers_va = program->dividers_scratch_offset + list->wg_state.BackingMemory.StartAddress;
     args.node_share_mapping_va = program->share_mapping_scratch_offset + list->wg_state.BackingMemory.StartAddress;
-    args.num_nodes = state->entry_points_count;
+    args.num_nodes = program->num_pipelines;
 
     d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
             program->workgroup_distributor.vk_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -3147,7 +3214,7 @@ static void d3d12_command_list_workgraph_execute_node_gpu(
     unsigned int table_index;
 
     memset(&push, 0, sizeof(push));
-    node_input = state->entry_points[node_index].node_input;
+    node_input = state->entry_points[program->slot_entry[node_index]].node_input;
 
     /* Just rebind resources every time. We have to execute intermediate shaders anyway,
      * which clobbers all descriptor state. */
@@ -3155,7 +3222,7 @@ static void d3d12_command_list_workgraph_execute_node_gpu(
     push.root_parameter_bda = vk_root_parameter_buffer_va;
 
     push.node_payload_output_bda = output_va;
-    push.node_remaining_recursion_levels = d3d12_command_list_workgraph_remaining_levels(program, level, node_index);
+    push.node_remaining_recursion_levels = d3d12_command_list_workgraph_remaining_levels(state, program, node_index);
 
     if (indirect_scratch)
     {
@@ -3323,7 +3390,7 @@ static bool d3d12_command_list_workgraph_setup_indirect(
         int coalesce_divider_or_amp;
         uint32_t max_amplification;
 
-        input = wg_state->entry_points[i].node_input;
+        input = wg_state->entry_points[program->slot_entry[i]].node_input;
         if (input->launch_type == VKD3D_SHADER_NODE_LAUNCH_TYPE_BROADCASTING)
         {
             max_amplification = input->broadcast_grid[0] * input->broadcast_grid[1] * input->broadcast_grid[2];
