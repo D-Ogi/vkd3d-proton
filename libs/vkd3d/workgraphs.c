@@ -250,6 +250,15 @@ struct d3d12_wg_state_object_program
      * so each execution context has its own. */
     VkDeviceSize multi_input_staging_scratch_offset;
     VkDeviceSize multi_input_staging_scratch_size;
+    /* amdgpu-wddm fork: the two payload rings and the unrolled offsets of the levels. They are in the backing
+     * memory, so that each execution context has its own (WorkGraphs.md, Backing memory). Before, the state
+     * object had one set, which executions of the graph on parallel queues shared. */
+    VkDeviceSize payload0_scratch_offset;
+    VkDeviceSize payload0_scratch_size;
+    VkDeviceSize payload1_scratch_offset;
+    VkDeviceSize payload1_scratch_size;
+    VkDeviceSize unrolled_offsets_scratch_offset;
+    VkDeviceSize unrolled_offsets_scratch_size;
     uint32_t multi_input_large_size;
     uint32_t multi_input_groups;
     VkDeviceSize required_scratch_size;
@@ -1565,28 +1574,6 @@ static ULONG STDMETHODCALLTYPE d3d12_work_graph_properties_AddRef(d3d12_work_gra
     return refcount;
 }
 
-static HRESULT d3d12_wg_state_object_allocate_ring(struct d3d12_wg_state_object_ring *ring, VkDeviceSize size,
-        struct d3d12_device *device)
-{
-    HRESULT hr;
-    if (FAILED(hr = vkd3d_create_buffer_explicit_usage(device,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            size, "workgraph-ring", &ring->vk_buffer)))
-    {
-        return hr;
-    }
-
-    if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, ring->vk_buffer,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-            &ring->allocation)))
-    {
-        return hr;
-    }
-
-    ring->va = vkd3d_get_buffer_device_address(device, ring->vk_buffer);
-    return S_OK;
-}
-
 static void d3d12_wg_state_object_cleanup_allocation(struct d3d12_wg_state_object_ring *ring, struct d3d12_device *device)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
@@ -1612,9 +1599,6 @@ static void d3d12_wg_state_object_cleanup(struct d3d12_wg_state_object *state_ob
     }
     vkd3d_free(state_object->modules);
 
-    d3d12_wg_state_object_cleanup_allocation(&state_object->payload[0], state_object->device);
-    d3d12_wg_state_object_cleanup_allocation(&state_object->payload[1], state_object->device);
-    d3d12_wg_state_object_cleanup_allocation(&state_object->unrolled_offsets, state_object->device);
     d3d12_wg_state_object_cleanup_allocation(&state_object->lost_records, state_object->device);
 }
 
@@ -2633,6 +2617,9 @@ static HRESULT d3d12_wg_state_object_compile_program(
     alloc_scratch(payload_expander_scratch, program->num_pipelines * sizeof(struct d3d12_wg_payload_expander_meta));
     d3d12_wg_get_multi_input_config(&multi_input_config);
     alloc_scratch(multi_input_staging_scratch, multi_input_config.staging_size);
+    alloc_scratch(payload0_scratch, VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE);
+    alloc_scratch(payload1_scratch, VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE);
+    alloc_scratch(unrolled_offsets_scratch, VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE);
 #undef alloc_scratch
 
     program->multi_input_large_size = multi_input_config.large_size;
@@ -2852,27 +2839,6 @@ static HRESULT d3d12_wg_state_object_allocate_lost_records(struct d3d12_wg_state
     return S_OK;
 }
 
-static HRESULT d3d12_wg_state_object_allocate_rings(struct d3d12_wg_state_object *object)
-{
-    /* This is the big achilles heel of any emulation path. This memory requirement is way too huge
-     * to make sense as scratch memory, so we'll have to come up with some global device data share or something
-     * to make this feasible, but for simple testing, we can just assume one workgraph per device. */
-    const VkDeviceSize payload_ring_size = VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE;
-    HRESULT hr;
-
-    if (FAILED(hr = d3d12_wg_state_object_allocate_ring(&object->payload[0], payload_ring_size, object->device)))
-        return hr;
-    if (FAILED(hr = d3d12_wg_state_object_allocate_ring(&object->payload[1], payload_ring_size, object->device)))
-        return hr;
-    if (FAILED(hr = d3d12_wg_state_object_allocate_ring(&object->unrolled_offsets, payload_ring_size, object->device)))
-        return hr;
-
-    if (FAILED(hr = d3d12_wg_state_object_allocate_lost_records(object)))
-        return hr;
-
-    return S_OK;
-}
-
 static HRESULT d3d12_wg_state_object_compile_programs(
         struct d3d12_wg_state_object *object, struct d3d12_wg_state_object_data *data)
 {
@@ -2954,7 +2920,7 @@ static HRESULT d3d12_wg_state_object_compile_programs(
             return hr;
     }
 
-    if (FAILED(hr = d3d12_wg_state_object_allocate_rings(object)))
+    if (FAILED(hr = d3d12_wg_state_object_allocate_lost_records(object)))
         return hr;
 
     return S_OK;
@@ -3425,7 +3391,7 @@ static void d3d12_command_list_emit_distribute_payload_offsets(struct d3d12_comm
     args.commands = list->wg_state.BackingMemory.StartAddress + program->indirect_commands_scratch_base_offset;
     args.meta = list->wg_state.BackingMemory.StartAddress + program->payload_expander_scratch_offset;
     args.payload = payload_va;
-    args.unrolled_offsets = state->unrolled_offsets.va;
+    args.unrolled_offsets = list->wg_state.BackingMemory.StartAddress + program->unrolled_offsets_scratch_offset;
     args.packed_offset_counts = list->wg_state.BackingMemory.StartAddress + program->required_scratch_size;
 
     d3d12_command_list_meta_push_data(list, list->cmd.vk_command_buffer,
@@ -3556,7 +3522,8 @@ static void d3d12_command_list_workgraph_execute_node_gpu(
                 list->wg_state.BackingMemory.StartAddress + program->indirect_commands_scratch_node_offset +
                 sizeof(struct d3d12_workgraph_indirect_command) * node_index;
 
-        push.node_payload_stride_or_offsets_bda = state->unrolled_offsets.va;
+        push.node_payload_stride_or_offsets_bda =
+                list->wg_state.BackingMemory.StartAddress + program->unrolled_offsets_scratch_offset;
         push.node_payload_bda = input_va;
 
         primary_linear_offset_bda = indirect_va + offsetof(struct d3d12_workgraph_indirect_command, primary_linear_offset);
@@ -3792,6 +3759,14 @@ static bool d3d12_command_list_workgraph_setup_indirect(
     return true;
 }
 
+/* amdgpu-wddm fork: payload ring index (0 or 1) of the execution, in the backing memory. */
+static VkDeviceAddress d3d12_wg_payload_va(const struct d3d12_command_list *list,
+        const struct d3d12_wg_state_object_program *program, unsigned int index)
+{
+    return list->wg_state.BackingMemory.StartAddress +
+            (index ? program->payload1_scratch_offset : program->payload0_scratch_offset);
+}
+
 static bool d3d12_command_list_workgraph_execute_entry_gpu(
         struct d3d12_command_list *list, struct d3d12_wg_state_object *state,
         const struct d3d12_wg_state_object_program *program, D3D12_GPU_VIRTUAL_ADDRESS va,
@@ -3810,7 +3785,7 @@ static bool d3d12_command_list_workgraph_execute_entry_gpu(
     for (i = 0; i < program->levels[0].nodes_count; i++)
     {
         d3d12_command_list_workgraph_execute_node_gpu(
-                list, state, program, state->payload[0].va, va, 0, program->levels[0].nodes[i],
+                list, state, program, d3d12_wg_payload_va(list, program, 0), va, 0, program->levels[0].nodes[i],
                 &indirect_scratch, vk_root_param_buffer_va);
     }
 
@@ -3818,7 +3793,7 @@ static bool d3d12_command_list_workgraph_execute_entry_gpu(
     for (i = 0; i < program->levels[0].shared_nodes_count; i++)
     {
         d3d12_command_list_workgraph_execute_node_gpu(
-                list, state, program, state->payload[0].va, va, 0, program->levels[0].shared_nodes[i].node_pipeline_index,
+                list, state, program, d3d12_wg_payload_va(list, program, 0), va, 0, program->levels[0].shared_nodes[i].node_pipeline_index,
                 &indirect_scratch, vk_root_param_buffer_va);
     }
 
@@ -3983,14 +3958,14 @@ static bool d3d12_command_list_workgraph_execute_entry_multi_gpu(
         slot_indirect.offset = indirect_scratch.offset + s * indirect_size;
         slot_indirect.va = indirect_scratch.va + s * indirect_size;
 
-        d3d12_command_list_workgraph_execute_node_gpu(list, state, program, state->payload[0].va, slot_va,
+        d3d12_command_list_workgraph_execute_node_gpu(list, state, program, d3d12_wg_payload_va(list, program, 0), slot_va,
                 0, node_index, &slot_indirect, vk_root_param_buffer_va);
 
         for (j = 0; j < program->levels[0].shared_nodes_count; j++)
         {
             if (program->levels[0].shared_nodes[j].node_payload_index == node_index)
             {
-                d3d12_command_list_workgraph_execute_node_gpu(list, state, program, state->payload[0].va,
+                d3d12_command_list_workgraph_execute_node_gpu(list, state, program, d3d12_wg_payload_va(list, program, 0),
                         slot_va, 0, program->levels[0].shared_nodes[j].node_pipeline_index,
                         &slot_indirect, vk_root_param_buffer_va);
             }
@@ -4042,7 +4017,7 @@ static bool d3d12_command_list_workgraph_execute_entry_cpu(
         memcpy(payload_scratch.host_ptr, desc->pRecords, payload_size);
 
     if (!d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program, node_index, desc,
-            wg_state->payload[0].va, payload_scratch.va,
+            d3d12_wg_payload_va(list, program, 0), payload_scratch.va,
             vk_root_param_buffer_va))
         return false;
 
@@ -4053,7 +4028,7 @@ static bool d3d12_command_list_workgraph_execute_entry_cpu(
         {
             if (!d3d12_command_list_workgraph_execute_node_cpu_entry(list, wg_state, program,
                     program->levels[0].shared_nodes[i].node_pipeline_index, desc,
-                    wg_state->payload[0].va, payload_scratch.va,
+                    d3d12_wg_payload_va(list, program, 0), payload_scratch.va,
                     vk_root_param_buffer_va))
                 return false;
         }
@@ -4140,6 +4115,15 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
 
     program = &wg_state->programs[wg_state_program_index];
 
+    /* amdgpu-wddm fork: the execution state, the payload rings included, is in the backing memory. With less
+     * memory than GetWorkGraphMemoryRequirements() asks for, the graph would write past it, so it does not run. */
+    if (list->wg_state.BackingMemory.SizeInBytes < program->required_scratch_size)
+    {
+        ERR("Backing memory is not large enough (%"PRIu64" < %"PRIu64"), the graph does not run.\n",
+                list->wg_state.BackingMemory.SizeInBytes, program->required_scratch_size);
+        goto out;
+    }
+
     if (!d3d12_command_list_workgraph_allocate_scratch(list,
             VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
             sizeof(union vkd3d_root_parameter_data), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
@@ -4156,7 +4140,7 @@ void d3d12_command_list_workgraph_dispatch(struct d3d12_command_list *list, cons
     for (i = 1; i < program->num_levels; i++)
     {
         d3d12_command_list_workgraph_execute_level(list, wg_state, program, i,
-                wg_state->payload[i & 1].va, wg_state->payload[(i & 1) ^ 1].va,
+                d3d12_wg_payload_va(list, program, i & 1), d3d12_wg_payload_va(list, program, (i & 1) ^ 1),
                 root_param_scratch.va);
     }
 

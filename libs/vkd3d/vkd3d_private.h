@@ -7040,10 +7040,8 @@ struct d3d12_wg_state_object
     struct d3d12_wg_state_object_module *modules;
     size_t modules_count;
 
-    /* Very hacky. Allocate huge scratch buffers that can hold execution state.
-     * Generally speaking, these buffers should be allocated in ring-buffers on device. */
-    struct d3d12_wg_state_object_ring unrolled_offsets;
-    struct d3d12_wg_state_object_ring payload[2];
+    /* amdgpu-wddm fork: the payload rings and the unrolled offsets are in the backing memory of each execution
+     * (d3d12_wg_state_object_program), so that executions on parallel queues do not share them. */
 
     /* amdgpu-wddm fork: struct vkd3d_workgraph_lost_records, mapped. lost_events_reported is the events count
      * of the last ERR line. */
