@@ -139,6 +139,9 @@ struct d3d12_wg_state_object_program
 
     const D3D12_NODE *explicit_defined_nodes;
     size_t explicit_defined_nodes_count;
+
+    /* amdgpu-wddm fork: local root arguments table index per entry point, after auto-assignment. */
+    uint32_t *local_root_table_indices;
 };
 
 struct d3d12_wg_state_object_module
@@ -175,6 +178,10 @@ struct d3d12_wg_state_object_data
     struct vkd3d_shader_library_subobject *subobjects;
     size_t subobjects_size;
     size_t subobjects_count;
+
+    /* amdgpu-wddm fork: node inputs in export order, recorded before the entry points are sorted. */
+    const struct vkd3d_shader_node_input_data **export_order;
+    size_t export_order_count;
 };
 
 static void d3d12_wg_state_object_free_programs(
@@ -204,6 +211,7 @@ static void d3d12_wg_state_object_free_programs(
         vkd3d_free(programs[i].coalesce_dividers_or_amp);
         vkd3d_free(programs[i].share_mapping);
         vkd3d_free(programs[i].payload_expander_meta);
+        vkd3d_free(programs[i].local_root_table_indices);
     }
     vkd3d_free(programs);
 }
@@ -236,6 +244,7 @@ static void d3d12_wg_state_object_cleanup_data(
     vkd3d_free(data->subobject_root_signatures);
 
     vkd3d_free(data->associations);
+    vkd3d_free(data->export_order);
 }
 
 static HRESULT d3d12_wg_state_object_parse_subobject(
@@ -642,6 +651,14 @@ static HRESULT d3d12_wg_state_object_rearrange_entry_points(struct d3d12_wg_stat
     size_t padded_entry_offset = 0;
     size_t i;
 
+    /* amdgpu-wddm fork: the sort loses the export order, which the default local root
+     * arguments table indices need (WorkGraphs.md, D3D12_WORK_GRAPH_DESC). */
+    if (!(data->export_order = vkd3d_calloc(max(data->entry_points_count, 1), sizeof(*data->export_order))))
+        return E_OUTOFMEMORY;
+    for (i = 0; i < data->entry_points_count; i++)
+        if (data->entry_points[i].node_input)
+            data->export_order[data->export_order_count++] = data->entry_points[i].node_input;
+
     /* Rearrange and figure out how large unbounded arrays are, and place arrayed entry points
      * in order so that we can index linearly. */
     qsort(data->entry_points, data->entry_points_count, sizeof(*data->entry_points), entry_point_compare_func);
@@ -982,6 +999,143 @@ static HRESULT d3d12_wg_state_object_resolve_entry_points(struct d3d12_wg_state_
 
 fail:
     vkd3d_free(node_is_output_target);
+    return hr;
+}
+
+/* amdgpu-wddm fork: depth first visit for the population order, outputs in declared order. */
+static void d3d12_wg_state_object_population_visit(const struct d3d12_wg_state_object_data *data,
+        const bool *in_program, bool *visited, unsigned int *order, size_t *order_count,
+        unsigned int entry_index)
+{
+    const struct vkd3d_shader_library_entry_point *entry = &data->entry_points[entry_index];
+    const struct vkd3d_shader_node_output_data *output;
+    uint32_t node_array_size, node_index;
+    size_t i, j;
+
+    if (visited[entry_index] || !in_program[entry_index])
+        return;
+
+    visited[entry_index] = true;
+    order[(*order_count)++] = entry_index;
+
+    for (i = 0; i < entry->node_outputs_count; i++)
+    {
+        output = &entry->node_outputs[i];
+        if (output->node_array_size == UINT32_MAX)
+            continue;
+
+        node_array_size = output->node_array_size ? output->node_array_size : 1;
+
+        for (j = 0; j < node_array_size; j++)
+        {
+            node_index = d3d12_work_graph_find_node_by_id(data->entry_points, data->entry_points_count,
+                    output->node_id, output->node_array_index + j);
+            if (node_index != UINT32_MAX)
+            {
+                d3d12_wg_state_object_population_visit(data, in_program, visited,
+                        order, order_count, node_index);
+            }
+        }
+    }
+}
+
+/* amdgpu-wddm fork: a node with a local root signature and no table index gets the lowest unused
+ * index 0, 1, 2 and so on, in the order the node is added to the graph (WorkGraphs.md,
+ * [NodeLocalRootArgumentsTableIndex(index)] and D3D12_WORK_GRAPH_DESC). Explicit indices stay. */
+static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
+        struct d3d12_wg_state_object_data *data,
+        struct d3d12_wg_state_object_program *program)
+{
+    const struct d3d12_state_object_association *local_rs_assoc;
+    size_t count = data->entry_points_count;
+    uint32_t *indices, candidate;
+    unsigned int *order = NULL;
+    bool *in_program = NULL;
+    bool *visited = NULL;
+    size_t order_count = 0;
+    uint32_t node_index;
+    HRESULT hr = S_OK;
+    size_t i, j;
+    bool used;
+
+    if (!(indices = vkd3d_malloc(max(count, 1) * sizeof(*indices))))
+        return E_OUTOFMEMORY;
+    program->local_root_table_indices = indices;
+    for (i = 0; i < count; i++)
+        indices[i] = UINT32_MAX;
+
+    in_program = vkd3d_calloc(max(count, 1), sizeof(*in_program));
+    visited = vkd3d_calloc(max(count, 1), sizeof(*visited));
+    order = vkd3d_calloc(max(count, 1), sizeof(*order));
+    if (!in_program || !visited || !order)
+    {
+        hr = E_OUTOFMEMORY;
+        goto out;
+    }
+
+    for (i = 0; i < program->num_levels; i++)
+    {
+        for (j = 0; j < program->levels[i].nodes_count; j++)
+            in_program[program->levels[i].nodes[j]] = true;
+        for (j = 0; j < program->levels[i].shared_nodes_count; j++)
+            in_program[program->levels[i].shared_nodes[j].node_pipeline_index] = true;
+    }
+
+    /* Listed entry points first, then every node in export order. */
+    for (i = 0; i < program->explicit_entry_point_count; i++)
+    {
+        node_index = d3d12_work_graph_find_node_by_id_wchar(data->entry_points, data->entry_points_count,
+                program->explicit_entry_points[i].Name, program->explicit_entry_points[i].ArrayIndex);
+        if (node_index != UINT32_MAX)
+            d3d12_wg_state_object_population_visit(data, in_program, visited, order, &order_count, node_index);
+    }
+
+    for (i = 0; i < data->export_order_count; i++)
+    {
+        for (j = 0; j < count; j++)
+        {
+            if (data->entry_points[j].node_input == data->export_order[i])
+            {
+                d3d12_wg_state_object_population_visit(data, in_program, visited, order, &order_count, j);
+                break;
+            }
+        }
+    }
+
+    for (i = 0; i < count; i++)
+        if (in_program[i] && data->entry_points[i].node_input)
+            indices[i] = data->entry_points[i].node_input->local_root_arguments_table_index;
+
+    for (i = 0; i < order_count; i++)
+    {
+        node_index = order[i];
+        if (indices[node_index] != UINT32_MAX)
+            continue;
+
+        local_rs_assoc = d3d12_state_object_find_association(VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE,
+                data->associations, data->associations_count, NULL, 0, &data->entry_points[node_index], NULL);
+        if (!local_rs_assoc || !local_rs_assoc->root_signature)
+            continue;
+
+        for (candidate = 0; candidate != UINT32_MAX; candidate++)
+        {
+            used = false;
+            for (j = 0; j < count && !used; j++)
+                used = in_program[j] && indices[j] == candidate;
+            if (!used)
+                break;
+        }
+
+        indices[node_index] = candidate;
+        TRACE("Node %s[%u] gets local root arguments table index %u.\n",
+                data->entry_points[node_index].node_input->node_id,
+                data->entry_points[node_index].node_input->node_array_index, candidate);
+    }
+
+out:
+    vkd3d_free(in_program);
+    vkd3d_free(visited);
+    vkd3d_free(order);
     return hr;
 }
 
@@ -1579,7 +1733,7 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNodeLocalRootArgume
     if (entry == -1u)
         return -1u;
     else
-        return object->entry_points[entry].node_input->local_root_arguments_table_index;
+        return object->programs[WorkGraphIndex].local_root_table_indices[entry];
 }
 
 static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNumEntrypoints(
@@ -2380,6 +2534,9 @@ static HRESULT d3d12_wg_state_object_compile_programs(
             if (FAILED(hr = d3d12_wg_state_object_resolve_entry_points(object, data, program)))
                 return hr;
         }
+
+        if (FAILED(hr = d3d12_wg_state_object_assign_local_root_table_indices(data, program)))
+            return hr;
     }
 
     /* Convert modules separately, per-program.
@@ -2646,7 +2803,7 @@ static void d3d12_command_list_workgraph_execute_node_cpu_entry(struct d3d12_com
     /* Counteract fixed offset applied by shader */
     push.node_payload_output_offset = program->required_scratch_size / sizeof(uint32_t) - 2;
 
-    table_index = node_input->local_root_arguments_table_index;
+    table_index = program->local_root_table_indices[node_index];
     if (table_index != UINT32_MAX)
     {
         push.local_root_signature_bda =
@@ -3054,7 +3211,7 @@ static void d3d12_command_list_workgraph_execute_node_gpu(
     /* Compensate for offset applied by shader. */
     push.node_payload_output_offset = program->required_scratch_size / sizeof(uint32_t) - 2;
 
-    table_index = node_input->local_root_arguments_table_index;
+    table_index = program->local_root_table_indices[node_index];
     if (table_index != UINT32_MAX)
     {
         push.local_root_signature_bda =
