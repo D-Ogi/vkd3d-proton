@@ -59,7 +59,8 @@ void main()
 			int divider = registers.coalesce_dividers.data[id];
 
 			if (divider > 1)
-				wg_count = (count + uint(divider) - 1) / uint(divider);
+				// amdgpu-wddm fork: count + divider - 1 wraps for counts near 2^32.
+				wg_count = count / uint(divider) + (count % uint(divider) != 0u ? 1u : 0u);
 			else
 				wg_count = count;
 
