@@ -1148,6 +1148,11 @@ struct vkd3d_shader_library_entry_point
     uint32_t pipeline_variant_index;
     uint32_t stage_index;
 
+    /* amdgpu-wddm fork: the position in the export order of the library (its RDAT function table), or
+     * UINT32_MAX if it is not known. The entry points of a library are in the order of the dx.entryPoints
+     * metadata, which DXC sorts by name. */
+    uint32_t export_index;
+
     /* For implementing the API, since it uses WCHAR despite C++ identifiers being ASCII ... */
     WCHAR *mangled_entry_point;
     WCHAR *plain_entry_point;

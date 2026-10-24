@@ -372,6 +372,13 @@ struct d3d12_wg_state_object_program
     uint32_t *slot_entry;
     uint32_t *slot_depth;
     uint32_t *recursion_slot_base;
+
+    /* amdgpu-wddm fork: the nodes of the graph (entry point indices) in the order of population, which is the
+     * node index of GetNodeID and GetNodeIndex. node_in_graph has one entry per entry point. */
+    D3D12_WORK_GRAPH_FLAGS flags;
+    unsigned int *node_order;
+    unsigned int node_order_count;
+    bool *node_in_graph;
 };
 
 struct d3d12_wg_state_object_module
@@ -447,6 +454,8 @@ static void d3d12_wg_state_object_free_programs(
         vkd3d_free(programs[i].slot_entry);
         vkd3d_free(programs[i].slot_depth);
         vkd3d_free(programs[i].recursion_slot_base);
+        vkd3d_free(programs[i].node_order);
+        vkd3d_free(programs[i].node_in_graph);
     }
     vkd3d_free(programs);
 }
@@ -495,9 +504,10 @@ static HRESULT d3d12_wg_state_object_parse_subobject(
             const D3D12_WORK_GRAPH_DESC *wg_desc = obj->pDesc;
             struct d3d12_wg_state_object_program *program;
 
-            if (wg_desc->Flags != D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES)
+            /* amdgpu-wddm fork: a graph can also have only the listed and explicitly defined nodes. */
+            if (wg_desc->Flags & ~D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES)
             {
-                FIXME("Only INCLUDE_ALL_AVAILABLE_NODES mode is supported.\n");
+                FIXME("Unsupported work graph flags %#x.\n", wg_desc->Flags);
                 return E_NOTIMPL;
             }
 
@@ -519,6 +529,7 @@ static HRESULT d3d12_wg_state_object_parse_subobject(
             }
 
             program->name = vkd3d_wstrdup(wg_desc->ProgramName);
+            program->flags = wg_desc->Flags;
             break;
         }
 
@@ -828,7 +839,7 @@ static HRESULT d3d12_wg_state_object_program_add_node_to_level(
     {
         /* Fish for shared inputs. */
         const struct vkd3d_shader_node_input_data *candidate = data->entry_points[i].node_input;
-        if (!candidate)
+        if (!candidate || !program->node_in_graph[i])
             continue;
 
         if (candidate->node_share_input_id &&
@@ -881,8 +892,32 @@ static int entry_point_compare_func(const void *a_, const void *b_)
         return 0;
 }
 
+/* amdgpu-wddm fork: the export order. The libraries are in subobject order, and the node shaders of one library are
+ * in the order of its RDAT function table. The entry points of a library come in dx.entryPoints order, which DXC
+ * sorts by name. */
+struct d3d12_wg_export_rank
+{
+    const struct vkd3d_shader_library_entry_point *entry;
+    size_t position;
+};
+
+static int d3d12_wg_export_rank_compare(const void *a_, const void *b_)
+{
+    const struct d3d12_wg_export_rank *a = a_;
+    const struct d3d12_wg_export_rank *b = b_;
+
+    if (a->entry->identifier != b->entry->identifier)
+        return a->entry->identifier < b->entry->identifier ? -1 : 1;
+    if (a->entry->export_index != b->entry->export_index)
+        return a->entry->export_index < b->entry->export_index ? -1 : 1;
+    if (a->position != b->position)
+        return a->position < b->position ? -1 : 1;
+    return 0;
+}
+
 static HRESULT d3d12_wg_state_object_rearrange_entry_points(struct d3d12_wg_state_object_data *data)
 {
+    struct d3d12_wg_export_rank *ranks;
     struct vkd3d_shader_library_entry_point *new_entries;
     const struct vkd3d_shader_library_entry_point *entry;
     const struct vkd3d_shader_library_entry_point *next;
@@ -894,9 +929,18 @@ static HRESULT d3d12_wg_state_object_rearrange_entry_points(struct d3d12_wg_stat
      * arguments table indices need (WorkGraphs.md, D3D12_WORK_GRAPH_DESC). */
     if (!(data->export_order = vkd3d_calloc(max(data->entry_points_count, 1), sizeof(*data->export_order))))
         return E_OUTOFMEMORY;
+    if (!(ranks = vkd3d_calloc(max(data->entry_points_count, 1), sizeof(*ranks))))
+        return E_OUTOFMEMORY;
     for (i = 0; i < data->entry_points_count; i++)
-        if (data->entry_points[i].node_input)
-            data->export_order[data->export_order_count++] = data->entry_points[i].node_input;
+    {
+        ranks[i].entry = &data->entry_points[i];
+        ranks[i].position = i;
+    }
+    qsort(ranks, data->entry_points_count, sizeof(*ranks), d3d12_wg_export_rank_compare);
+    for (i = 0; i < data->entry_points_count; i++)
+        if (ranks[i].entry->node_input)
+            data->export_order[data->export_order_count++] = ranks[i].entry->node_input;
+    vkd3d_free(ranks);
 
     /* Rearrange and figure out how large unbounded arrays are, and place arrayed entry points
      * in order so that we can index linearly. */
@@ -1186,160 +1230,43 @@ static uint32_t d3d12_wg_state_object_program_depth_slot(
     return depth ? program->recursion_slot_base[entry_index] + depth - 1 : entry_index;
 }
 
-static HRESULT d3d12_wg_state_object_resolve_entry_points_explicit(struct d3d12_wg_state_object *object,
-        struct d3d12_wg_state_object_data *data,
-        struct d3d12_wg_state_object_program *program)
-{
-    UINT node_array_index;
-    uint32_t node_index;
-    LPCWSTR node_name;
-    HRESULT hr;
-    size_t i;
-
-    for (i = 0; i < program->explicit_entry_point_count; i++)
-    {
-        node_name = program->explicit_entry_points[i].Name;
-        node_array_index = program->explicit_entry_points[i].ArrayIndex;
-        node_index = d3d12_work_graph_find_node_by_id_wchar(
-                data->entry_points, data->entry_points_count,
-                node_name, node_array_index);
-
-        if (node_index == UINT32_MAX)
-        {
-            WARN("Couldn't find node index for %s[%u].\n", debugstr_w(node_name), node_array_index);
-            return E_INVALIDARG;
-        }
-
-        if (FAILED(hr = d3d12_wg_state_object_program_add_node_to_level(program, data, node_index, 0, false)))
-            return hr;
-    }
-
-    return S_OK;
-}
-
-static HRESULT d3d12_wg_state_object_resolve_entry_points(struct d3d12_wg_state_object *object,
-        struct d3d12_wg_state_object_data *data,
-        struct d3d12_wg_state_object_program *program)
-{
-    /* For now, we include everything.
-     * For implicitly included nodes, the core rule is that if a node is used as an input it's not promoted to an entry point.
-     * A node which is not referenced by any other is implicitly promoted to an entry point.
-     * For now, we don't have meta-override available, so we'll assert that the node is set up properly. */
-    bool *node_is_output_target = NULL;
-    HRESULT hr = S_OK;
-    size_t i, j, k;
-
-    node_is_output_target = vkd3d_calloc(data->entry_points_count, sizeof(*node_is_output_target));
-    for (i = 0; i < data->entry_points_count; i++)
-    {
-        for (j = 0; j < data->entry_points[i].node_outputs_count; j++)
-        {
-            struct vkd3d_shader_node_output_data *output = &data->entry_points[i].node_outputs[j];
-            uint32_t node_array_size;
-            uint32_t node_index;
-
-            if (output->node_array_size == UINT32_MAX)
-            {
-                /* Try to find the appropriate array size here. */
-                output->node_array_size = d3d12_work_graph_find_array_size_by_id(
-                        data->entry_points, data->entry_points_count, output->node_id);
-            }
-
-            if (output->node_array_size == UINT32_MAX)
-            {
-                /* This will be tricky ... We'll just have to deduce the array size late based on what exists in the graph. */
-                FIXME("Cannot deal with unbounded node arrays yet.\n");
-                hr = E_NOTIMPL;
-                goto fail;
-            }
-
-            node_array_size = output->node_array_size ? output->node_array_size : 1;
-
-            for (k = 0; k < node_array_size; k++)
-            {
-                node_index = d3d12_work_graph_find_node_by_id(
-                        data->entry_points, data->entry_points_count,
-                        output->node_id, output->node_array_index + k);
-
-                if (node_index == UINT32_MAX)
-                {
-                    /* It's okay if we don't find the input in sparse mode. */
-                    if (!output->sparse_array)
-                    {
-                        FIXME("NodeID %s[%zu] was not found.\n", output->node_id, output->node_array_index + k);
-                        hr = E_INVALIDARG;
-                        goto fail;
-                    }
-                }
-
-                if (node_index != UINT32_MAX)
-                    node_is_output_target[node_index] = true;
-            }
-        }
-    }
-
-    /* Look at shared inputs. If a node has shared inputs with another node, and that node is output target,
-     * inherit the output state. */
-    for (i = 0; i < data->entry_points_count; i++)
-    {
-        const struct vkd3d_shader_node_input_data *node_input = data->entry_points[i].node_input;
-        uint32_t node_index;
-
-        if (!node_input)
-            continue;
-        if (!node_input->node_share_input_id || *node_input->node_share_input_id == '\0')
-            continue;
-
-        node_index = d3d12_work_graph_find_node_by_id(
-                data->entry_points, data->entry_points_count,
-                node_input->node_share_input_id, node_input->node_share_input_array_index);
-
-        /* If we don't find the node, assume there is no sharing to care about anyway, so *shrug*. */
-        if (node_index != UINT32_MAX)
-            node_is_output_target[i] = node_is_output_target[node_index];
-    }
-
-    /* We cannot override this state yet, so verify shader matches our expectation. */
-    for (i = 0; i < data->entry_points_count; i++)
-    {
-        const struct vkd3d_shader_node_input_data *node_input = data->entry_points[i].node_input;
-        if (!node_input)
-            continue;
-
-        /* Recurse through the nodes. Start with entry point and fill in any dependencies. */
-        /* If node is not an output of any node, the default PSO flags dictate that it must be considered
-         * an entry point anyway. */
-        if (node_input->is_program_entry || !node_is_output_target[i])
-            if (FAILED(hr = d3d12_wg_state_object_program_add_node_to_level(program, data, i, 0, false)))
-                goto fail;
-    }
-
-fail:
-    vkd3d_free(node_is_output_target);
-    return hr;
-}
-
-/* amdgpu-wddm fork: depth first visit for the population order, outputs in declared order. */
-static void d3d12_wg_state_object_population_visit(const struct d3d12_wg_state_object_data *data,
-        const bool *in_program, bool *visited, unsigned int *order, size_t *order_count,
+/* amdgpu-wddm fork: graph population (WorkGraphs.md, D3D12_WORK_GRAPH_DESC). The order in which the nodes are
+ * added is the node order of GetNodeID and GetNodeIndex, and the entry points keep it. A node is added once. */
+static void d3d12_wg_state_object_population_add(struct d3d12_wg_state_object_program *program,
         unsigned int entry_index)
+{
+    if (program->node_in_graph[entry_index])
+        return;
+
+    program->node_in_graph[entry_index] = true;
+    program->node_order[program->node_order_count++] = entry_index;
+}
+
+/* Adds the node, then its outputs, depth first, in the order the shader declares them. An array output adds
+ * its elements in index order; a sparse array can have missing elements. The outputs of a node are added only
+ * once, also when the node was in the graph before (an explicitly defined node that is not an entry point). */
+static HRESULT d3d12_wg_state_object_population_expand(const struct d3d12_wg_state_object_data *data,
+        struct d3d12_wg_state_object_program *program, bool *expanded, unsigned int entry_index)
 {
     const struct vkd3d_shader_library_entry_point *entry = &data->entry_points[entry_index];
     const struct vkd3d_shader_node_output_data *output;
     uint32_t node_array_size, node_index;
+    HRESULT hr;
     size_t i, j;
 
-    if (visited[entry_index] || !in_program[entry_index])
-        return;
-
-    visited[entry_index] = true;
-    order[(*order_count)++] = entry_index;
+    d3d12_wg_state_object_population_add(program, entry_index);
+    if (expanded[entry_index])
+        return S_OK;
+    expanded[entry_index] = true;
 
     for (i = 0; i < entry->node_outputs_count; i++)
     {
         output = &entry->node_outputs[i];
         if (output->node_array_size == UINT32_MAX)
-            continue;
+        {
+            FIXME("Cannot deal with unbounded node arrays yet.\n");
+            return E_NOTIMPL;
+        }
 
         node_array_size = output->node_array_size ? output->node_array_size : 1;
 
@@ -1347,13 +1274,214 @@ static void d3d12_wg_state_object_population_visit(const struct d3d12_wg_state_o
         {
             node_index = d3d12_work_graph_find_node_by_id(data->entry_points, data->entry_points_count,
                     output->node_id, output->node_array_index + j);
-            if (node_index != UINT32_MAX)
+            if (node_index == UINT32_MAX)
             {
-                d3d12_wg_state_object_population_visit(data, in_program, visited,
-                        order, order_count, node_index);
+                /* It's okay if we don't find the input in sparse mode. */
+                if (output->sparse_array)
+                    continue;
+                WARN("NodeID %s[%zu] was not found.\n", output->node_id, output->node_array_index + j);
+                return E_INVALIDARG;
+            }
+
+            if (FAILED(hr = d3d12_wg_state_object_population_expand(data, program, expanded, node_index)))
+                return hr;
+        }
+    }
+
+    return S_OK;
+}
+
+static bool d3d12_wg_state_object_program_node_in_levels(const struct d3d12_wg_state_object_program *program,
+        unsigned int entry_index)
+{
+    unsigned int i, j;
+
+    for (i = 0; i < program->num_levels; i++)
+    {
+        for (j = 0; j < program->levels[i].nodes_count; j++)
+            if (program->slot_entry[program->levels[i].nodes[j]] == entry_index)
+                return true;
+        for (j = 0; j < program->levels[i].shared_nodes_count; j++)
+            if (program->levels[i].shared_nodes[j].node_pipeline_index == entry_index)
+                return true;
+    }
+
+    return false;
+}
+
+/* amdgpu-wddm fork: the nodes are added first from pExplicitlyDefinedNodes, then from pEntrypoints, then with
+ * D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES from every node shader in export order. An explicitly defined
+ * node adds its outputs only if it is an entry point. The entry points are the listed nodes, the nodes that are
+ * entry points in the shader or in an override, and the nodes that no other node in the graph writes to. Without
+ * the flag, such an unwritten node must be a listed node or an entry point. The levels are then built from the
+ * entry points in the node order. */
+static HRESULT d3d12_wg_state_object_populate_program(struct d3d12_wg_state_object_data *data,
+        struct d3d12_wg_state_object_program *program)
+{
+    const struct vkd3d_shader_node_input_data *node_input;
+    const struct vkd3d_shader_library_entry_point *defined;
+    size_t count = data->entry_points_count;
+    struct vkd3d_shader_node_output_data *output;
+    bool *expanded = NULL, *listed = NULL;
+    uint32_t node_array_size, node_index;
+    bool *written = NULL;
+    unsigned int entry;
+    HRESULT hr = S_OK;
+    size_t i, j, k;
+
+    program->node_order = vkd3d_calloc(max(count, 1), sizeof(*program->node_order));
+    program->node_in_graph = vkd3d_calloc(max(count, 1), sizeof(*program->node_in_graph));
+    expanded = vkd3d_calloc(max(count, 1), sizeof(*expanded));
+    listed = vkd3d_calloc(max(count, 1), sizeof(*listed));
+    written = vkd3d_calloc(max(count, 1), sizeof(*written));
+    if (!program->node_order || !program->node_in_graph || !expanded || !listed || !written)
+    {
+        hr = E_OUTOFMEMORY;
+        goto out;
+    }
+
+    /* The size of an array output without [NodeArraySize] comes from the nodes that exist. */
+    for (i = 0; i < count; i++)
+    {
+        for (j = 0; j < data->entry_points[i].node_outputs_count; j++)
+        {
+            output = &data->entry_points[i].node_outputs[j];
+            if (output->node_array_size == UINT32_MAX)
+            {
+                output->node_array_size = d3d12_work_graph_find_array_size_by_id(
+                        data->entry_points, data->entry_points_count, output->node_id);
             }
         }
     }
+
+    for (i = 0; i < program->explicit_defined_nodes_count; i++)
+    {
+        /* d3d12_wg_state_object_apply_node_overrides() checked the node type and the export. */
+        defined = d3d12_wg_state_object_find_exported_entry_point(data,
+                program->explicit_defined_nodes[i].Shader.Shader);
+        entry = defined - data->entry_points;
+        if (defined->node_input->is_program_entry)
+            hr = d3d12_wg_state_object_population_expand(data, program, expanded, entry);
+        else
+            d3d12_wg_state_object_population_add(program, entry);
+        if (FAILED(hr))
+            goto out;
+    }
+
+    for (i = 0; i < program->explicit_entry_point_count; i++)
+    {
+        node_index = d3d12_work_graph_find_node_by_id_wchar(data->entry_points, data->entry_points_count,
+                program->explicit_entry_points[i].Name, program->explicit_entry_points[i].ArrayIndex);
+        if (node_index == UINT32_MAX)
+        {
+            WARN("Couldn't find node index for %s[%u].\n", debugstr_w(program->explicit_entry_points[i].Name),
+                    program->explicit_entry_points[i].ArrayIndex);
+            hr = E_INVALIDARG;
+            goto out;
+        }
+
+        listed[node_index] = true;
+        if (FAILED(hr = d3d12_wg_state_object_population_expand(data, program, expanded, node_index)))
+            goto out;
+    }
+
+    if (program->flags & D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES)
+    {
+        for (i = 0; i < data->export_order_count; i++)
+        {
+            for (j = 0; j < count; j++)
+            {
+                if (data->entry_points[j].node_input == data->export_order[i])
+                {
+                    if (FAILED(hr = d3d12_wg_state_object_population_expand(data, program, expanded, j)))
+                        goto out;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!program->node_order_count)
+    {
+        WARN("Work graph %s has no nodes.\n", debugstr_w(program->name));
+        hr = E_INVALIDARG;
+        goto out;
+    }
+
+    /* The writers are the nodes in the graph, other than the node itself. */
+    for (i = 0; i < count; i++)
+    {
+        if (!program->node_in_graph[i])
+            continue;
+
+        for (j = 0; j < data->entry_points[i].node_outputs_count; j++)
+        {
+            output = &data->entry_points[i].node_outputs[j];
+            node_array_size = output->node_array_size ? output->node_array_size : 1;
+            for (k = 0; k < node_array_size; k++)
+            {
+                node_index = d3d12_work_graph_find_node_by_id(data->entry_points, data->entry_points_count,
+                        output->node_id, output->node_array_index + k);
+                if (node_index != UINT32_MAX && node_index != i)
+                    written[node_index] = true;
+            }
+        }
+    }
+
+    /* A node that shares the input of another node gets its records from the writers of that node. */
+    for (i = 0; i < count; i++)
+    {
+        node_input = data->entry_points[i].node_input;
+        if (!program->node_in_graph[i] || !node_input->node_share_input_id ||
+                *node_input->node_share_input_id == '\0')
+            continue;
+
+        node_index = d3d12_work_graph_find_node_by_id(data->entry_points, data->entry_points_count,
+                node_input->node_share_input_id, node_input->node_share_input_array_index);
+
+        /* If we don't find the node, assume there is no sharing to care about anyway, so *shrug*. */
+        if (node_index != UINT32_MAX)
+            written[i] = written[node_index];
+    }
+
+    for (i = 0; i < program->node_order_count; i++)
+    {
+        entry = program->node_order[i];
+        node_input = data->entry_points[entry].node_input;
+        if (!listed[entry] && !node_input->is_program_entry && written[entry])
+            continue;
+
+        if (!listed[entry] && !node_input->is_program_entry &&
+                !(program->flags & D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES))
+        {
+            WARN("Node %s[%u] is not an entry point, and no node writes to it.\n",
+                    node_input->node_id, node_input->node_array_index);
+            hr = E_INVALIDARG;
+            goto out;
+        }
+
+        if (FAILED(hr = d3d12_wg_state_object_program_add_node_to_level(program, data, entry, 0, false)))
+            goto out;
+    }
+
+    for (i = 0; i < program->node_order_count; i++)
+    {
+        entry = program->node_order[i];
+        if (!d3d12_wg_state_object_program_node_in_levels(program, entry))
+        {
+            WARN("Node %s[%u] cannot be reached from an entry point.\n",
+                    data->entry_points[entry].node_input->node_id,
+                    data->entry_points[entry].node_input->node_array_index);
+            hr = E_INVALIDARG;
+            goto out;
+        }
+    }
+
+out:
+    vkd3d_free(expanded);
+    vkd3d_free(listed);
+    vkd3d_free(written);
+    return hr;
 }
 
 /* amdgpu-wddm fork: a node with a local root signature and no table index gets the lowest unused
@@ -1366,12 +1494,10 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
     const struct d3d12_state_object_association *local_rs_assoc;
     size_t count = data->entry_points_count;
     uint32_t *indices, candidate;
-    unsigned int *order = NULL;
-    bool *in_program = NULL;
-    bool *visited = NULL;
-    size_t order_count = 0;
+    const unsigned int *order;
+    const bool *in_program;
     uint32_t node_index;
-    HRESULT hr = S_OK;
+    size_t order_count;
     size_t i, j;
     bool used;
 
@@ -1381,59 +1507,10 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
     for (i = 0; i < program->num_pipelines; i++)
         indices[i] = UINT32_MAX;
 
-    in_program = vkd3d_calloc(max(count, 1), sizeof(*in_program));
-    visited = vkd3d_calloc(max(count, 1), sizeof(*visited));
-    order = vkd3d_calloc(max(count, 1), sizeof(*order));
-    if (!in_program || !visited || !order)
-    {
-        hr = E_OUTOFMEMORY;
-        goto out;
-    }
-
-    for (i = 0; i < program->num_levels; i++)
-    {
-        for (j = 0; j < program->levels[i].nodes_count; j++)
-            in_program[program->slot_entry[program->levels[i].nodes[j]]] = true;
-        for (j = 0; j < program->levels[i].shared_nodes_count; j++)
-            in_program[program->slot_entry[program->levels[i].shared_nodes[j].node_pipeline_index]] = true;
-    }
-
-    /* Population order: the explicitly defined nodes, then the listed entry points, then every node in export
-     * order (INCLUDE_ALL_AVAILABLE_NODES). Each node is followed by its outputs, depth first. */
-    for (i = 0; i < program->explicit_defined_nodes_count; i++)
-    {
-        const struct vkd3d_shader_library_entry_point *defined;
-
-        if (program->explicit_defined_nodes[i].NodeType != D3D12_NODE_TYPE_SHADER)
-            continue;
-        defined = d3d12_wg_state_object_find_exported_entry_point(data,
-                program->explicit_defined_nodes[i].Shader.Shader);
-        if (defined)
-        {
-            d3d12_wg_state_object_population_visit(data, in_program, visited, order, &order_count,
-                    defined - data->entry_points);
-        }
-    }
-
-    for (i = 0; i < program->explicit_entry_point_count; i++)
-    {
-        node_index = d3d12_work_graph_find_node_by_id_wchar(data->entry_points, data->entry_points_count,
-                program->explicit_entry_points[i].Name, program->explicit_entry_points[i].ArrayIndex);
-        if (node_index != UINT32_MAX)
-            d3d12_wg_state_object_population_visit(data, in_program, visited, order, &order_count, node_index);
-    }
-
-    for (i = 0; i < data->export_order_count; i++)
-    {
-        for (j = 0; j < count; j++)
-        {
-            if (data->entry_points[j].node_input == data->export_order[i])
-            {
-                d3d12_wg_state_object_population_visit(data, in_program, visited, order, &order_count, j);
-                break;
-            }
-        }
-    }
+    /* The population order, see d3d12_wg_state_object_populate_program(). */
+    in_program = program->node_in_graph;
+    order = program->node_order;
+    order_count = program->node_order_count;
 
     for (i = 0; i < count; i++)
         if (in_program[i] && data->entry_points[i].node_input)
@@ -1469,11 +1546,7 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
     for (i = count; i < program->num_pipelines; i++)
         indices[i] = indices[program->slot_entry[i]];
 
-out:
-    vkd3d_free(in_program);
-    vkd3d_free(visited);
-    vkd3d_free(order);
-    return hr;
+    return S_OK;
 }
 
 static HRESULT d3d12_wg_state_object_parse_subobjects(
@@ -1996,7 +2069,6 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNumNodes(
 {
     struct d3d12_wg_state_object *object = impl_from_ID3D12WorkGraphProperties(iface);
     const struct d3d12_wg_state_object_program *program;
-    unsigned int count, i;
     TRACE("iface %p, WorkGraphIndex %u\n", iface, WorkGraphIndex);
 
     if (WorkGraphIndex >= object->programs_count)
@@ -2005,38 +2077,15 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNumNodes(
         return -1u;
     }
 
+    /* amdgpu-wddm fork: the nodes in the order of population (WorkGraphs.md, GetNodeID). */
     program = &object->programs[WorkGraphIndex];
-
-    count = 0;
-    for (i = 0; i < program->num_nodes; i++)
-    {
-        if (program->pipelines[i].vk_non_entry_pipeline != VK_NULL_HANDLE ||
-            program->pipelines[i].vk_cpu_node_entry_pipeline != VK_NULL_HANDLE)
-        {
-            count++;
-        }
-    }
-    return count;
+    return program->node_order_count;
 }
 
 static unsigned int d3d12_work_graph_properties_node_index_to_entry(
         const struct d3d12_wg_state_object_program *program, UINT NodeIndex)
 {
-    unsigned int count, i;
-    count = 0;
-
-    for (i = 0; i < program->num_nodes; i++)
-    {
-        if (program->pipelines[i].vk_non_entry_pipeline != VK_NULL_HANDLE ||
-            program->pipelines[i].vk_cpu_node_entry_pipeline != VK_NULL_HANDLE)
-        {
-            if (count == NodeIndex)
-                return i;
-            count++;
-        }
-    }
-
-    return -1u;
+    return NodeIndex < program->node_order_count ? program->node_order[NodeIndex] : -1u;
 }
 
 static const struct d3d12_wg_state_object_pipeline *d3d12_work_graph_properties_node_index_pipeline(
@@ -2090,8 +2139,8 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNodeIndex(
 {
     struct d3d12_wg_state_object *object = impl_from_ID3D12WorkGraphProperties(iface);
     const struct d3d12_wg_state_object_program *program;
-    unsigned int count, i;
-    TRACE("iface %p, WorkGraphIndex %u, NodeID.Name %s, NodeID.ArrayIndex %u, stub!\n",
+    unsigned int entry, i;
+    TRACE("iface %p, WorkGraphIndex %u, NodeID.Name %s, NodeID.ArrayIndex %u\n",
             iface, WorkGraphIndex, debugstr_w(NodeID.Name), NodeID.ArrayIndex);
 
     if (WorkGraphIndex >= object->programs_count)
@@ -2100,20 +2149,15 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNodeIndex(
         return -1u;
     }
 
+    /* amdgpu-wddm fork: the inverse of GetNodeID. */
     program = &object->programs[WorkGraphIndex];
-    count = 0;
-
-    for (i = 0; i < program->num_nodes; i++)
+    for (i = 0; i < program->node_order_count; i++)
     {
-        if (program->pipelines[i].vk_non_entry_pipeline != VK_NULL_HANDLE ||
-            program->pipelines[i].vk_cpu_node_entry_pipeline != VK_NULL_HANDLE)
+        entry = program->node_order[i];
+        if (vkd3d_export_strequal(NodeID.Name, program->pipelines[entry].name) &&
+                NodeID.ArrayIndex == program->pipelines[entry].array_index)
         {
-            if (vkd3d_export_strequal(NodeID.Name, program->pipelines[i].name) &&
-                NodeID.ArrayIndex == program->pipelines[i].array_index)
-            {
-                return count;
-            }
-            count++;
+            return i;
         }
     }
 
@@ -2154,7 +2198,7 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetNumEntrypoints(
     if (WorkGraphIndex >= object->programs_count)
     {
         ERR("WorkGraphIndex %u is out of bound.\n", WorkGraphIndex);
-        return 0;
+        return -1u;
     }
 
     program = &object->programs[WorkGraphIndex];
@@ -2173,8 +2217,11 @@ static D3D12_NODE_ID * STDMETHODCALLTYPE d3d12_work_graph_properties_GetEntrypoi
 
     if (WorkGraphIndex >= object->programs_count)
     {
+        /* amdgpu-wddm fork: {NULL, 0}, not a NULL pointer, which the caller dereferences. */
         ERR("WorkGraphIndex %u is out of bound.\n", WorkGraphIndex);
-        return 0;
+        ret->Name = NULL;
+        ret->ArrayIndex = 0;
+        return ret;
     }
 
     program = &object->programs[WorkGraphIndex];
@@ -2206,7 +2253,7 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetEntrypointIndex(
     if (WorkGraphIndex >= object->programs_count)
     {
         ERR("WorkGraphIndex %u is out of bound.\n", WorkGraphIndex);
-        return 0;
+        return -1u;
     }
 
     program = &object->programs[WorkGraphIndex];
@@ -2237,7 +2284,7 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetEntrypointRecordSiz
     if (WorkGraphIndex >= object->programs_count)
     {
         ERR("WorkGraphIndex %u is out of bound.\n", WorkGraphIndex);
-        return 0;
+        return -1u;
     }
 
     program = &object->programs[WorkGraphIndex];
@@ -2245,7 +2292,7 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetEntrypointRecordSiz
     if (EntrypointIndex >= program->levels[0].nodes_count)
     {
         ERR("EntrypointIndex %u out of range.\n", EntrypointIndex);
-        return 0;
+        return -1u;
     }
 
     node_index = program->levels[0].nodes[EntrypointIndex];
@@ -3010,16 +3057,8 @@ static HRESULT d3d12_wg_state_object_compile_programs(
         if (FAILED(hr = d3d12_wg_state_object_program_init_slots(program, data)))
             return hr;
 
-        if (program->explicit_entry_point_count)
-        {
-            if (FAILED(hr = d3d12_wg_state_object_resolve_entry_points_explicit(object, data, program)))
-                return hr;
-        }
-        else
-        {
-            if (FAILED(hr = d3d12_wg_state_object_resolve_entry_points(object, data, program)))
-                return hr;
-        }
+        if (FAILED(hr = d3d12_wg_state_object_populate_program(data, program)))
+            return hr;
 
         if (FAILED(hr = d3d12_wg_state_object_assign_local_root_table_indices(data, program)))
             return hr;
