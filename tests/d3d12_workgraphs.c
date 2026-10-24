@@ -2452,6 +2452,157 @@ out_pso:
     destroy_workgraph_test_context(&context);
 }
 
+void test_workgraph_multi_gpu_input_backing_size(void)
+{
+    /* WorkGraphs.md, Discovering backing memory size requirements: a backing memory larger than the minimum can
+     * make a work graph execute more efficiently. The amdgpu-wddm engine uses the backing memory above
+     * MinSizeInBytes as more staging range for the merge slot of D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT, up to
+     * MaxSizeInBytes. With "staging=4096,staging_max=131072", 16 records of 256 bytes fit with MinSizeInBytes,
+     * 16 + 256 with one more SizeGranularityInBytes (64 KiB), and 512 with MaxSizeInBytes. Each case gives 600
+     * inputs of one record; the engine reports the records that do not fit. Native drivers launch all records,
+     * so only the sums are checked there. */
+    static const D3D12_NODE_ID entry_ids[] = { { u"EntryA", 0 }, { u"EntryB", 0 } };
+    static const struct
+    {
+        const char *name;
+        unsigned int granules; /* Backing memory: MinSizeInBytes + granules * SizeGranularityInBytes, ~0u: Max. */
+        uint64_t lost_events, lost_records; /* Cumulative. */
+    }
+    tests[] =
+    {
+        { "minimum, 584 lost", 0, 1, 584 },
+        { "minimum + 1 granule, 328 lost", 1, 2, 912 },
+        { "maximum, 88 lost", ~0u, 3, 1000 },
+    };
+    D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS wg_reqs;
+    struct workgraph_count_input inputs[600];
+    D3D12_NODE_GPU_INPUT node_inputs[600];
+    struct workgraph_multi_input multi;
+    struct test_context_workgraph context;
+    D3D12_DISPATCH_GRAPH_DESC dispatch_desc;
+    struct workgraph_lost_records lost;
+    uint32_t expected[8], values[8];
+    D3D12_PROGRAM_IDENTIFIER ident;
+    UINT64 size, max_size;
+    ID3D12Resource *scratch;
+    ID3D12Resource *records;
+    ID3D12Resource *output;
+    UINT entry_index[2];
+    ID3D12StateObject *pso;
+    unsigned int i, j;
+    bool is_engine;
+    UINT data_size;
+    HRESULT hr;
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    is_engine = workgraph_is_vkd3d_proton(context.device);
+
+    workgraph_set_multi_input_config("staging=4096,staging_max=131072");
+    hr = try_create_workgraph_pso(&context, multi_input_count_dxil, NULL, &pso);
+    workgraph_set_multi_input_config(NULL);
+    ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+    if (!pso)
+    {
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+    if (!workgraph_get_program(pso, &ident, &wg_reqs, entry_index, entry_ids, ARRAY_SIZE(entry_ids)))
+        goto out_pso;
+
+    ok(wg_reqs.MaxSizeInBytes >= wg_reqs.MinSizeInBytes, "Max size %"PRIu64" is less than min size %"PRIu64".\n",
+            (uint64_t)wg_reqs.MaxSizeInBytes, (uint64_t)wg_reqs.MinSizeInBytes);
+    if (is_engine)
+    {
+        /* The staging range grows by staging_max - staging from Min to Max. */
+        ok(wg_reqs.MaxSizeInBytes - wg_reqs.MinSizeInBytes >= 131072 - 4096,
+                "Max size %"PRIu64" leaves no room for more staging above min size %"PRIu64".\n",
+                (uint64_t)wg_reqs.MaxSizeInBytes, (uint64_t)wg_reqs.MinSizeInBytes);
+    }
+    /* Native drivers can report a very large maximum. The sums do not depend on the size there. */
+    max_size = wg_reqs.MaxSizeInBytes;
+    if (!is_engine && max_size > wg_reqs.MinSizeInBytes + 4 * (UINT64)wg_reqs.SizeGranularityInBytes)
+        max_size = wg_reqs.MinSizeInBytes + 4 * (UINT64)wg_reqs.SizeGranularityInBytes;
+
+    records = workgraph_create_count_records(&context, ARRAY_SIZE(inputs), WG_COUNT_RECORD_SIZE, 1);
+    for (i = 0; i < ARRAY_SIZE(inputs); i++)
+    {
+        inputs[i].entry = 0;
+        inputs[i].first = i;
+        inputs[i].count = 1;
+        inputs[i].repeat = false;
+        node_inputs[i].EntrypointIndex = entry_index[0];
+        node_inputs[i].NumRecords = 1;
+        node_inputs[i].Records.StartAddress = ID3D12Resource_GetGPUVirtualAddress(records) +
+                (UINT64)i * WG_COUNT_RECORD_SIZE;
+        node_inputs[i].Records.StrideInBytes = WG_COUNT_RECORD_SIZE;
+    }
+
+    memset(expected, 0, sizeof(expected));
+    for (i = 0; i < ARRAY_SIZE(inputs); i++)
+        workgraph_count_expected(&inputs[i], 1, 1, expected);
+    workgraph_create_multi_input(&context, node_inputs, ARRAY_SIZE(node_inputs), ARRAY_SIZE(node_inputs), 32, &multi);
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("%s", tests[i].name);
+
+        if (tests[i].granules == ~0u)
+            size = max_size;
+        else
+            size = wg_reqs.MinSizeInBytes + tests[i].granules * (UINT64)wg_reqs.SizeGranularityInBytes;
+        if (size > max_size)
+            size = max_size;
+
+        scratch = NULL;
+        if (size)
+            scratch = create_default_buffer(context.context.device, size,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        output = create_default_buffer(context.context.device, 4 * 1024,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+
+        memset(&dispatch_desc, 0, sizeof(dispatch_desc));
+        dispatch_desc.Mode = D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT;
+        dispatch_desc.MultiNodeGPUInput = multi.va;
+        workgraph_record_dispatch(&context, context.context.list, &ident, scratch, size, output, &dispatch_desc);
+        workgraph_read_output(&context, output, values, ARRAY_SIZE(values));
+
+        memset(&lost, 0, sizeof(lost));
+        data_size = sizeof(lost);
+        hr = ID3D12StateObject_GetPrivateData(pso, &workgraph_status_guid, &data_size, &lost);
+        if (is_engine)
+        {
+            /* The engine launches the records that fit, and reports the others. */
+            ok(hr == S_OK && data_size == sizeof(lost), "The engine does not report lost records, hr #%x.\n", (int)hr);
+            ok(lost.events == tests[i].lost_events, "Expected %"PRIu64" events with lost records, got %"PRIu64".\n",
+                    tests[i].lost_events, lost.events);
+            ok(lost.records == tests[i].lost_records, "Expected %"PRIu64" lost records, got %"PRIu64".\n",
+                    tests[i].lost_records, lost.records);
+            ok(values[0] + (uint32_t)(lost.records - (i ? tests[i - 1].lost_records : 0)) == expected[0],
+                    "Expected %u launched and lost records, got %u launched.\n", expected[0], values[0]);
+        }
+        else
+        {
+            for (j = 0; j < ARRAY_SIZE(values); j++)
+                ok(values[j] == expected[j], "Value %u: expected %u, got %u.\n", j, expected[j], values[j]);
+        }
+
+        if (scratch)
+            ID3D12Resource_Release(scratch);
+        ID3D12Resource_Release(output);
+    }
+    vkd3d_test_set_context(NULL);
+
+    hr = ID3D12Device5_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Device removed, hr #%x.\n", (int)hr);
+
+    ID3D12Resource_Release(multi.buffer);
+    ID3D12Resource_Release(records);
+out_pso:
+    ID3D12StateObject_Release(pso);
+    destroy_workgraph_test_context(&context);
+}
+
 void test_workgraph_multi_gpu_input_two_queues(void)
 {
     /* Two queues execute the same work graph at the same time, each with its own backing memory, inputs and

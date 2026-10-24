@@ -484,6 +484,7 @@ decl_test(test_workgraph_multi_gpu_input_capacity);
 decl_test(test_workgraph_multi_gpu_input_count_math);
 decl_test(test_workgraph_multi_gpu_input_counts);
 decl_test(test_workgraph_multi_gpu_input_lost_records);
+decl_test(test_workgraph_multi_gpu_input_backing_size);
 decl_test(test_workgraph_multi_gpu_input_two_queues);
 decl_test(test_workgraph_two_queues_levels);
 decl_test(test_workgraph_dispatch_failure);
