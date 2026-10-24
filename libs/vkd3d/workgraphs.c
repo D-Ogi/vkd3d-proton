@@ -1993,7 +1993,8 @@ static UINT STDMETHODCALLTYPE d3d12_work_graph_properties_GetEntrypointRecordSiz
     }
 
     node_index = program->levels[0].nodes[EntrypointIndex];
-    return object->entry_points[node_index].node_input->payload_stride;
+    /* amdgpu-wddm fork: the application record size, not the internal stride. */
+    return object->entry_points[node_index].node_input->record_size;
 }
 
 static void STDMETHODCALLTYPE d3d12_work_graph_properties_GetWorkGraphMemoryRequirements(
@@ -3642,8 +3643,10 @@ static void d3d12_command_list_workgraph_execute_entry_multi_gpu(
     for (i = 0; i < num_entries; i++)
     {
         node_index = program->levels[0].nodes[i];
-        /* The destination stride is the record size, aligned to 4 bytes. 0 means an empty record. */
-        stride = align(state->entry_points[node_index].node_input->payload_stride, 4);
+        /* The destination stride is the application record size, aligned to 4 bytes. 0 means an empty record.
+         * An entry point does not use the internal word of [NodeTrackRWInputSharing]: it must not call
+         * FinishedCrossGroupSharing(). */
+        stride = align(state->entry_points[node_index].node_input->record_size, 4);
         ((uint32_t *)strides_scratch.host_ptr)[i] = stride;
     }
 
@@ -3747,7 +3750,9 @@ static void d3d12_command_list_workgraph_execute_entry_cpu(
     }
 
     node_index = program->levels[0].nodes[desc->EntrypointIndex];
-    record_size = wg_state->entry_points[node_index].node_input->payload_stride;
+    /* amdgpu-wddm fork: record_size does not include the internal word of [NodeTrackRWInputSharing], which an
+     * entry point does not use, so only the bytes of the application's records are copied. */
+    record_size = wg_state->entry_points[node_index].node_input->record_size;
     if (desc->RecordStrideInBytes == 0)
         payload_size = record_size;
     else if (record_size)

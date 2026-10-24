@@ -1122,6 +1122,9 @@ struct vkd3d_shader_node_input_data
     bool dispatch_grid_is_upper_bound; /* [NodeMaxDispatchGrid] if true. */
     bool node_track_rw_input_sharing; /* Payload is tagged with [NodeTrackRWInputSharing]. */
     bool is_program_entry; /* [NodeIsProgramEntry] */
+    /* amdgpu-wddm fork: the application record size. payload_stride also holds the internal word of
+     * [NodeTrackRWInputSharing]. */
+    uint32_t record_size;
 };
 
 struct vkd3d_shader_node_output_data

@@ -2179,6 +2179,7 @@ static void vkd3d_shader_dxil_dup_node_input(struct vkd3d_shader_library_entry_p
     input->dispatch_grid_is_upper_bound = node_input->dispatch_grid_is_upper_bound == DXIL_SPV_TRUE;
     input->node_track_rw_input_sharing = node_input->node_track_rw_input_sharing == DXIL_SPV_TRUE;
     input->is_program_entry = node_input->is_program_entry == DXIL_SPV_TRUE;
+    input->record_size = node_input->record_size;
 }
 
 static void vkd3d_shader_dxil_dup_node_output(struct vkd3d_shader_library_entry_point *entry,
