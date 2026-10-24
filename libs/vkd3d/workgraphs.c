@@ -4991,6 +4991,10 @@ static bool d3d12_command_list_workgraph_prepare_pools(struct d3d12_command_list
                 d3d12_wg_pool_capacity(program, &pools->layout, level + 1, half, args->caps);
                 args->payload_capacity = args->caps[D3D12_WG_POOL_PAYLOAD];
                 args->packed_capacity = args->caps[D3D12_WG_POOL_ENTRIES];
+                /* The lab hook pool-caps:<L> gives the passes of the rounds of half 1 a record capacity of 0 for pool
+                 * L, so that round 2 finds a valid pool state above the capacity. The output guard keeps its value. */
+                if (half && d3d12_wg_fault_injected("pool-caps", level + 1))
+                    args->caps[D3D12_WG_POOL_OFFSETS] = 0;
             }
             /* The lab hooks write an invalid pool state of pool "level" in the rounds of half 0, so round 2 reads it:
              * 1 for payload bytes above every capacity, 2 for one record more than the slots hold, 3 for blocks 16

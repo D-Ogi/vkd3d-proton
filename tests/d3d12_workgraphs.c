@@ -7479,10 +7479,11 @@ void test_workgraph_drain_retention(void)
      * with a grid of 512 each), pool_charge (groups that are not full, blocks of 8-byte records) and pool_straddle
      * (shared readers whose owners are in other subgroup-sized chunks of the distributor, in both slot orders).
      * With VKD3D_TEST_WORKGRAPH_FAULT_INJECTION=1, AMDGPU_WDDM_WG_FAIL=pool-head:<level> makes the retention pass of
-     * that level write a head above the capacity of the pool in round 1, and pool-records:<level> a head with one
-     * record more than the slots, and pool-slot:<level> blocks 16 bytes after their place: the admission and injection
-     * passes of round 2 must refuse the pool and set the fault word, and the abandoned record count is a lower bound. Other drivers ignore the switches and give the same
-     * records.
+     * that level write a head above the capacity of the pool in round 1, pool-records:<level> a head with one record
+     * more than the slots, and pool-slot:<level> blocks 16 bytes after their place; pool-caps:<level> gives the passes
+     * of round 2 a record capacity of 0 for that pool. The admission and injection passes of round 2 must refuse the
+     * pool and set the fault word, and the abandoned record count is a lower bound. Other drivers ignore the switches
+     * and give the same records.
      * Each case launches at most 16384 records. */
     static const struct workgraph_retain_case tests[] =
     {
@@ -7519,6 +7520,9 @@ void test_workgraph_drain_retention(void)
          * injection finds it. */
         { "partial groups, blocks of pool 1 not at their place", 5, 64, WG_RETAIN_GROUPS, WG_DRAIN_REASON_FAULT, 0,
                 false, "pool-slot:1", WG_DRAIN_FAULT_PROGRESS | WG_DRAIN_FAULT_INJECT_HEAD },
+        /* Round 2 gives pool 1 a record capacity of 0: the pool state is valid, but above the capacity. */
+        { "partial groups, pool 1 above its capacity", 5, 64, WG_RETAIN_GROUPS, WG_DRAIN_REASON_FAULT, 0, false,
+                "pool-caps:1", WG_DRAIN_FAULT_PROGRESS | WG_DRAIN_FAULT_INJECT_HEAD },
     };
     struct workgraph_retain_run run;
     unsigned int i, steps;
