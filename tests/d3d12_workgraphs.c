@@ -1502,6 +1502,293 @@ void test_workgraph_lrat_order(void)
     destroy_workgraph_test_context(&context);
 }
 
+/* ASCII copy of a node name for messages. */
+static const char *workgraph_dbgstr_w(const WCHAR *str)
+{
+    static char buffers[4][64];
+    static unsigned int next;
+    char *buffer;
+    unsigned int i;
+
+    if (!str)
+        return "(null)";
+    buffer = buffers[next++ % ARRAY_SIZE(buffers)];
+    for (i = 0; i + 1 < sizeof(buffers[0]) && str[i]; i++)
+        buffer[i] = str[i] < 0x80 ? (char)str[i] : '?';
+    buffer[i] = '\0';
+    return buffer;
+}
+
+struct workgraph_order_node
+{
+    const WCHAR *name;
+    UINT array_index;
+};
+
+struct workgraph_order_case
+{
+    const char *name;
+    D3D12_WORK_GRAPH_FLAGS flags;
+    const struct workgraph_order_node *entry_list;
+    unsigned int entry_list_count;
+    /* Export name of one explicitly defined node, or NULL. */
+    const WCHAR *explicit_node;
+    BOOL explicit_program_entry;
+    /* The library lists its exports, in the reverse of the definition order. */
+    bool export_list;
+    HRESULT expected_hr;
+    const struct workgraph_order_node *nodes;
+    unsigned int node_count;
+    const struct workgraph_order_node *entries;
+    unsigned int entry_count;
+};
+
+static HRESULT create_workgraph_pso_desc(struct test_context_workgraph *context, D3D12_SHADER_BYTECODE code,
+        const D3D12_EXPORT_DESC *exports, unsigned int export_count, const D3D12_WORK_GRAPH_DESC *wg_desc,
+        ID3D12StateObject **pso)
+{
+    D3D12_GLOBAL_ROOT_SIGNATURE grs_desc;
+    D3D12_STATE_SUBOBJECT subobjects[3];
+    D3D12_STATE_OBJECT_DESC pso_desc;
+    D3D12_DXIL_LIBRARY_DESC dxil;
+
+    memset(&pso_desc, 0, sizeof(pso_desc));
+    memset(subobjects, 0, sizeof(subobjects));
+    memset(&dxil, 0, sizeof(dxil));
+    pso_desc.NumSubobjects = ARRAY_SIZE(subobjects);
+    pso_desc.pSubobjects = subobjects;
+    pso_desc.Type = D3D12_STATE_OBJECT_TYPE_EXECUTABLE;
+    grs_desc.pGlobalRootSignature = context->default_root_uav_rs;
+
+    subobjects[0].pDesc = &dxil;
+    subobjects[0].Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    subobjects[1].pDesc = wg_desc;
+    subobjects[1].Type = D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH;
+    subobjects[2].pDesc = &grs_desc;
+    subobjects[2].Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+    dxil.DXILLibrary = code;
+    dxil.NumExports = export_count;
+    dxil.pExports = export_count ? (D3D12_EXPORT_DESC *)exports : NULL;
+
+    *pso = NULL;
+    return ID3D12Device5_CreateStateObject(context->device, &pso_desc, &IID_ID3D12StateObject, (void **)pso);
+}
+
+static void check_work_graph_node_order(ID3D12Device5 *device, ID3D12StateObject *pso,
+        const struct workgraph_order_case *test)
+{
+    ID3D12WorkGraphProperties *props;
+    D3D12_NODE_ID id;
+    unsigned int i;
+    HRESULT hr;
+    UINT value;
+
+    hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+    ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+    if (FAILED(hr))
+        return;
+
+    value = ID3D12WorkGraphProperties_GetNumNodes(props, 0);
+    ok(value == test->node_count, "Expected %u nodes, got %u.\n", test->node_count, value);
+    for (i = 0; i < test->node_count; i++)
+    {
+        id = ID3D12WorkGraphProperties_GetNodeID(props, 0, i);
+        ok(export_strequal(id.Name, test->nodes[i].name) && id.ArrayIndex == test->nodes[i].array_index,
+                "Node %u: expected %s[%u], got %s[%u].\n", i, workgraph_dbgstr_w(test->nodes[i].name),
+                test->nodes[i].array_index, workgraph_dbgstr_w(id.Name), id.ArrayIndex);
+
+        id.Name = test->nodes[i].name;
+        id.ArrayIndex = test->nodes[i].array_index;
+        value = ID3D12WorkGraphProperties_GetNodeIndex(props, 0, id);
+        ok(value == i, "GetNodeIndex(%s[%u]): expected %u, got %u.\n", workgraph_dbgstr_w(id.Name), id.ArrayIndex,
+                i, value);
+    }
+
+    /* Invalid indices and IDs (WorkGraphs.md, GetNumNodes, GetNodeID and GetNodeIndex). */
+    id = ID3D12WorkGraphProperties_GetNodeID(props, 0, test->node_count);
+    ok(!id.Name && !id.ArrayIndex, "GetNodeID(%u): expected {NULL, 0}, got %s[%u].\n", test->node_count,
+            workgraph_dbgstr_w(id.Name), id.ArrayIndex);
+    id = ID3D12WorkGraphProperties_GetNodeID(props, 1, 0);
+    ok(!id.Name && !id.ArrayIndex, "GetNodeID of graph 1: expected {NULL, 0}, got %s[%u].\n",
+            workgraph_dbgstr_w(id.Name), id.ArrayIndex);
+    value = ID3D12WorkGraphProperties_GetNumNodes(props, 1);
+    /* The NVIDIA driver returns 0. */
+    bug_if(is_nvidia_windows_device((ID3D12Device *)device) && !workgraph_is_vkd3d_proton(device))
+    ok(value == UINT32_MAX, "GetNumNodes of graph 1: expected -1, got %u.\n", value);
+    id.Name = u"Arr";
+    id.ArrayIndex = 2;
+    value = ID3D12WorkGraphProperties_GetNodeIndex(props, 0, id);
+    ok(value == UINT32_MAX, "GetNodeIndex(Arr[2]): expected -1, got %u.\n", value);
+    id.Name = u"Nope";
+    id.ArrayIndex = 0;
+    value = ID3D12WorkGraphProperties_GetNodeIndex(props, 0, id);
+    ok(value == UINT32_MAX, "GetNodeIndex(Nope): expected -1, got %u.\n", value);
+    id.Name = test->nodes[0].name;
+    id.ArrayIndex = test->nodes[0].array_index;
+    value = ID3D12WorkGraphProperties_GetNodeIndex(props, 1, id);
+    ok(value == UINT32_MAX, "GetNodeIndex of graph 1: expected -1, got %u.\n", value);
+
+    value = ID3D12WorkGraphProperties_GetNumEntrypoints(props, 0);
+    ok(value == test->entry_count, "Expected %u entry points, got %u.\n", test->entry_count, value);
+    for (i = 0; i < test->entry_count; i++)
+    {
+        id = ID3D12WorkGraphProperties_GetEntrypointID(props, 0, i);
+        ok(export_strequal(id.Name, test->entries[i].name) && id.ArrayIndex == test->entries[i].array_index,
+                "Entry point %u: expected %s[%u], got %s[%u].\n", i, workgraph_dbgstr_w(test->entries[i].name),
+                test->entries[i].array_index, workgraph_dbgstr_w(id.Name), id.ArrayIndex);
+
+        id.Name = test->entries[i].name;
+        id.ArrayIndex = test->entries[i].array_index;
+        value = ID3D12WorkGraphProperties_GetEntrypointIndex(props, 0, id);
+        ok(value == i, "GetEntrypointIndex(%s[%u]): expected %u, got %u.\n", workgraph_dbgstr_w(id.Name),
+                id.ArrayIndex, i, value);
+    }
+
+    id = ID3D12WorkGraphProperties_GetEntrypointID(props, 0, test->entry_count);
+    ok(!id.Name && !id.ArrayIndex, "GetEntrypointID(%u): expected {NULL, 0}, got %s[%u].\n", test->entry_count,
+            workgraph_dbgstr_w(id.Name), id.ArrayIndex);
+    id = ID3D12WorkGraphProperties_GetEntrypointID(props, 1, 0);
+    ok(!id.Name && !id.ArrayIndex, "GetEntrypointID of graph 1: expected {NULL, 0}, got %s[%u].\n",
+            workgraph_dbgstr_w(id.Name), id.ArrayIndex);
+    value = ID3D12WorkGraphProperties_GetNumEntrypoints(props, 1);
+    ok(value == UINT32_MAX, "GetNumEntrypoints of graph 1: expected -1, got %u.\n", value);
+    /* The last node of each case is not an entry point. */
+    id.Name = test->nodes[test->node_count - 1].name;
+    id.ArrayIndex = test->nodes[test->node_count - 1].array_index;
+    value = ID3D12WorkGraphProperties_GetEntrypointIndex(props, 0, id);
+    ok(value == UINT32_MAX || test->node_count == 1, "GetEntrypointIndex(%s[%u]): expected -1, got %u.\n",
+            workgraph_dbgstr_w(id.Name), id.ArrayIndex, value);
+    id.Name = test->entries[0].name;
+    id.ArrayIndex = test->entries[0].array_index;
+    value = ID3D12WorkGraphProperties_GetEntrypointIndex(props, 1, id);
+    ok(value == UINT32_MAX, "GetEntrypointIndex of graph 1: expected -1, got %u.\n", value);
+
+    ID3D12WorkGraphProperties_Release(props);
+}
+
+void test_workgraph_node_order(void)
+{
+    /* The node order of a work graph is the order of population (WorkGraphs.md, D3D12_WORK_GRAPH_DESC): first
+     * the explicitly defined nodes, then the listed entry points, then INCLUDE_ALL_AVAILABLE_NODES in the
+     * export order of the library. A node that is added also adds its outputs, depth first, in the order the
+     * shader declares them; an array output adds its existing elements in index order. A node that is already
+     * in the graph adds nothing. An explicitly defined node that is not an entry point does not add its
+     * outputs; they are added when the population from an entry point reaches the node. GetNodeID and
+     * GetNodeIndex are inverses over this order. The entry point indices are in the same order. The test
+     * creates the state objects only; it does not dispatch. */
+#define N(name) { u"" #name, 0 }
+#define ARR(index) { u"Arr", index }
+    static const struct workgraph_order_node all_nodes[] =
+            { N(Zeta), N(Mid), N(Kid), N(Lone), N(Beta), N(Alpha), ARR(1), ARR(3), N(Omega), N(Pi) };
+    static const struct workgraph_order_node omega_nodes[] = { N(Omega), N(Lone), N(Pi) };
+    static const struct workgraph_order_node omega_zeta_nodes[] =
+            { N(Omega), N(Lone), N(Pi), N(Zeta), N(Mid), N(Kid), N(Beta), N(Alpha), ARR(1), ARR(3) };
+    static const struct workgraph_order_node beta_first_nodes[] =
+            { N(Beta), N(Zeta), N(Mid), N(Kid), N(Lone), N(Alpha), ARR(1), ARR(3), N(Omega), N(Pi) };
+    static const struct workgraph_order_node mid_nodes[] = { N(Mid), N(Kid), N(Lone) };
+    static const struct workgraph_order_node arr1_nodes[] = { ARR(1) };
+    static const struct workgraph_order_node arr2_list[] = { ARR(2) };
+    static const struct workgraph_order_node zeta_omega[] = { N(Zeta), N(Omega) };
+    static const struct workgraph_order_node omega_zeta[] = { N(Omega), N(Zeta) };
+    static const struct workgraph_order_node omega[] = { N(Omega) };
+    static const struct workgraph_order_node mid[] = { N(Mid) };
+#undef N
+#undef ARR
+    static const struct workgraph_order_case tests[] =
+    {
+        { "include all", D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES, NULL, 0, NULL, FALSE, false, S_OK,
+                all_nodes, ARRAY_SIZE(all_nodes), zeta_omega, ARRAY_SIZE(zeta_omega) },
+        { "include all, export list", D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES, NULL, 0, NULL, FALSE, true,
+                S_OK, all_nodes, ARRAY_SIZE(all_nodes), zeta_omega, ARRAY_SIZE(zeta_omega) },
+        { "entry Omega", 0, omega, ARRAY_SIZE(omega), NULL, FALSE, false, S_OK,
+                omega_nodes, ARRAY_SIZE(omega_nodes), omega, ARRAY_SIZE(omega) },
+        { "entries Omega Zeta", 0, omega_zeta, ARRAY_SIZE(omega_zeta), NULL, FALSE, false, S_OK,
+                omega_zeta_nodes, ARRAY_SIZE(omega_zeta_nodes), omega_zeta, ARRAY_SIZE(omega_zeta) },
+        { "entry Omega, include all", D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES, omega, ARRAY_SIZE(omega),
+                NULL, FALSE, false, S_OK, omega_zeta_nodes, ARRAY_SIZE(omega_zeta_nodes), omega_zeta, ARRAY_SIZE(omega_zeta) },
+        { "explicit Beta, include all", D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES, NULL, 0, u"Beta", FALSE, false,
+                S_OK, beta_first_nodes, ARRAY_SIZE(beta_first_nodes), zeta_omega, ARRAY_SIZE(zeta_omega) },
+        { "explicit entry Mid", 0, NULL, 0, u"Mid", TRUE, false, S_OK, mid_nodes, ARRAY_SIZE(mid_nodes),
+                mid, ARRAY_SIZE(mid) },
+        { "entry Arr[1]", 0, arr1_nodes, ARRAY_SIZE(arr1_nodes), NULL, FALSE, false, S_OK,
+                arr1_nodes, ARRAY_SIZE(arr1_nodes), arr1_nodes, ARRAY_SIZE(arr1_nodes) },
+        /* Kid is not an entry point, and no node in the graph writes to it. */
+        { "explicit Kid only", 0, NULL, 0, u"Kid", FALSE, false, E_INVALIDARG },
+        /* Arr[2] does not exist. */
+        { "entry Arr[2]", 0, arr2_list, ARRAY_SIZE(arr2_list), NULL, FALSE, false, E_INVALIDARG },
+    };
+    static const WCHAR *export_names[] =
+            { u"Pi", u"Lone", u"Arr1", u"Arr3", u"Kid", u"Mid", u"Beta", u"Omega", u"Alpha", u"Zeta" };
+    D3D12_EXPORT_DESC exports[ARRAY_SIZE(export_names)];
+    D3D12_THREAD_LAUNCH_OVERRIDES overrides;
+    struct test_context_workgraph context;
+    D3D12_NODE_ID entry_ids[2];
+    D3D12_WORK_GRAPH_DESC wg_desc;
+    ID3D12StateObject *pso;
+    D3D12_NODE node;
+    unsigned int i, j;
+    HRESULT hr;
+
+#include "shaders/workgraph/headers/node_order.h"
+
+    if (!init_workgraph_test_context(&context))
+        return;
+
+    memset(exports, 0, sizeof(exports));
+    for (i = 0; i < ARRAY_SIZE(exports); i++)
+        exports[i].Name = export_names[i];
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("%s", tests[i].name);
+
+        memset(&wg_desc, 0, sizeof(wg_desc));
+        wg_desc.ProgramName = u"Dummy";
+        wg_desc.Flags = tests[i].flags;
+        for (j = 0; j < tests[i].entry_list_count; j++)
+        {
+            entry_ids[j].Name = tests[i].entry_list[j].name;
+            entry_ids[j].ArrayIndex = tests[i].entry_list[j].array_index;
+        }
+        wg_desc.NumEntrypoints = tests[i].entry_list_count;
+        wg_desc.pEntrypoints = tests[i].entry_list_count ? entry_ids : NULL;
+
+        if (tests[i].explicit_node)
+        {
+            memset(&overrides, 0, sizeof(overrides));
+            memset(&node, 0, sizeof(node));
+            node.NodeType = D3D12_NODE_TYPE_SHADER;
+            node.Shader.Shader = tests[i].explicit_node;
+            if (tests[i].explicit_program_entry)
+            {
+                overrides.pProgramEntry = &tests[i].explicit_program_entry;
+                node.Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_THREAD_LAUNCH;
+                node.Shader.pThreadLaunchOverrides = &overrides;
+            }
+            else
+                node.Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_NONE;
+            wg_desc.NumExplicitlyDefinedNodes = 1;
+            wg_desc.pExplicitlyDefinedNodes = &node;
+        }
+
+        hr = create_workgraph_pso_desc(&context, node_order_dxil, exports,
+                tests[i].export_list ? ARRAY_SIZE(exports) : 0, &wg_desc, &pso);
+        if (tests[i].expected_hr == S_OK)
+            ok(hr == S_OK, "Failed to create state object, hr #%x.\n", (int)hr);
+        else
+            ok(FAILED(hr), "Expected failure, hr #%x.\n", (int)hr);
+        if (SUCCEEDED(hr))
+        {
+            if (tests[i].expected_hr == S_OK)
+                check_work_graph_node_order(context.device, pso, &tests[i]);
+            ID3D12StateObject_Release(pso);
+        }
+    }
+    vkd3d_test_set_context(NULL);
+
+    destroy_workgraph_test_context(&context);
+}
+
 void test_workgraph_array_self_recursion(void)
 {
     /* N[1] is the only element of the node array N and has NodeMaxRecursionDepth(1). It recurses through
