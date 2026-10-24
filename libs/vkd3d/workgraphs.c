@@ -37,8 +37,9 @@
  * L = min((64 KiB - 15) / stride, 256) (dxil-spirv, build_allocate_node_records), and the record addressing clamps
  * the record index to L - 1 (emit_build_output_payload_offset). A dropped allocation writes from the start of the
  * sink, so it ends at most L x stride after it. An allocation that fits ends at or before the capacity; the records
- * of a lane start inside it, so a write with an index past the count (which the application must not do) ends at
- * most (L - 1) x stride after the capacity. Both are less than 64 KiB. */
+ * of a lane start at or before the capacity (a trailing lane with count 0 starts at it), so a write with an index
+ * past the count (which the application must not do) ends at most L x stride after the capacity. Both are at most
+ * 64 KiB - 15 bytes. This holds for validated record types and layouts, not for malformed shader metadata. */
 #define VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE (64ull * 1024)
 /* The node output allocator computes payload offsets in 32 bits. */
 STATIC_ASSERT(VKD3D_WORKGRAPH_PAYLOAD_RING_SIZE + VKD3D_WORKGRAPH_PAYLOAD_SINK_SIZE <= UINT32_MAX);
