@@ -4013,7 +4013,7 @@ ULONG d3d12_device_release_common(struct d3d12_device *device)
     }
 
     cur_refcount = 0;
-    cas_refcount = vkd3d_atomic_uint32_load_explicit(&device->refcount, vkd3d_memory_order_relaxed);
+    cas_refcount = vkd3d_atomic_uint32_load_explicit((uint32_t*)&device->refcount, vkd3d_memory_order_relaxed);
 
     /* In order to prevent another thread from resurrecting a destroyed device,
      * we need to lock the container mutex before decrementing the ref count to
@@ -11398,7 +11398,7 @@ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
 
 HRESULT d3d12_device_removed_reason(struct d3d12_device *device)
 {
-    return vkd3d_atomic_uint32_load_explicit(&device->removed_reason, vkd3d_memory_order_acquire);
+    return vkd3d_atomic_uint32_load_explicit((uint32_t*)&device->removed_reason, vkd3d_memory_order_acquire);
 }
 
 VkResult d3d12_device_poll_device_faults(struct d3d12_device *device, uint64_t timeout)
@@ -11654,7 +11654,7 @@ void d3d12_device_mark_as_removed(struct d3d12_device *device, HRESULT reason,
             device, (int)reason, vkd3d_dbg_vsprintf(message, args));
     va_end(args);
 
-    vkd3d_atomic_uint32_store_explicit(&device->removed_reason, reason, vkd3d_memory_order_release);
+    vkd3d_atomic_uint32_store_explicit((uint32_t*)&device->removed_reason, reason, vkd3d_memory_order_release);
 }
 
 VkPipeline d3d12_device_get_or_create_vertex_input_pipeline(struct d3d12_device *device,

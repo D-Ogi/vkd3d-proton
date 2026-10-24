@@ -4072,7 +4072,7 @@ static void d3d12_resource_wait_for_sparse_init(struct d3d12_resource *resource)
 
 void d3d12_resource_decref_retained(struct d3d12_resource *resource)
 {
-    if (vkd3d_atomic_uint32_load_explicit(&resource->internal_refcount, vkd3d_memory_order_relaxed) == 1)
+    if (vkd3d_atomic_uint32_load_explicit((uint32_t*)&resource->internal_refcount, vkd3d_memory_order_relaxed) == 1)
     {
         unsigned int data_size;
         void *data;

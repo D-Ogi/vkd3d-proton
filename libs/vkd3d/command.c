@@ -3449,7 +3449,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
         d3d12_device_inline_retire(allocator->device);
 
     /* We only expect there to be only one internal ref live, the public refcount. */
-    if ((internal_refs = vkd3d_atomic_uint32_load_explicit(&allocator->internal_refcount, vkd3d_memory_order_acquire)) > 1)
+    if ((internal_refs = vkd3d_atomic_uint32_load_explicit((uint32_t*)&allocator->internal_refcount, vkd3d_memory_order_acquire)) > 1)
     {
         /* HACK: There are currently command lists waiting to be submitted to the queue in the submission threads.
          * Buggy application, but work around this by not resetting the command pool this time.
