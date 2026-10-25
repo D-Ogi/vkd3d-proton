@@ -9523,6 +9523,33 @@ static D3D12_SAMPLER_FEEDBACK_TIER d3d12_device_determine_sampler_feedback_tier(
     return D3D12_SAMPLER_FEEDBACK_TIER_0_9;
 }
 
+/* The sampler heap size of the paths without EXT_descriptor_heap (descriptor sets and
+ * EXT_descriptor_buffer). The bindless sampler binding of every pipeline layout gets this size.
+ * From DDI 0102 on, the D3D12 runtime creates a device only when MaxSamplerDescriptorHeapSize
+ * is at least 4000. The larger size is reported only when the Vulkan sampler limits hold it
+ * together with the static samplers of a root signature. Padding descriptors fill every
+ * shader-visible sampler heap to 2048 (resource.c), so they keep 2048. */
+#define VKD3D_LARGE_SAMPLER_DESCRIPTOR_COUNT 4096u
+
+static uint32_t d3d12_device_get_legacy_max_sampler_heap_size(struct d3d12_device *device)
+{
+    const VkPhysicalDeviceVulkan12Properties *limits = &device->device_info.vulkan_1_2_properties;
+    const uint32_t count = VKD3D_LARGE_SAMPLER_DESCRIPTOR_COUNT;
+    const uint32_t with_static = count + D3D12_MAX_LIVE_STATIC_SAMPLERS;
+
+    if (d3d12_descriptor_heap_require_padding_descriptors(device))
+        return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
+    if (limits->maxDescriptorSetUpdateAfterBindSamplers < with_static ||
+            limits->maxPerStageDescriptorUpdateAfterBindSamplers < with_static ||
+            device->device_info.properties2.properties.limits.maxSamplerAllocationCount < with_static)
+        return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
+    if (d3d12_device_uses_descriptor_buffers(device) &&
+            device->device_info.descriptor_buffer_properties.maxSamplerDescriptorBufferRange <
+            (VkDeviceSize)count * device->device_info.descriptor_buffer_properties.samplerDescriptorSize)
+        return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
+    return count;
+}
+
 uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, D3D12_DESCRIPTOR_HEAP_TYPE heap_type)
 {
     /* For now, hard-code descriptor counts to the minimum numbers required by D3D12.
@@ -9573,6 +9600,10 @@ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device, 
                 uint32_t count = min(1000000, useable_size >> device->bindless_state.sampler_size_log2);
                 assert(count >= VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT);
                 return count;
+            }
+            else if (!d3d12_device_use_descriptor_heap(device))
+            {
+                return d3d12_device_get_legacy_max_sampler_heap_size(device);
             }
             else
             {
