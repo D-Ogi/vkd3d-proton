@@ -1795,6 +1795,119 @@ void test_workgraph_node_order(void)
     destroy_workgraph_test_context(&context);
 }
 
+void test_workgraph_ddi_order(void)
+{
+    /* amdgpu-wddm fork: VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM (libs/vkd3d/workgraphs.c), the description that
+     * the system D3D12 driver (bc250-win engine-ddi, work-graphs.cpp) gives the engine: every node of the graph is
+     * explicitly defined, and the entry points are pEntrypoints in that order, also where the population from the
+     * shaders would order them differently. A program entry that pEntrypoints does not list, INCLUDE_ALL_AVAILABLE_NODES
+     * and a rename are refused. D3D12 defines no such flag, so the test runs on vkd3d-proton only. It uses the
+     * library of test_workgraph_node_order, where Zeta and Omega are the program entries. */
+    static const WCHAR *export_names[] =
+            { u"Pi", u"Lone", u"Arr1", u"Arr3", u"Kid", u"Mid", u"Beta", u"Omega", u"Alpha", u"Zeta" };
+    static const D3D12_NODE_ID omega_zeta[] = { { u"Omega", 0 }, { u"Zeta", 0 } };
+    static const D3D12_NODE_ID zeta_omega[] = { { u"Zeta", 0 }, { u"Omega", 0 } };
+    static const D3D12_NODE_ID omega[] = { { u"Omega", 0 } };
+    static const D3D12_NODE_ID renamed = { u"Renamed", 0 };
+    static const struct
+    {
+        const char *name;
+        D3D12_WORK_GRAPH_FLAGS flags;
+        const D3D12_NODE_ID *entries;
+        unsigned int entry_count;
+        bool rename;
+        HRESULT expected_hr;
+    }
+    tests[] =
+    {
+        { "entries Omega Zeta", 0, omega_zeta, ARRAY_SIZE(omega_zeta), false, S_OK },
+        { "entries Zeta Omega", 0, zeta_omega, ARRAY_SIZE(zeta_omega), false, S_OK },
+        { "program entry Zeta not listed", 0, omega, ARRAY_SIZE(omega), false, E_INVALIDARG },
+        { "include all", D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES, omega_zeta, ARRAY_SIZE(omega_zeta), false,
+                E_INVALIDARG },
+        { "Omega renamed", 0, omega_zeta, ARRAY_SIZE(omega_zeta), true, E_NOTIMPL },
+    };
+    D3D12_NODE nodes[ARRAY_SIZE(export_names)];
+    D3D12_COMMON_COMPUTE_NODE_OVERRIDES overrides;
+    struct test_context_workgraph context;
+    ID3D12WorkGraphProperties *props;
+    D3D12_WORK_GRAPH_DESC wg_desc;
+    ID3D12StateObject *pso;
+    unsigned int i, j;
+    D3D12_NODE_ID id;
+    HRESULT hr;
+    UINT value;
+
+#include "shaders/workgraph/headers/node_order.h"
+
+    if (!init_workgraph_test_context(&context))
+        return;
+    if (!workgraph_is_vkd3d_proton(context.device))
+    {
+        skip("The DDI order flag is a flag of vkd3d-proton.\n");
+        destroy_workgraph_test_context(&context);
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        vkd3d_test_set_context("%s", tests[i].name);
+
+        memset(nodes, 0, sizeof(nodes));
+        for (j = 0; j < ARRAY_SIZE(nodes); j++)
+        {
+            nodes[j].NodeType = D3D12_NODE_TYPE_SHADER;
+            nodes[j].Shader.Shader = export_names[j];
+            nodes[j].Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_NONE;
+            if (tests[i].rename && export_strequal(export_names[j], u"Omega"))
+            {
+                memset(&overrides, 0, sizeof(overrides));
+                overrides.pNewName = &renamed;
+                nodes[j].Shader.OverridesType = D3D12_NODE_OVERRIDES_TYPE_COMMON_COMPUTE;
+                nodes[j].Shader.pCommonComputeNodeOverrides = &overrides;
+            }
+        }
+
+        memset(&wg_desc, 0, sizeof(wg_desc));
+        wg_desc.ProgramName = u"DDI";
+        wg_desc.Flags = tests[i].flags | (D3D12_WORK_GRAPH_FLAGS)0x80000000u;
+        wg_desc.NumEntrypoints = tests[i].entry_count;
+        wg_desc.pEntrypoints = tests[i].entries;
+        wg_desc.NumExplicitlyDefinedNodes = ARRAY_SIZE(nodes);
+        wg_desc.pExplicitlyDefinedNodes = nodes;
+
+        hr = create_workgraph_pso_desc(&context, node_order_dxil, NULL, 0, &wg_desc, &pso);
+        ok(hr == tests[i].expected_hr, "Expected hr #%x, got #%x.\n", (int)tests[i].expected_hr, (int)hr);
+        if (FAILED(hr))
+            continue;
+
+        hr = ID3D12StateObject_QueryInterface(pso, &IID_ID3D12WorkGraphProperties, (void **)&props);
+        ok(SUCCEEDED(hr), "Failed to query ID3D12WorkGraphProperties, hr #%x.\n", (int)hr);
+        if (SUCCEEDED(hr))
+        {
+            value = ID3D12WorkGraphProperties_GetNumNodes(props, 0);
+            ok(value == ARRAY_SIZE(nodes), "Expected %u nodes, got %u.\n", (unsigned int)ARRAY_SIZE(nodes), value);
+            value = ID3D12WorkGraphProperties_GetNumEntrypoints(props, 0);
+            ok(value == tests[i].entry_count, "Expected %u entry points, got %u.\n", tests[i].entry_count, value);
+            for (j = 0; j < tests[i].entry_count; j++)
+            {
+                id = ID3D12WorkGraphProperties_GetEntrypointID(props, 0, j);
+                ok(export_strequal(id.Name, tests[i].entries[j].Name) && !id.ArrayIndex,
+                        "Entry point %u: expected %s, got %s[%u].\n", j,
+                        workgraph_dbgstr_w(tests[i].entries[j].Name), workgraph_dbgstr_w(id.Name), id.ArrayIndex);
+                value = ID3D12WorkGraphProperties_GetEntrypointIndex(props, 0, tests[i].entries[j]);
+                ok(value == j, "GetEntrypointIndex(%s): expected %u, got %u.\n",
+                        workgraph_dbgstr_w(tests[i].entries[j].Name), j, value);
+            }
+            ID3D12WorkGraphProperties_Release(props);
+        }
+        ID3D12StateObject_Release(pso);
+    }
+    vkd3d_test_set_context(NULL);
+
+    destroy_workgraph_test_context(&context);
+}
+
 void test_workgraph_array_self_recursion(void)
 {
     /* N[1] is the only element of the node array N and has NodeMaxRecursionDepth(1). It recurses through

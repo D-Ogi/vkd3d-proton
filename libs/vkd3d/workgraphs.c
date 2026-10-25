@@ -712,6 +712,18 @@ static void d3d12_wg_state_object_cleanup_data(
     vkd3d_free(data->export_order);
 }
 
+/* amdgpu-wddm fork: a work graph flag of the system D3D12 driver (bc250-win, engine-ddi/work-graphs.cpp), which
+ * D3D12 does not define. The DDI gives the driver the final graph (WorkGraphs.md, D3D12DDI_WORK_GRAPH_DESC_0108):
+ * every node with its final properties, and the entry points in the order of their entry point indices. The driver
+ * passes every node as an explicitly defined node with overrides, and the entry points in that order. With the flag:
+ * - the entry points are pEntrypoints, in that order, so that the entry point indices of DispatchGraph, also those
+ *   in GPU memory, are the indices of the runtime;
+ * - a node that the engine makes an entry point, but that pEntrypoints does not list, is refused;
+ * - no local root arguments table index is assigned automatically, because the runtime assigned them;
+ * - a rename, a shared input or an output override that differs from the shader is refused (E_NOTIMPL), because the
+ *   engine applies none of them. An override that is equal to the shader has no effect. */
+#define VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM 0x80000000u
+
 static HRESULT d3d12_wg_state_object_parse_subobject(
         struct d3d12_wg_state_object_data *data, struct d3d12_device *device,
         const D3D12_STATE_SUBOBJECT *obj, unsigned int association_priority)
@@ -726,10 +738,21 @@ static HRESULT d3d12_wg_state_object_parse_subobject(
             struct d3d12_wg_state_object_program *program;
 
             /* amdgpu-wddm fork: a graph can also have only the listed and explicitly defined nodes. */
-            if (wg_desc->Flags & ~D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES)
+            if (wg_desc->Flags & ~(D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES |
+                    VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM))
             {
                 FIXME("Unsupported work graph flags %#x.\n", wg_desc->Flags);
                 return E_NOTIMPL;
+            }
+
+            /* amdgpu-wddm fork: a graph of the DDI lists every node and every entry point. */
+            if ((wg_desc->Flags & VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM) &&
+                    ((wg_desc->Flags & D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES) ||
+                    !wg_desc->NumEntrypoints || !wg_desc->NumExplicitlyDefinedNodes))
+            {
+                ERR("Work graph %s of the DDI without its entry points and nodes, flags %#x.\n",
+                        debugstr_w(wg_desc->ProgramName), wg_desc->Flags);
+                return E_INVALIDARG;
             }
 
             vkd3d_array_reserve((void **)&data->programs, &data->programs_size,
@@ -801,6 +824,74 @@ static HRESULT d3d12_wg_state_object_parse_subobject(
             vkd3d_array_reserve((void**)&data->dxil_libraries, &data->dxil_libraries_size,
                     data->dxil_libraries_count + 1, sizeof(*data->dxil_libraries));
             data->dxil_libraries[data->dxil_libraries_count++] = lib;
+            break;
+        }
+
+        case D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG:
+        {
+            /* amdgpu-wddm fork: the dependency flags change nothing for an executable work graph. Additions to a
+             * work graph state object are not implemented, so a state object that allows them is refused. */
+            const D3D12_STATE_OBJECT_CONFIG *config = obj->pDesc;
+
+            if (config->Flags & ~(D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS |
+                    D3D12_STATE_OBJECT_FLAG_ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS))
+            {
+                ERR("Unsupported state object flags %#x for a work graph.\n", config->Flags);
+                return E_NOTIMPL;
+            }
+            break;
+        }
+
+        case D3D12_STATE_SUBOBJECT_TYPE_NODE_MASK:
+        {
+            /* amdgpu-wddm fork: the device has one node, so a node mask changes nothing. */
+            const D3D12_NODE_MASK *mask = obj->pDesc;
+
+            if (mask->NodeMask > 1)
+            {
+                ERR("Node mask %#x for a work graph on a device with one node.\n", mask->NodeMask);
+                return E_INVALIDARG;
+            }
+            break;
+        }
+
+        case D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION:
+        {
+            /* amdgpu-wddm fork: an association to a root signature subobject of the description. The system D3D12
+             * driver gives one for each root signature that the runtime associates with an export. */
+            const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION *association = obj->pDesc;
+            const D3D12_STATE_SUBOBJECT *target = association->pSubobjectToAssociate;
+            unsigned int num_associations = max(association->NumExports, 1);
+            struct d3d12_state_object_association *entry;
+            const D3D12_LOCAL_ROOT_SIGNATURE *rs;
+
+            if (!target || (target->Type != D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE &&
+                    target->Type != D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE))
+            {
+                ERR("Association with subobject type %d is not supported for a work graph.\n",
+                        target ? (int)target->Type : -1);
+                return E_NOTIMPL;
+            }
+
+            /* LOCAL_ROOT_SIGNATURE and GLOBAL_ROOT_SIGNATURE alias. */
+            rs = target->pDesc;
+            if (!vkd3d_array_reserve((void **)&data->associations, &data->associations_size,
+                    data->associations_count + num_associations, sizeof(*data->associations)))
+                return E_OUTOFMEMORY;
+
+            for (i = 0; i < num_associations; i++)
+            {
+                entry = &data->associations[data->associations_count++];
+                entry->kind = target->Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE ?
+                        VKD3D_SHADER_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE :
+                        VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE;
+                entry->root_signature = impl_from_ID3D12RootSignature(rs->pLocalRootSignature);
+                if (entry->root_signature)
+                    d3d12_root_signature_inc_ref(entry->root_signature);
+                entry->export = association->NumExports ? association->pExports[i] : NULL;
+                entry->priority = association->NumExports ?
+                        VKD3D_ASSOCIATION_PRIORITY_EXPLICIT : VKD3D_ASSOCIATION_PRIORITY_EXPLICIT_DEFAULT;
+            }
             break;
         }
 
@@ -1242,11 +1333,70 @@ d3d12_wg_state_object_find_exported_entry_point(
     return NULL;
 }
 
+/* amdgpu-wddm fork: the node ID of an override against the ID that the shader declares. */
+static bool d3d12_wg_node_id_equal(const D3D12_NODE_ID *id, const char *name, uint32_t array_index)
+{
+    return name && *name && id->Name && vkd3d_export_strequal_mixed(id->Name, name) &&
+            id->ArrayIndex == array_index;
+}
+
+/* amdgpu-wddm fork: with VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM the overrides are the final properties of the
+ * node. The engine applies no rename, no shared input and no output override, so each of them must be what the shader
+ * declares. A smaller output budget than the declared one is accepted: the engine sizes for the declared one. */
+static HRESULT d3d12_wg_state_object_check_ddi_overrides(const struct vkd3d_shader_library_entry_point *entry,
+        const D3D12_NODE_ID *new_name, const D3D12_NODE_ID *share_input_of,
+        UINT num_output_overrides, const D3D12_NODE_OUTPUT_OVERRIDES *output_overrides)
+{
+    const struct vkd3d_shader_node_input_data *input = entry->node_input;
+    const struct vkd3d_shader_node_output_data *output;
+    const D3D12_NODE_OUTPUT_OVERRIDES *o;
+    UINT i;
+
+    if (new_name && !d3d12_wg_node_id_equal(new_name, input->node_id, input->node_array_index))
+    {
+        ERR("Node %s[%u] is renamed to %s[%u], which is not implemented.\n", input->node_id,
+                input->node_array_index, debugstr_w(new_name->Name), new_name->ArrayIndex);
+        return E_NOTIMPL;
+    }
+
+    if (share_input_of && !d3d12_wg_node_id_equal(share_input_of, input->node_share_input_id,
+            input->node_share_input_array_index))
+    {
+        ERR("Node %s[%u] shares the input of %s[%u], which the shader does not declare.\n", input->node_id,
+                input->node_array_index, debugstr_w(share_input_of->Name), share_input_of->ArrayIndex);
+        return E_NOTIMPL;
+    }
+
+    for (i = 0; i < num_output_overrides; i++)
+    {
+        o = &output_overrides[i];
+        if (o->OutputIndex >= entry->node_outputs_count)
+        {
+            ERR("Node %s[%u] has no output %u.\n", input->node_id, input->node_array_index, o->OutputIndex);
+            return E_INVALIDARG;
+        }
+
+        output = &entry->node_outputs[o->OutputIndex];
+        if ((o->pNewName && !d3d12_wg_node_id_equal(o->pNewName, output->node_id, output->node_array_index)) ||
+                (o->pAllowSparseNodes && *o->pAllowSparseNodes && !output->sparse_array) ||
+                (o->pMaxRecords && *o->pMaxRecords > output->max_records))
+        {
+            ERR("Output %u of node %s[%u] differs from the shader, which is not implemented.\n", o->OutputIndex,
+                    input->node_id, input->node_array_index);
+            return E_NOTIMPL;
+        }
+    }
+
+    return S_OK;
+}
+
 static HRESULT d3d12_wg_state_object_apply_node_overrides(
         struct d3d12_wg_state_object_data *data,
         struct d3d12_wg_state_object_program *program)
 {
+    const bool ddi = !!(program->flags & VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM);
     const struct vkd3d_shader_library_entry_point *entry;
+    HRESULT hr;
     size_t i;
 
     for (i = 0; i < program->explicit_defined_nodes_count; i++)
@@ -1284,14 +1434,23 @@ static HRESULT d3d12_wg_state_object_apply_node_overrides(
             case D3D12_NODE_OVERRIDES_TYPE_BROADCASTING_LAUNCH:
             {
                 const D3D12_BROADCASTING_LAUNCH_OVERRIDES *override = shader_node->pBroadcastingLaunchOverrides;
-                if (override->NumOutputOverrides || override->pShareInputOf || override->pNewName)
-                    program->pool_ignored_overrides = true;
-                if (override->NumOutputOverrides)
-                    FIXME("Output overrides not supported yet.\n");
-                if (override->pShareInputOf)
-                    FIXME("ShaderInputOf overrides not supported yet.\n");
-                if (override->pNewName)
-                    FIXME("NameView overrides not supported yet.\n");
+                if (ddi)
+                {
+                    if (FAILED(hr = d3d12_wg_state_object_check_ddi_overrides(entry, override->pNewName,
+                            override->pShareInputOf, override->NumOutputOverrides, override->pOutputOverrides)))
+                        return hr;
+                }
+                else
+                {
+                    if (override->NumOutputOverrides || override->pShareInputOf || override->pNewName)
+                        program->pool_ignored_overrides = true;
+                    if (override->NumOutputOverrides)
+                        FIXME("Output overrides not supported yet.\n");
+                    if (override->pShareInputOf)
+                        FIXME("ShaderInputOf overrides not supported yet.\n");
+                    if (override->pNewName)
+                        FIXME("NameView overrides not supported yet.\n");
+                }
 
                 if (override->pDispatchGrid)
                 {
@@ -1339,14 +1498,23 @@ static HRESULT d3d12_wg_state_object_apply_node_overrides(
             case D3D12_NODE_OVERRIDES_TYPE_COMMON_COMPUTE:
             {
                 const D3D12_COALESCING_LAUNCH_OVERRIDES *override = shader_node->pCoalescingLaunchOverrides;
-                if (override->NumOutputOverrides || override->pShareInputOf || override->pNewName)
-                    program->pool_ignored_overrides = true;
-                if (override->NumOutputOverrides)
-                    FIXME("Output overrides not supported yet.\n");
-                if (override->pShareInputOf)
-                    FIXME("ShaderInputOf overrides not supported yet.\n");
-                if (override->pNewName)
-                    FIXME("NameView overrides not supported yet.\n");
+                if (ddi)
+                {
+                    if (FAILED(hr = d3d12_wg_state_object_check_ddi_overrides(entry, override->pNewName,
+                            override->pShareInputOf, override->NumOutputOverrides, override->pOutputOverrides)))
+                        return hr;
+                }
+                else
+                {
+                    if (override->NumOutputOverrides || override->pShareInputOf || override->pNewName)
+                        program->pool_ignored_overrides = true;
+                    if (override->NumOutputOverrides)
+                        FIXME("Output overrides not supported yet.\n");
+                    if (override->pShareInputOf)
+                        FIXME("ShaderInputOf overrides not supported yet.\n");
+                    if (override->pNewName)
+                        FIXME("NameView overrides not supported yet.\n");
+                }
 
                 if (override->pProgramEntry)
                 {
@@ -1669,7 +1837,41 @@ static HRESULT d3d12_wg_state_object_populate_program(struct d3d12_wg_state_obje
             written[i] = written[node_index];
     }
 
-    for (i = 0; i < program->node_order_count; i++)
+    /* amdgpu-wddm fork: a graph of the DDI has the entry points of pEntrypoints, in that order (the entry point
+     * indices of the runtime, also in GPU memory). Every other node of the graph must be a node that is written and
+     * not an entry point, or the runtime and the engine disagree about the graph. */
+    if (program->flags & VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM)
+    {
+        for (i = 0; i < program->node_order_count; i++)
+        {
+            entry = program->node_order[i];
+            node_input = data->entry_points[entry].node_input;
+            if (!listed[entry] && (node_input->is_program_entry || !written[entry]))
+            {
+                ERR("Node %s[%u] is an entry point that the DDI does not list.\n",
+                        node_input->node_id, node_input->node_array_index);
+                hr = E_INVALIDARG;
+                goto out;
+            }
+        }
+
+        for (i = 0; i < program->explicit_entry_point_count; i++)
+        {
+            node_index = d3d12_work_graph_find_node_by_id_wchar(data->entry_points, data->entry_points_count,
+                    program->explicit_entry_points[i].Name, program->explicit_entry_points[i].ArrayIndex);
+            if (FAILED(hr = d3d12_wg_state_object_program_add_node_to_level(program, data, node_index, 0, false)))
+                goto out;
+        }
+
+        if (program->levels[0].nodes_count != program->explicit_entry_point_count)
+        {
+            ERR("Work graph %s lists an entry point twice.\n", debugstr_w(program->name));
+            hr = E_INVALIDARG;
+            goto out;
+        }
+    }
+
+    for (i = 0; i < program->node_order_count && !(program->flags & VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM); i++)
     {
         entry = program->node_order[i];
         node_input = data->entry_points[entry].node_input;
@@ -1740,6 +1942,10 @@ static HRESULT d3d12_wg_state_object_assign_local_root_table_indices(
     for (i = 0; i < count; i++)
         if (in_program[i] && data->entry_points[i].node_input)
             indices[i] = data->entry_points[i].node_input->local_root_arguments_table_index;
+
+    /* The runtime assigned the indices of a graph of the DDI: a node without one has no local root signature. */
+    if (program->flags & VKD3D_WORK_GRAPH_FLAG_DDI_ORDER_AMDGPU_WDDM)
+        order_count = 0;
 
     for (i = 0; i < order_count; i++)
     {

@@ -479,6 +479,7 @@ decl_test(test_workgraph_depth_limit);
 decl_test(test_workgraph_create_failure);
 decl_test(test_workgraph_lrat_order);
 decl_test(test_workgraph_node_order);
+decl_test(test_workgraph_ddi_order);
 decl_test(test_workgraph_array_self_recursion);
 decl_test(test_workgraph_empty_cpu_input);
 decl_test(test_workgraph_cpu_input_extent);
