@@ -3848,8 +3848,7 @@ static void rs_desc_from_d3d12(VkPipelineRasterizationStateCreateInfo *vk_desc,
     vk_desc->depthBiasSlopeFactor = d3d12_desc->SlopeScaledDepthBias;
     vk_desc->lineWidth = 1.0f;
 
-    if (d3d12_desc->ForcedSampleCount)
-        FIXME("Ignoring ForcedSampleCount %#x.\n", d3d12_desc->ForcedSampleCount);
+    /* Without outputs, d3d12_pipeline_state_init_graphics uses ForcedSampleCount. */
 }
 
 static void rs_conservative_info_from_d3d12(VkPipelineRasterizationConservativeStateCreateInfoEXT *conservative_info,
@@ -5552,6 +5551,48 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     sample_count = vk_samples_from_dxgi_sample_desc(&desc->sample_desc);
     if (desc->sample_desc.Count != 1 && desc->sample_desc.Quality)
         WARN("Ignoring sample quality %u.\n", desc->sample_desc.Quality);
+
+    /* VulkanOn12.md, sample counts with no outputs: without render targets and depth-stencil
+     * format, SampleDesc.Count can be any count of SupportedSampleCountsWithNoOutputs. If it is
+     * larger than 1, ForcedSampleCount must be 0 (multisample rasterization) or 1 (single-sample
+     * rasterization). If it is 1, ForcedSampleCount (TIR: 1, 4, 8 or 16) gives the rasterization
+     * sample count, with pixel-frequency shading. With outputs, ForcedSampleCount stays ignored. */
+    if (!desc->rtv_formats.NumRenderTargets && desc->dsv_format == DXGI_FORMAT_UNKNOWN)
+    {
+        const UINT no_output_counts = device->d3d12_caps.options19.SupportedSampleCountsWithNoOutputs;
+        const UINT forced = desc->rasterizer_state.ForcedSampleCount;
+
+        if (desc->sample_desc.Count > 1 && (!vk_samples_from_sample_count(desc->sample_desc.Count) ||
+                !(no_output_counts & desc->sample_desc.Count)))
+        {
+            WARN("Unsupported attachment-free sample count %u.\n", desc->sample_desc.Count);
+            return E_INVALIDARG;
+        }
+
+        if (forced)
+        {
+            if (desc->sample_desc.Count > 1 && forced > 1)
+            {
+                WARN("ForcedSampleCount %u with SampleDesc.Count %u.\n", forced, desc->sample_desc.Count);
+                return E_INVALIDARG;
+            }
+            if (forced != 1 && forced != 4 && forced != 8 && forced != 16)
+            {
+                WARN("Invalid ForcedSampleCount %u.\n", forced);
+                return E_INVALIDARG;
+            }
+            if (!(no_output_counts & forced))
+            {
+                WARN("Unsupported ForcedSampleCount %u.\n", forced);
+                return E_INVALIDARG;
+            }
+            sample_count = vk_samples_from_sample_count(forced);
+        }
+    }
+    else if (desc->rasterizer_state.ForcedSampleCount)
+    {
+        FIXME("Ignoring ForcedSampleCount %#x with outputs.\n", desc->rasterizer_state.ForcedSampleCount);
+    }
 
     rt_count = desc->rtv_formats.NumRenderTargets;
     if (rt_count > ARRAY_SIZE(graphics->blend_attachments))

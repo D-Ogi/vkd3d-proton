@@ -9905,8 +9905,13 @@ static void d3d12_device_caps_init_feature_options19(struct d3d12_device *device
     /* We trivially support this by not validating resource types in rendering
      * and computing renderArea to be the intersection of all bound views. */
     options19->MismatchingOutputDimensionsSupported = TRUE;
-    /* Requires SampleCount > 1 for pipelinesm, not just ForcedSamplecount */
-    options19->SupportedSampleCountsWithNoOutputs = 0x1;
+    /* Attachment-free pipelines use SampleDesc.Count, or ForcedSampleCount, as their static
+     * rasterization sample count (d3d12_pipeline_state_init_graphics). Successive PSOs can use
+     * different counts inside the same attachment-free rendering, which needs variableMultisampleRate. */
+    options19->SupportedSampleCountsWithNoOutputs = VK_SAMPLE_COUNT_1_BIT;
+    if (device->device_info.features2.features.variableMultisampleRate)
+        options19->SupportedSampleCountsWithNoOutputs =
+                device->device_info.properties2.properties.limits.framebufferNoAttachmentsSampleCounts & 0x3f;
     /* D3D12 expectations w.r.t. rounding match Vulkan spec.
      * However, both AMD and Intel native drivers round to even. RADV has no-trunc-coord workarounds.
      * Turnip enables round-to-even behavior for vkd3d. Same for ANV. */
