@@ -1617,8 +1617,9 @@ static void check_work_graph_node_order(ID3D12Device5 *device, ID3D12StateObject
     ok(!id.Name && !id.ArrayIndex, "GetNodeID of graph 1: expected {NULL, 0}, got %s[%u].\n",
             workgraph_dbgstr_w(id.Name), id.ArrayIndex);
     value = ID3D12WorkGraphProperties_GetNumNodes(props, 1);
-    /* The NVIDIA driver returns 0. */
-    bug_if(is_nvidia_windows_device((ID3D12Device *)device) && !workgraph_is_vkd3d_proton(device))
+    /* The Microsoft runtime implements ID3D12WorkGraphProperties (no DDI asks the driver) and returns 0, with
+     * the NVIDIA driver and with amdgpu-wddm on the installed route alike. */
+    bug_if(!workgraph_is_vkd3d_proton(device))
     ok(value == UINT32_MAX, "GetNumNodes of graph 1: expected -1, got %u.\n", value);
     id.Name = u"Arr";
     id.ArrayIndex = 2;
