@@ -9547,6 +9547,11 @@ static uint32_t d3d12_device_get_legacy_max_sampler_heap_size(struct d3d12_devic
             device->device_info.descriptor_buffer_properties.maxSamplerDescriptorBufferRange <
             (VkDeviceSize)count * device->device_info.descriptor_buffer_properties.samplerDescriptorSize)
         return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
+    /* Every sampler of a full heap can have its own custom border colour. Past the device limit the
+     * sampler gets transparent black instead (resource.c), so the limit must hold the whole heap. */
+    if (device->vk_info.EXT_custom_border_color &&
+            device->device_info.custom_border_color_properties.maxCustomBorderColorSamplers < count)
+        return VKD3D_MIN_SAMPLER_DESCRIPTOR_COUNT;
     return count;
 }
 
