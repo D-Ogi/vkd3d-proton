@@ -9,8 +9,15 @@ cbuffer Constants : register(b0)
 
 struct [raypayload] Payload
 {
-    float hits : write(miss, caller, closesthit, anyhit) : read(caller, miss);
+    float hits : write(miss, caller, closesthit, anyhit) : read(caller, miss, closesthit, anyhit);
 };
+
+/* Ray N can only intersect triangle N % 8. Each shader adds its value, so the result also
+ * counts any-hit invocations, and a wrong primitive adds 64. */
+static float check_primitive(float value)
+{
+    return PrimitiveIndex() == DispatchRaysIndex().x % 8 ? value : 64.0;
+}
 
 [shader("miss")]
 void MissShader(inout Payload payload)
@@ -21,13 +28,13 @@ void MissShader(inout Payload payload)
 [shader("closesthit")]
 void ClosestHit(inout Payload payload, BuiltInTriangleIntersectionAttributes attribs)
 {
-    payload.hits = 1.0;
+    payload.hits += check_primitive(1.0);
 }
 
 [shader("anyhit")]
 void AnyHit(inout Payload payload, BuiltInTriangleIntersectionAttributes attribs)
 {
-    payload.hits = 0.75;
+    payload.hits += check_primitive(0.75);
     IgnoreHit();
 }
 
@@ -55,4 +62,3 @@ void GenShader()
 
     Buf[DispatchRaysIndex().x] = payload.hits;
 }
-

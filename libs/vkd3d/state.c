@@ -2292,8 +2292,13 @@ unsigned int d3d12_root_signature_get_shader_interface_flags(const struct d3d12_
     if (root_signature->heap.redzone_style == VKD3D_ROOT_SIGNATURE_HEAP_REDZONE_STYLE_INLINE)
         flags |= VKD3D_SHADER_INTERFACE_INLINE_REDZONE_CBV;
 
-    if (vkd3d_atomic_uint32_load_explicit(&root_signature->device->vendor_hacks.force_ray_query_omm,
-            vkd3d_memory_order_relaxed))
+    /* RayQuery objects in shaders older than SM 6.9 cannot declare RAYQUERY_FLAG_ALLOW_OPACITY_MICROMAPS.
+     * A driver that supports opacity micromaps and does not implement the
+     * RAYQUERY_ALLOW_OPACITY_MICROMAPS_ON_PRE_SM69_SHADERS pipeline and state object flags must treat
+     * these objects as opted in (D3D12 Raytracing spec, "RayQuery flags on pre Shader Model 6.9 shaders"). */
+    if (root_signature->device->device_info.supports_opacity_micromap ||
+            vkd3d_atomic_uint32_load_explicit(&root_signature->device->vendor_hacks.force_ray_query_omm,
+                    vkd3d_memory_order_relaxed))
         flags |= VKD3D_SHADER_INTERFACE_RAY_QUERY_OMM_DEVICE_GLOBAL;
 
     return flags;

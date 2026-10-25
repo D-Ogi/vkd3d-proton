@@ -8340,16 +8340,39 @@ cleanup:
     }
 }
 
+STATIC_ASSERT(offsetof(D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER, DriverOpaqueVersioningData) == VK_UUID_SIZE);
+STATIC_ASSERT(sizeof(D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER) == 2 * VK_UUID_SIZE);
+
 static D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE d3d12_device_CheckDriverMatchingIdentifier(d3d12_device_iface *iface,
         D3D12_SERIALIZED_DATA_TYPE serialized_data_type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *identifier)
 {
-    FIXME("iface %p, serialized_data_type %u, identifier %p stub!\n",
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkAccelerationStructureCompatibilityKHR compatibility;
+    VkAccelerationStructureVersionInfoKHR version_info;
+
+    TRACE("iface %p, serialized_data_type %u, identifier %p.\n",
             iface, serialized_data_type, identifier);
 
-    if (serialized_data_type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE)
+    if (serialized_data_type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE ||
+            !d3d12_device_supports_ray_tracing_tier_1_0(device))
         return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
 
-    return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+    /* The identifier is the first 2 * VK_UUID_SIZE bytes of the Vulkan serialized header:
+     * driverUUID, then the compatibility data of vkGetDeviceAccelerationStructureCompatibilityKHR.
+     * This covers TLAS, BLAS and opacity micromap arrays. */
+    if (memcmp(&identifier->DriverOpaqueGUID, device->device_info.vulkan_1_1_properties.driverUUID, VK_UUID_SIZE))
+        return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+
+    memset(&version_info, 0, sizeof(version_info));
+    version_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_VERSION_INFO_KHR;
+    version_info.pVersionData = (const uint8_t *)identifier;
+    VK_CALL(vkGetDeviceAccelerationStructureCompatibilityKHR(device->vk_device, &version_info, &compatibility));
+
+    /* Same driver, so a refusal means another version of it. */
+    return compatibility == VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR ?
+            D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE :
+            D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_SetBackgroundProcessingMode(d3d12_device_iface *iface,
@@ -9383,7 +9406,10 @@ static D3D12_RAYTRACING_TIER d3d12_device_determine_ray_tracing_tier(struct d3d1
         }
     }
 
-    if (tier == D3D12_RAYTRACING_TIER_1_1 && info->supports_opacity_micromap)
+    /* Tier 1.2 adds opacity micromaps and shader execution reordering (fork change: upstream asks for the
+     * micromaps only). A device without SER stays at tier 1.1 also when it supports micromaps. */
+    if (tier == D3D12_RAYTRACING_TIER_1_1 && info->supports_opacity_micromap &&
+            info->invocation_reorder_features.rayTracingInvocationReorder)
     {
         INFO("DXR 1.2 support enabled.\n");
         tier = D3D12_RAYTRACING_TIER_1_2;
@@ -10249,9 +10275,12 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
          * - Long vector (hnnnnng)
          * - Shader Execution Reordering
          * - 16/64-bit is{inf,nan,normal} etc
+         *
+         * Opacity micromaps are not required (fork change). They belong to raytracing tier 1.2, and SM 6.9 at
+         * tier 1.1 is valid: the SM 6.9 OMM flags have no effect when no acceleration structure has an OMM.
+         * SER is still required, because SM 6.9 needs it on every device with raytracing.
          */
         if (device->d3d12_caps.max_shader_model == D3D_SHADER_MODEL_6_8 &&
-            device->device_info.opacity_micromap_features.micromap &&
             /* For maint9 bitops which support 16-bit / 64-bit. Needed for vector version of these. */
             device->device_info.maintenance_9_features.maintenance9 &&
             device->device_info.long_vector_features.longVector &&
