@@ -5875,3 +5875,175 @@ void test_shader_execution_reordering_ray_query(void)
 {
     test_shader_execution_reordering_trace_inner(true);
 }
+
+#ifdef _WIN32
+#include <tlhelp32.h>
+#endif
+static void ser_dump_modules(void)
+{
+#ifdef _WIN32
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    MODULEENTRY32W entry;
+    if (snapshot == INVALID_HANDLE_VALUE) { ok(false, "Module snapshot failed.\n"); return; }
+    memset(&entry, 0, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    if (Module32FirstW(snapshot, &entry)) do
+    {
+        char path[4096];
+        if (WideCharToMultiByte(CP_UTF8, 0, entry.szExePath, -1, path, sizeof(path), NULL, NULL))
+            printf("SER_MODULE %s\n", path);
+    } while (Module32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+#endif
+}
+
+/* Independent integer readback of HitObject copy, PHI, unbound and payload contracts.
+ * This native D3D12 client does not link the local translation engine. */
+void test_shader_execution_reordering_values(void)
+{
+#include "shaders/rt/headers/ser_values.h"
+    const struct value_case
+    {
+        const char *name;
+        LPCWSTR entry;
+        const D3D12_SHADER_BYTECODE *code;
+        UINT choice, index, count, expected[4];
+    } cases[] = {
+        {"copy", u"CopyLive", &ser_CopyLive, 0, 1, 4, {111, 123, 0, 1}},
+        {"phi00", u"TwoPhi", &ser_TwoPhi, 0, 0, 2, {111, 111}},
+        {"phi01", u"TwoPhi", &ser_TwoPhi, 0, 1, 2, {111, 123}},
+        {"phi10", u"TwoPhi", &ser_TwoPhi, 1, 0, 2, {123, 111}},
+        {"phi11", u"TwoPhi", &ser_TwoPhi, 1, 1, 2, {123, 123}},
+        {"unbound", u"UnboundPhi", &ser_UnboundPhi, 0, 0, 1, {100}},
+        {"nop", u"UnboundPhi", &ser_UnboundPhi, 1, 0, 1, {100}},
+        {"unbound-root", u"UnboundRoot", &ser_UnboundRoot, 0, 0, 2, {0, 1}},
+        {"bound-root", u"BoundRoot", &ser_BoundRoot, 0, 0, 3, {0xcafe, 111, 1}},
+        {"direct", u"DirectPayloadControl", &ser_DirectPayloadControl, 0, 0, 1, {111}},
+        {"payload-alias", u"TempAlias", &ser_TempAlias, 0, 0, 1, {129}},
+        {"loop0", u"LoopLive", &ser_LoopLive, 0, 0, 2, {0, 111}},
+        {"loop1", u"LoopLive", &ser_LoopLive, 1, 0, 2, {111, 123}},
+        {"loop2", u"LoopLive", &ser_LoopLive, 2, 0, 2, {234, 111}},
+        {"loop3", u"LoopLive", &ser_LoopLive, 3, 0, 2, {345, 123}},
+        {"loop16", u"LoopLive", &ser_LoopLive, 16, 0, 2, {1872, 111}},
+        {"loop31", u"LoopLive", &ser_LoopLive, 31, 0, 2, {3621, 123}},
+        {"array0", u"ArrayLive", &ser_ArrayLive, 0, 0, 1, {111}},
+        {"array1", u"ArrayLive", &ser_ArrayLive, 0, 1, 1, {123}},
+        {"helper", u"HelperLive", &ser_HelperLive, 0, 0, 2, {111, 123}},
+        {"hint", u"HintOnly", &ser_HintOnly, 0, 0, 1, {100}},
+    };
+    struct raytracing_test_context context;
+    D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_9};
+    D3D12_ROOT_SIGNATURE_DESC desc = {0}, local_desc = {0};
+    D3D12_ROOT_PARAMETER params[3] = {{0}}, local_param = {0};
+    ID3D12RootSignature *local_rs;
+    struct test_rt_geometry rt_geom;
+    struct test_geometry geom;
+    const char *filter = getenv("SER_CASE");
+    UINT i, j, executed = 0;
+    if (filter && !*filter) filter = NULL;
+    if (!init_raytracing_test_context(&context, D3D12_RAYTRACING_TIER_1_1)) return;
+    if (FAILED(ID3D12Device_CheckFeatureSupport(context.context.device, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) || sm.HighestShaderModel < D3D_SHADER_MODEL_6_9)
+    {
+        ok(false, "SER requires SM 6.9; unsupported is not a pass.\n");
+        destroy_raytracing_test_context(&context);
+        return;
+    }
+    init_test_geometry(context.context.device, &geom);
+    init_rt_geometry(&context, &rt_geom, &geom, 1, 1.0f, 1, 1.0f, 1.0f, 0);
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[2].Constants.Num32BitValues = 4;
+    desc.NumParameters = ARRAY_SIZE(params);
+    desc.pParameters = params;
+    create_root_signature(context.context.device, &desc, &context.context.root_signature);
+    local_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    local_param.Constants.ShaderRegister = 1;
+    local_param.Constants.Num32BitValues = 1;
+    local_desc.NumParameters = 1;
+    local_desc.pParameters = &local_param;
+    local_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
+    create_root_signature(context.context.device, &local_desc, &local_rs);
+    for (i = 0; i < ARRAY_SIZE(cases); ++i)
+    {
+        const struct value_case *c = &cases[i];
+        struct rt_pso_factory factory;
+        D3D12_HIT_GROUP_DESC hit = {0};
+        D3D12_DISPATCH_RAYS_DESC dispatch = {0};
+        ID3D12StateObject *pso;
+        ID3D12StateObjectProperties *props;
+        ID3D12Resource *output, *sbt;
+        struct resource_readback rb;
+        UINT handles[5][16] = {{0}}, values[4] = {c->choice, c->index, 100, 0};
+        LPCWSTR exports[5] = {c->entry, u"ValueMiss0", u"ValueMiss1", u"ValueHitGroup", u"ValueCallable"};
+        bool identifiers_ok = true;
+        if (filter && strcmp(filter, c->name)) continue;
+        rt_pso_factory_init(&factory);
+        rt_pso_factory_add_default_node_mask(&factory);
+        rt_pso_factory_add_pipeline_config(&factory, 1);
+        rt_pso_factory_add_shader_config(&factory, 4, 8);
+        rt_pso_factory_add_global_root_signature(&factory, context.context.root_signature);
+        j = rt_pso_factory_add_local_root_signature(&factory, local_rs);
+        rt_pso_factory_add_subobject_to_exports_association(&factory, j, 1, &exports[3]);
+        hit.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+        hit.ClosestHitShaderImport = u"ValueHit";
+        hit.HitGroupExport = exports[3];
+        rt_pso_factory_add_hit_group(&factory, &hit);
+        rt_pso_factory_add_dxil_library(&factory, *c->code, 0, NULL);
+        rt_pso_factory_add_dxil_library(&factory, ser_ser_values_support, 0, NULL);
+        pso = rt_pso_factory_compile(&context, &factory, D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+        ok(!!pso, "%s pipeline creation.\n", c->name);
+        if (!pso) continue;
+        if (FAILED(ID3D12StateObject_QueryInterface(pso, &IID_ID3D12StateObjectProperties, (void **)&props)))
+        { ok(false, "%s state properties.\n", c->name); ID3D12StateObject_Release(pso); continue; }
+        for (j = 0; j < ARRAY_SIZE(exports); ++j)
+        {
+            const void *identifier = ID3D12StateObjectProperties_GetShaderIdentifier(props, exports[j]);
+            if (!identifier) { identifiers_ok = false; break; }
+            memcpy(handles[j], identifier, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+        }
+        ID3D12StateObjectProperties_Release(props);
+        ok(identifiers_ok, "%s identifiers.\n", c->name);
+        if (!identifiers_ok) { ID3D12StateObject_Release(pso); continue; }
+        handles[3][8] = 0xcafe;
+        sbt = create_upload_buffer(context.context.device, sizeof(handles), handles);
+        output = create_default_buffer(context.context.device, 4 * sizeof(UINT), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        dispatch.RayGenerationShaderRecord.StartAddress = ID3D12Resource_GetGPUVirtualAddress(sbt);
+        dispatch.RayGenerationShaderRecord.SizeInBytes = 64;
+        dispatch.MissShaderTable.StartAddress = dispatch.RayGenerationShaderRecord.StartAddress + 64;
+        dispatch.MissShaderTable.SizeInBytes = 128;
+        dispatch.MissShaderTable.StrideInBytes = 64;
+        dispatch.HitGroupTable.StartAddress = dispatch.RayGenerationShaderRecord.StartAddress + 192;
+        dispatch.HitGroupTable.SizeInBytes = dispatch.HitGroupTable.StrideInBytes = 64;
+        dispatch.CallableShaderTable.StartAddress = dispatch.RayGenerationShaderRecord.StartAddress + 256;
+        dispatch.CallableShaderTable.SizeInBytes = dispatch.CallableShaderTable.StrideInBytes = 64;
+        dispatch.Width = dispatch.Height = dispatch.Depth = 1;
+        ID3D12GraphicsCommandList4_SetComputeRootSignature(context.list4, context.context.root_signature);
+        ID3D12GraphicsCommandList4_SetPipelineState1(context.list4, pso);
+        ID3D12GraphicsCommandList4_SetComputeRootUnorderedAccessView(context.list4, 0, ID3D12Resource_GetGPUVirtualAddress(output));
+        ID3D12GraphicsCommandList4_SetComputeRootShaderResourceView(context.list4, 1, ID3D12Resource_GetGPUVirtualAddress(rt_geom.top_rtas.rtas));
+        ID3D12GraphicsCommandList4_SetComputeRoot32BitConstants(context.list4, 2, 4, values, 0);
+        ID3D12GraphicsCommandList4_DispatchRays(context.list4, &dispatch);
+        transition_resource_state(context.context.list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        get_buffer_readback_with_command_list(output, DXGI_FORMAT_UNKNOWN, &rb, context.context.queue, context.context.list);
+        for (j = 0; j < c->count; ++j)
+        {
+            UINT actual = get_readback_uint(&rb, j, 0, 0);
+            printf("SER_VALUE case=%s word=%u expected=%u actual=%u\n", c->name, j, c->expected[j], actual);
+            ok(actual == c->expected[j], "%s word %u expected %u got %u.\n", c->name, j, c->expected[j], actual);
+        }
+        release_resource_readback(&rb);
+        reset_command_list(context.context.list, context.context.allocator);
+        ID3D12Resource_Release(output);
+        ID3D12Resource_Release(sbt);
+        ID3D12StateObject_Release(pso);
+        ++executed;
+    }
+    printf("SER_CASES executed=%u expected=%u\n", executed, filter ? 1u : (UINT)ARRAY_SIZE(cases));
+    ok(executed == (filter ? 1u : ARRAY_SIZE(cases)), "All requested SER cases must dispatch and read back.\n");
+    ser_dump_modules();
+    ID3D12RootSignature_Release(local_rs);
+    destroy_rt_geometry(&rt_geom);
+    destroy_test_geometry(&geom);
+    destroy_raytracing_test_context(&context);
+}
