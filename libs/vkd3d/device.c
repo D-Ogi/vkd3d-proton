@@ -10665,6 +10665,7 @@ static void vkd3d_compute_shader_interface_key(struct d3d12_device *device)
     key = hash_fnv1_iterate_u32(key, device->d3d12_caps.options1.WaveLaneCountMin);
     key = hash_fnv1_iterate_u32(key, device->d3d12_caps.options1.WaveLaneCountMax);
     key = hash_fnv1_iterate_u32(key, device->bindless_state.flags);
+    key = hash_fnv1_iterate_u32(key, device->bindless_state.packed_metadata_offset);
     key = hash_fnv1_iterate_u32(key, device->device_info.robustness2_properties.robustStorageBufferAccessSizeAlignment);
 
     if (d3d12_device_use_descriptor_heap(device))

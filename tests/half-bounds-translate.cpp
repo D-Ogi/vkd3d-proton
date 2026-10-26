@@ -26,7 +26,7 @@ static dxil_spv_bool uav(void *, const dxil_spv_uav_d3d_binding *d, dxil_spv_uav
 }
 int main(int argc, char **argv)
 {
-    if (argc != 4 && argc != 5) return 2;
+    if (argc < 4 || argc > 7) return 2;
     FILE *f = fopen(argv[1], "rb"); if (!f) return 3;
     fseek(f, 0, SEEK_END); long size = ftell(f); rewind(f);
     std::vector<char> bytes(size); if (fread(bytes.data(), 1, size, f) != size) return 4; fclose(f);
@@ -40,10 +40,21 @@ int main(int argc, char **argv)
     dxil_spv_option_scalar_block_layout scalar{{DXIL_SPV_OPTION_SCALAR_BLOCK_LAYOUT}, 1, 1};
     if (dxil_spv_converter_add_option(converter, &alignment.base) ||
         dxil_spv_converter_add_option(converter, &scalar.base)) return 7;
-    if (argc == 5) {
+    if (argc >= 5) {
         dxil_spv_option_ssbo_robustness_size_alignment granularity{
             {DXIL_SPV_OPTION_SSBO_ROBUSTNESS_SIZE_ALIGNMENT}, unsigned(atoi(argv[4]))};
         if (dxil_spv_converter_add_option(converter, &granularity.base)) return 12;
+    }
+    if (argc >= 6) {
+        dxil_spv_option_ssbo_exact_size_metadata metadata{
+            {DXIL_SPV_OPTION_SSBO_EXACT_SIZE_METADATA}, unsigned(atoi(argv[5]))};
+        dxil_spv_option_physical_address_descriptor_indexing layout{
+            {DXIL_SPV_OPTION_PHYSICAL_ADDRESS_DESCRIPTOR_INDEXING}, 8, 0};
+        if (dxil_spv_converter_add_option(converter, &metadata.base) ||
+            dxil_spv_converter_add_option(converter, &layout.base)) return 13;
+        dxil_spv_converter_set_meta_descriptor(converter, DXIL_SPV_META_DESCRIPTOR_RAW_DESCRIPTOR_HEAP_VIEW,
+                argc == 7 ? DXIL_SPV_META_DESCRIPTOR_KIND_UBO_CONTAINING_BDA :
+                            DXIL_SPV_META_DESCRIPTOR_KIND_READONLY_SSBO, 2, 0);
     }
     if (dxil_spv_converter_run(converter)) return 8;
     dxil_spv_compiled_spirv spirv{};

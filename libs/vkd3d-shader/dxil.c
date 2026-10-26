@@ -308,7 +308,10 @@ static dxil_spv_bool dxil_remap(const struct vkd3d_dxil_remap_userdata *remap,
     remap_info.shader_interface_flags = shader_interface_info->flags;
     remap_info.min_ssbo_alignment = shader_interface_info->min_ssbo_alignment;
     remap_info.quirks = remap->quirks;
-    remap_info.skip_heap_lowering = remap->skip_heap_lowering;
+    remap_info.skip_heap_lowering = remap->skip_heap_lowering ||
+            (shader_interface_info->ssbo_exact_size_metadata_offset &&
+             d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_STRUCTURED_BUFFER &&
+             d3d_binding->alignment < shader_interface_info->ssbo_robustness_size_alignment);
     remap_info.local_root_signature = false;
 
     if (!dxil_remap_inner(&remap_info, descriptor_type, d3d_binding, vk_binding, resource_flags))
@@ -839,6 +842,14 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
             ERR("dxil-spirv does not support SSBO_ROBUSTNESS_SIZE_ALIGNMENT.\n");
             return VKD3D_ERROR_NOT_IMPLEMENTED;
         }
+    }
+
+    if (shader_interface_info->ssbo_exact_size_metadata_offset)
+    {
+        struct dxil_spv_option_ssbo_exact_size_metadata helper =
+                {{DXIL_SPV_OPTION_SSBO_EXACT_SIZE_METADATA}, shader_interface_info->ssbo_exact_size_metadata_offset};
+        if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
+            return VKD3D_ERROR_NOT_IMPLEMENTED;
     }
 
     if (shader_interface_info->flags & VKD3D_SHADER_INTERFACE_PUSH_CONSTANTS_AS_UNIFORM_BUFFER)

@@ -6780,6 +6780,13 @@ static void vkd3d_create_buffer_srv_heap(vkd3d_cpu_descriptor_va_t desc_va,
         }
     }
 
+    if (bindless->flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA)
+    {
+        uint32_t exact_range = resource && desc->ViewDimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE ? view.range : 0;
+        memcpy(stack_payload + bindless->packed_metadata_offset +
+                offsetof(struct vkd3d_descriptor_metadata_view, info.buffer.range), &exact_range, sizeof(exact_range));
+    }
+
     memcpy(d.payload, stack_payload, bindless->cbv_srv_uav_size);
 }
 
@@ -6821,6 +6828,9 @@ static void vkd3d_create_buffer_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
         /* We prepare a packed NULL descriptor that contains both texel buffer and SSBO. */
         d3d12_descriptor_heap_write_null_descriptor_template_embedded(device, desc_va,
                 VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
+        if (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA)
+            memset(d.payload + device->bindless_state.packed_metadata_offset +
+                    offsetof(struct vkd3d_descriptor_metadata_view, info.buffer.range), 0, sizeof(uint32_t));
         return;
     }
 
@@ -6886,6 +6896,9 @@ static void vkd3d_create_buffer_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
     VK_CALL(vkGetDescriptorEXT(device->vk_device, &get_info,
             device->device_info.descriptor_buffer_properties.robustUniformTexelBufferDescriptorSize,
             d.payload));
+    if (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA)
+        memcpy(d.payload + device->bindless_state.packed_metadata_offset +
+                offsetof(struct vkd3d_descriptor_metadata_view, info.buffer.range), &view.range, sizeof(view.range));
 }
 
 static void vkd3d_create_buffer_srv(vkd3d_cpu_descriptor_va_t desc_va,

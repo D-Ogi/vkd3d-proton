@@ -3100,6 +3100,10 @@ static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_sta
     shader_interface->min_ssbo_alignment = d3d12_device_get_ssbo_alignment(device);
     shader_interface->ssbo_robustness_size_alignment =
             device->device_info.robustness2_properties.robustStorageBufferAccessSizeAlignment;
+    shader_interface->ssbo_exact_size_metadata_offset =
+            (device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA) ?
+            device->bindless_state.packed_metadata_offset +
+            offsetof(struct vkd3d_descriptor_metadata_view, info.buffer.range) : 0;
     shader_interface->descriptor_tables.offset = root_signature->descriptor_table_offset;
     shader_interface->descriptor_tables.count = root_signature->descriptor_table_count;
     shader_interface->bindings = root_signature->bindings;

@@ -10,7 +10,8 @@ import json
 import re
 from pathlib import Path
 
-def check(path, tail=False, extended=False):
+def check(path, tail=False, extended=False, scalar=False):
+    strides = [2,6,10,14,32,0] if scalar else [10,12,14,16,32,0]
     source = path.read_text()
     instructions = {}
     accesses = []
@@ -27,7 +28,7 @@ def check(path, tail=False, extended=False):
         elif t[0] == 'OpDecorate' and t[2] == 'DescriptorSet':
             sets[t[1]] = int(t[3])
     results = []
-    for count in ((5, 6, 429496729, 306783377) if extended else (5, 6)):
+    for count in ((1, 5, 6, 429496729, 306783377) if extended else (5, 6)):
         for thread in (sorted(set((0, 4, 5, count - 1, count, count + 1, 0xffffffff))) if extended else range(6)):
             cache = {}
             def value(id):
@@ -54,8 +55,16 @@ def check(path, tail=False, extended=False):
                     elif sets.get(root) == 1:
                         assert ix[0] == 0
                         descriptor = ix[1]
-                        stride = [10,12,14,16,32,0][descriptor % 6]
+                        stride = strides[descriptor % 6]
                         v = [0, stride * (count if descriptor >= 6 else count - 1)]
+                    elif sets.get(root) == 2:
+                        if ix == [0]:
+                            # UBO containing the raw descriptor heap's BDA.
+                            v = (root, [])
+                        else:
+                            assert ix[0] == 0 and ix[2:] in ([0, 13], [0, 6, 1])
+                            descriptor = ix[1]
+                            v = strides[descriptor % 6] * (count if descriptor >= 6 else count - 1)
                     else:
                         raise ValueError(('Unexpected address load', root, ix))
                 elif op == 'OpGroupNonUniformBroadcastFirst':
@@ -66,7 +75,7 @@ def check(path, tail=False, extended=False):
                     root, ix = value(a[1])
                     assert sets.get(root) == 0 and len(ix) == 1 and a[2] == '0'
                     descriptor = ix[0]
-                    stride = [10,12,14,16,32,0][descriptor % 6]
+                    stride = strides[descriptor % 6]
                     n = count if descriptor >= 6 else count - 1
                     v = ((stride * n + 3) & ~3) // 2
                 elif op in ('OpIAdd', 'OpIMul', 'OpShiftRightLogical', 'OpULessThan', 'OpUDiv'):
@@ -84,7 +93,7 @@ def check(path, tail=False, extended=False):
                     raise ValueError(('Unsupported address instruction', id, op, a))
                 cache[id] = v
                 return v
-            actual = {0: [], 2: [], 6: [], 8: []}
+            actual = {d: [] for d in ((0,6) if scalar else (0,2,6,8))}
             for pointer in accesses:
                 # Resolve only the descriptor-array prefix before examining its offset.
                 pointer_op, args = instructions[pointer]
@@ -99,7 +108,7 @@ def check(path, tail=False, extended=False):
                 _, full_ix = value(pointer)
                 assert len(full_ix) == 3 and full_ix[1] == 0
                 descriptor = full_ix[0]
-                stride = 10 if descriptor % 6 == 0 else 14
+                stride = strides[descriptor % 6]
                 elements = count if descriptor >= 6 else count - 1
                 if elements * stride > 0xfffffffc: continue
                 pointer_type = args[0]
@@ -113,7 +122,7 @@ def check(path, tail=False, extended=False):
                     if component_offset + 2 <= ((elements * stride + 3) & ~3):
                         actual[descriptor].append(component_offset)
             for descriptor, offsets in actual.items():
-                stride = 10 if descriptor % 6 == 0 else 14
+                stride = strides[descriptor % 6]
                 elements = count if descriptor >= 6 else count - 1
                 if elements * stride > 0xfffffffc: continue
                 expected = list(range(thread * stride, (thread + 1) * stride, 2)) if thread < elements else []
@@ -134,13 +143,14 @@ if __name__ == '__main__':
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--tail', action='store_true')
     p.add_argument('--extended', action='store_true')
+    p.add_argument('--scalar', action='store_true')
     a = p.parse_args()
-    results = [check(a.old, a.tail, a.extended), check(a.fixed, a.tail, a.extended)]
+    results = [check(a.old, a.tail, a.extended, a.scalar), check(a.fixed, a.tail, a.extended, a.scalar)]
     a.output.write_text(json.dumps(results, indent=2))
     for result in results:
         print(result['file'], 'failures', result['failures'], 'cases', len(result['cases']))
         for case in result['cases']:
             if not case['passed']: print(case)
     if not a.extended:
-        assert results[0]['failures'] == (0 if a.tail else 8), 'Old source must reproduce unsafe loads/stores at both bases'
+        assert results[0]['failures'] == (0 if a.tail else 4 if a.scalar else 8), 'Old source must reproduce unsafe loads/stores at both bases'
     assert results[1]['failures'] == 0, 'Fixed option must preserve all valid stores and drop OOB stores'

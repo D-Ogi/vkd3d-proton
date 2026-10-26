@@ -1946,6 +1946,10 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
     shader_interface_info.min_ssbo_alignment = d3d12_device_get_ssbo_alignment(object->device);
     shader_interface_info.ssbo_robustness_size_alignment =
             object->device->device_info.robustness2_properties.robustStorageBufferAccessSizeAlignment;
+    shader_interface_info.ssbo_exact_size_metadata_offset =
+            (object->device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA) ?
+            object->device->bindless_state.packed_metadata_offset +
+            offsetof(struct vkd3d_descriptor_metadata_view, info.buffer.range) : 0;
 
     /* Effectively ignored. */
     shader_interface_info.stage = VK_SHADER_STAGE_ALL;
