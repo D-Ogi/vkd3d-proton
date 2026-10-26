@@ -35,7 +35,11 @@ for name in names:
         if name == 'BoundRoot': source = here / 'ser_values_bound_root.lib_6_9.hlsl'
         if name == 'ser_values_support': source = here / 'ser_values_support.lib_6_9.hlsl'
         cmd = run([a.dxc, '-T', 'lib_6_9', '-HV', '2021', '-Fo', binary, source])
-    validation = run([a.dxc.parent / 'dxv.exe', binary])
+    signed = binary.with_suffix('.signed.dxil')
+    validation = run([a.dxc.parent / 'dxv.exe', binary, '-o=' + str(signed)])
+    binary.write_bytes(signed.read_bytes())
+    if binary.read_bytes()[4:20] == bytes(16):
+        raise RuntimeError(f'Validator did not sign {binary}')
     records.append(dict(source=str(source), source_sha256=sha(source), binary=str(binary),
                         binary_sha256=sha(binary), command=cmd, validation=validation))
     data = binary.read_bytes()
