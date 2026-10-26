@@ -1083,6 +1083,7 @@ static ID3D12StateObject *rt_pso_factory_compile(struct raytracing_test_context 
     D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION *assoc;
     D3D12_STATE_OBJECT_DESC desc;
     ID3D12StateObject *rt_pso;
+    HRESULT hr;
     size_t i;
 
     memset(&desc, 0, sizeof(desc));
@@ -1101,7 +1102,28 @@ static ID3D12StateObject *rt_pso_factory_compile(struct raytracing_test_context 
     }
 
     rt_pso = NULL;
-    ID3D12Device5_CreateStateObject(context->device5, &desc, &IID_ID3D12StateObject, (void **)&rt_pso);
+    hr = ID3D12Device5_CreateStateObject(context->device5, &desc, &IID_ID3D12StateObject, (void **)&rt_pso);
+    if (FAILED(hr))
+    {
+        ID3D12InfoQueue *queue;
+        printf("CreateStateObject HRESULT=%#lx\n", (unsigned long)hr);
+        if (SUCCEEDED(ID3D12Device5_QueryInterface(context->device5, &IID_ID3D12InfoQueue, (void **)&queue)))
+        {
+            UINT64 n, count = ID3D12InfoQueue_GetNumStoredMessages(queue);
+            for (n = 0; n < count; ++n)
+            {
+                SIZE_T bytes = 0;
+                D3D12_MESSAGE *message;
+                ID3D12InfoQueue_GetMessage(queue, n, NULL, &bytes);
+                if (!bytes || !(message = malloc(bytes))) continue;
+                if (SUCCEEDED(ID3D12InfoQueue_GetMessage(queue, n, message, &bytes)))
+                    printf("D3D12_MESSAGE id=%u severity=%u %s\n", message->ID, message->Severity, message->pDescription);
+                free(message);
+            }
+            ID3D12InfoQueue_ClearStoredMessages(queue);
+            ID3D12InfoQueue_Release(queue);
+        }
+    }
 
     free(factory->subobjects);
     for (i = 0; i < factory->allocs_count; i++)
@@ -5981,7 +6003,7 @@ void test_shader_execution_reordering_values(void)
         rt_pso_factory_init(&factory);
         rt_pso_factory_add_default_node_mask(&factory);
         rt_pso_factory_add_pipeline_config(&factory, 1);
-        rt_pso_factory_add_shader_config(&factory, 4, 8);
+        rt_pso_factory_add_shader_config(&factory, 8, 4);
         rt_pso_factory_add_global_root_signature(&factory, context.context.root_signature);
         j = rt_pso_factory_add_local_root_signature(&factory, local_rs);
         rt_pso_factory_add_subobject_to_exports_association(&factory, j, 1, &exports[3]);
