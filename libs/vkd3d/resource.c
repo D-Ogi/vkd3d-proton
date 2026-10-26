@@ -7889,6 +7889,12 @@ static void vkd3d_create_buffer_uav_heap(vkd3d_cpu_descriptor_va_t desc_va, stru
     if (d.metadata)
         d.metadata->info.buffer = view;
 
+    /* Shader-visible handles omit the CPU metadata pointer, but narrow
+     * structured accesses still consume the exact range from the payload. */
+    if (bindless->flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA)
+        memcpy(stack_payload + bindless->packed_metadata_offset +
+                offsetof(struct vkd3d_descriptor_metadata_view, info.buffer.range), &view.range, sizeof(view.range));
+
     memcpy(d.payload, stack_payload, bindless->cbv_srv_uav_size);
 }
 
