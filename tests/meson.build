@@ -54,11 +54,11 @@ executable('d3d12', d3d12_test_src,
   link_with           : [ d3d12_test_utils_lib ])
 
 if vkd3d_platform == 'windows'
-executable('ser-values', ['ser-values.c', 'd3d12_raytracing.c'],
+executable('ser-values', ['ser-values.c', 'ser-diagnostics.cpp', 'd3d12_raytracing.c'],
   dependencies        : vkd3d_test_deps,
   include_directories : vkd3d_private_includes,
   install             : false,
-  c_args              : vkd3d_test_flags,
+  c_args              : vkd3d_test_flags + ['-DSER_DIAGNOSTIC_CLIENT'],
   link_with           : [ d3d12_test_utils_lib ])
 endif
 

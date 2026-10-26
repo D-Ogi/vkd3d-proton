@@ -1105,24 +1105,11 @@ static ID3D12StateObject *rt_pso_factory_compile(struct raytracing_test_context 
     hr = ID3D12Device5_CreateStateObject(context->device5, &desc, &IID_ID3D12StateObject, (void **)&rt_pso);
     if (FAILED(hr))
     {
-        ID3D12InfoQueue *queue;
         printf("CreateStateObject HRESULT=%#lx\n", (unsigned long)hr);
-        if (SUCCEEDED(ID3D12Device5_QueryInterface(context->device5, &IID_ID3D12InfoQueue, (void **)&queue)))
-        {
-            UINT64 n, count = ID3D12InfoQueue_GetNumStoredMessages(queue);
-            for (n = 0; n < count; ++n)
-            {
-                SIZE_T bytes = 0;
-                D3D12_MESSAGE *message;
-                ID3D12InfoQueue_GetMessage(queue, n, NULL, &bytes);
-                if (!bytes || !(message = malloc(bytes))) continue;
-                if (SUCCEEDED(ID3D12InfoQueue_GetMessage(queue, n, message, &bytes)))
-                    printf("D3D12_MESSAGE id=%u severity=%u %s\n", message->ID, message->Severity, message->pDescription);
-                free(message);
-            }
-            ID3D12InfoQueue_ClearStoredMessages(queue);
-            ID3D12InfoQueue_Release(queue);
-        }
+#ifdef SER_DIAGNOSTIC_CLIENT
+        void ser_dump_infoqueue(void *device);
+        ser_dump_infoqueue(context->device5);
+#endif
     }
 
     free(factory->subobjects);
