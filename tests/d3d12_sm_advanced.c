@@ -8064,8 +8064,10 @@ static void test_sm69_long_vector_load_store_inner(bool root_desc)
         return;
     }
 
-    if (FAILED(ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS22, &options22, sizeof(options22))) ||
-        !options22.CreateByteOffsetViewsSupported)
+    /* Root descriptors use GPU virtual addresses, not byte-offset views. */
+    if (!root_desc && (FAILED(ID3D12Device_CheckFeatureSupport(context.device,
+            D3D12_FEATURE_D3D12_OPTIONS22, &options22, sizeof(options22))) ||
+            !options22.CreateByteOffsetViewsSupported))
     {
         skip("ByteOffset views not supported.\n");
         destroy_test_context(&context);

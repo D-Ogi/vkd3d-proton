@@ -32,8 +32,8 @@
 #include "d3d12_tests.h"
 #undef decl_test
 
-/* Uncomment when testing against Agility SDK debug layers. */
-#if 0
+/* This test build uses the accompanying Agility SDK 619 runtime. */
+#if 1
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 619;
 __declspec(dllexport) extern const char *D3D12SDKPath = u8".\\D3D12\\";
 #endif
