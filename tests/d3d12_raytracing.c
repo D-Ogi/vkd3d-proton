@@ -5937,7 +5937,7 @@ void test_shader_execution_reordering_values(void)
         {"loop31", u"LoopLive", &ser_LoopLive, 31, 0, 2, {3621, 123}},
         {"array0", u"ArrayLive", &ser_ArrayLive, 0, 0, 1, {111}},
         {"array1", u"ArrayLive", &ser_ArrayLive, 0, 1, 1, {123}},
-        {"helper", u"HelperLive", &ser_HelperLive, 0, 0, 2, {111, 123}},
+        {"helper", u"HelperLive", &ser_HelperLive, 0, 1, 2, {111, 123}},
         {"hint", u"HintOnly", &ser_HintOnly, 0, 0, 1, {100}},
     };
     struct raytracing_test_context context;
