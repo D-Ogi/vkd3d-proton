@@ -1944,6 +1944,8 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
 
     memset(&shader_interface_info, 0, sizeof(shader_interface_info));
     shader_interface_info.min_ssbo_alignment = d3d12_device_get_ssbo_alignment(object->device);
+    shader_interface_info.ssbo_robustness_size_alignment =
+            object->device->device_info.robustness2_properties.robustStorageBufferAccessSizeAlignment;
 
     /* Effectively ignored. */
     shader_interface_info.stage = VK_SHADER_STAGE_ALL;

@@ -4124,6 +4124,8 @@ static HRESULT d3d12_wg_state_object_convert_entry_point(
     memset(&shader_interface_local_info, 0, sizeof(shader_interface_local_info));
 
     shader_interface_info.min_ssbo_alignment = d3d12_device_get_ssbo_alignment(object->device);
+    shader_interface_info.ssbo_robustness_size_alignment =
+            object->device->device_info.robustness2_properties.robustStorageBufferAccessSizeAlignment;
 
     shader_interface_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     shader_interface_info.xfb_info = NULL;

@@ -3098,6 +3098,8 @@ static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_sta
     memset(shader_interface, 0, sizeof(*shader_interface));
     shader_interface->flags = d3d12_root_signature_get_shader_interface_flags(root_signature, state->pipeline_type);
     shader_interface->min_ssbo_alignment = d3d12_device_get_ssbo_alignment(device);
+    shader_interface->ssbo_robustness_size_alignment =
+            device->device_info.robustness2_properties.robustStorageBufferAccessSizeAlignment;
     shader_interface->descriptor_tables.offset = root_signature->descriptor_table_offset;
     shader_interface->descriptor_tables.count = root_signature->descriptor_table_count;
     shader_interface->bindings = root_signature->bindings;

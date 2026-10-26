@@ -297,6 +297,7 @@ struct vkd3d_shader_interface_info
 {
     unsigned int flags; /* vkd3d_shader_interface_flags */
     unsigned int min_ssbo_alignment;
+    unsigned int ssbo_robustness_size_alignment;
     unsigned int patch_location_offset;
 
     struct vkd3d_shader_descriptor_table_buffer descriptor_tables;

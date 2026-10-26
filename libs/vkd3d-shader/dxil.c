@@ -830,6 +830,17 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
         }
     }
 
+    {
+        struct dxil_spv_option_ssbo_robustness_size_alignment helper =
+                { { DXIL_SPV_OPTION_SSBO_ROBUSTNESS_SIZE_ALIGNMENT },
+                    max(1u, shader_interface_info->ssbo_robustness_size_alignment) };
+        if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
+        {
+            ERR("dxil-spirv does not support SSBO_ROBUSTNESS_SIZE_ALIGNMENT.\n");
+            return VKD3D_ERROR_NOT_IMPLEMENTED;
+        }
+    }
+
     if (shader_interface_info->flags & VKD3D_SHADER_INTERFACE_PUSH_CONSTANTS_AS_UNIFORM_BUFFER)
     {
         const struct dxil_spv_option_root_constant_inline_uniform_block helper =
