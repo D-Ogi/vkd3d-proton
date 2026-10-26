@@ -6000,7 +6000,9 @@ void test_shader_execution_reordering_values(void)
         rt_pso_factory_add_hit_group(&factory, &hit);
         rt_pso_factory_add_dxil_library(&factory, *c->code, 0, NULL);
         rt_pso_factory_add_dxil_library(&factory, ser_ser_values_support, 0, NULL);
+        printf("SER_PHASE case=%s phase=pipeline-begin\n", c->name); fflush(stdout);
         pso = rt_pso_factory_compile(&context, &factory, D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+        printf("SER_PHASE case=%s phase=pipeline-end result=%s\n", c->name, pso ? "created" : "failed"); fflush(stdout);
         ok(!!pso, "%s pipeline creation.\n", c->name);
         if (!pso) continue;
         if (FAILED(ID3D12StateObject_QueryInterface(pso, &IID_ID3D12StateObjectProperties, (void **)&props)))
@@ -6027,14 +6029,18 @@ void test_shader_execution_reordering_values(void)
         dispatch.CallableShaderTable.StartAddress = dispatch.RayGenerationShaderRecord.StartAddress + 256;
         dispatch.CallableShaderTable.SizeInBytes = dispatch.CallableShaderTable.StrideInBytes = 64;
         dispatch.Width = dispatch.Height = dispatch.Depth = 1;
+        printf("SER_PHASE case=%s phase=record-begin\n", c->name); fflush(stdout);
         ID3D12GraphicsCommandList4_SetComputeRootSignature(context.list4, context.context.root_signature);
         ID3D12GraphicsCommandList4_SetPipelineState1(context.list4, pso);
         ID3D12GraphicsCommandList4_SetComputeRootUnorderedAccessView(context.list4, 0, ID3D12Resource_GetGPUVirtualAddress(output));
         ID3D12GraphicsCommandList4_SetComputeRootShaderResourceView(context.list4, 1, ID3D12Resource_GetGPUVirtualAddress(rt_geom.top_rtas.rtas));
         ID3D12GraphicsCommandList4_SetComputeRoot32BitConstants(context.list4, 2, 4, values, 0);
         ID3D12GraphicsCommandList4_DispatchRays(context.list4, &dispatch);
+        printf("SER_PHASE case=%s phase=record-end\n", c->name); fflush(stdout);
         transition_resource_state(context.context.list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        printf("SER_PHASE case=%s phase=readback-begin\n", c->name); fflush(stdout);
         get_buffer_readback_with_command_list(output, DXGI_FORMAT_UNKNOWN, &rb, context.context.queue, context.context.list);
+        printf("SER_PHASE case=%s phase=readback-end\n", c->name); fflush(stdout);
         for (j = 0; j < c->count; ++j)
         {
             UINT actual = get_readback_uint(&rb, j, 0, 0);
