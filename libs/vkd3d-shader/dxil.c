@@ -1493,6 +1493,17 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
         }
     }
 
+    else if (shader_interface_info->ssbo_exact_size_metadata_offset)
+    {
+        /* The embedded descriptor-buffer path already binds the raw heap as
+         * its VA auxiliary SSBO, even when no RTAS range appears in the shader. */
+        dxil_spv_converter_set_meta_descriptor(converter,
+                DXIL_SPV_META_DESCRIPTOR_RAW_DESCRIPTOR_HEAP_VIEW,
+                DXIL_SPV_META_DESCRIPTOR_KIND_READONLY_SSBO,
+                shader_interface_info->exact_size_metadata_binding.set,
+                shader_interface_info->exact_size_metadata_binding.binding);
+    }
+
     return VKD3D_OK;
 }
 

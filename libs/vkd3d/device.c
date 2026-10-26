@@ -10677,7 +10677,8 @@ static void vkd3d_compute_shader_interface_key(struct d3d12_device *device)
 
         /* We only get to know this very late after we've checked quirk override files and workaround setup. */
         if (!d3d12_descriptor_heap_require_padding_descriptors(device) &&
-                !device->bindless_state.heap.uav_counter_embedded_offset)
+                !device->bindless_state.heap.uav_counter_embedded_offset &&
+                !(device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA))
         {
             INFO("Disabling heap redzone.\n");
             device->bindless_state.heap.redzone_size = 0;

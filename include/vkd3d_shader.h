@@ -299,6 +299,7 @@ struct vkd3d_shader_interface_info
     unsigned int min_ssbo_alignment;
     unsigned int ssbo_robustness_size_alignment;
     unsigned int ssbo_exact_size_metadata_offset;
+    struct vkd3d_shader_descriptor_binding exact_size_metadata_binding;
     unsigned int patch_location_offset;
 
     struct vkd3d_shader_descriptor_table_buffer descriptor_tables;

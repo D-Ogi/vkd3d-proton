@@ -4130,6 +4130,8 @@ static HRESULT d3d12_wg_state_object_convert_entry_point(
             (object->device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA) ?
             object->device->bindless_state.packed_metadata_offset +
             offsetof(struct vkd3d_descriptor_metadata_view, info.buffer.range) : 0;
+    vkd3d_bindless_state_find_binding(&object->device->bindless_state,
+            VKD3D_BINDLESS_SET_EXTRA_RAW_VA_AUX_BUFFER, &shader_interface_info.exact_size_metadata_binding);
 
     shader_interface_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     shader_interface_info.xfb_info = NULL;
