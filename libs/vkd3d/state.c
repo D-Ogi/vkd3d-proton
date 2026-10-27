@@ -8493,7 +8493,7 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
     {
         pipeline_key.view_id = dyn_state->view_id;
         pipeline_key.view_layer_count = dyn_state->view_layer_count;
-        pipeline_key.view_viewport_count = dyn_state->viewport_count;
+        pipeline_key.view_viewport_count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     }
 
     if (!(graphics->pipeline_dynamic_states & VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES))

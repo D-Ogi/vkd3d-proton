@@ -9308,6 +9308,12 @@ static VKD3D_NOINLINE void d3d12_command_list_bind_vertex_buffers_by_address(str
     VK_CALL(vkCmdBindVertexBuffers3KHR(list->cmd.vk_command_buffer, first, count, infos));
 }
 
+static bool d3d12_pipeline_state_uses_viewport_array(const struct d3d12_pipeline_state *state)
+{
+    return state && d3d12_pipeline_state_is_graphics(state) &&
+            (state->graphics.multiview.count || state->graphics.multiview.dynamic_data);
+}
+
 static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *list)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
@@ -9359,12 +9365,19 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
                 graphics->rs_conservative_info.conservativeRasterizationMode));
     }
 
-    if (dyn_state->viewport_count)
+    if (dyn_state->viewport_count || d3d12_pipeline_state_uses_viewport_array(list->state))
     {
+        const unsigned int viewport_count = d3d12_pipeline_state_uses_viewport_array(list->state) ?
+                D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE : dyn_state->viewport_count;
         if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_VIEWPORT)
         {
-            VK_CALL(vkCmdSetViewportWithCount(list->cmd.vk_command_buffer,
-                    dyn_state->viewport_count, dyn_state->viewports));
+            VkViewport viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            memcpy(viewports, dyn_state->viewports, dyn_state->viewport_count * sizeof(*viewports));
+            /* Indices below the API maximum are not clamped to a bound slot.
+             * Unbound slots rasterize nothing through their empty scissors. */
+            for (i = dyn_state->viewport_count; i < viewport_count; ++i)
+                viewports[i] = (VkViewport){0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+            VK_CALL(vkCmdSetViewportWithCount(list->cmd.vk_command_buffer, viewport_count, viewports));
         }
 
         if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_SCISSOR)
@@ -9402,8 +9415,10 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
                 clamped_scissors[i].extent.height = min(scissor->extent.height, (uint32_t)(bottom_right.y - top_left.y));
             }
 
+            for (i = dyn_state->viewport_count; i < viewport_count; ++i)
+                clamped_scissors[i] = (VkRect2D){{0, 0}, {0, 0}};
             VK_CALL(vkCmdSetScissorWithCount(list->cmd.vk_command_buffer,
-                    dyn_state->viewport_count, clamped_scissors));
+                    viewport_count, clamped_scissors));
         }
     }
     else
@@ -10195,7 +10210,7 @@ static struct d3d12_view_draw_scope d3d12_command_list_begin_view_draw(
     if (list->state->graphics.multiview.dynamic_data && !list->state->graphics.multiview.count)
     {
         const struct bc250_pgp_view_data data = {0, 0, 0, list->fb_layer_count,
-                list->dynamic_state.viewport_count};
+                D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE};
         /* A reusable pixel library may read ViewID even without a view
          * description. Snapshot zero for this draw, after older DGC work. */
         d3d12_command_list_flush_dgc_batch(list);
@@ -10241,7 +10256,7 @@ static void d3d12_command_list_select_view(struct d3d12_command_list *list,
     {
         const D3D12_VIEW_INSTANCE_LOCATION *loc = &scope->parent->graphics.multiview.locations[view];
         const struct bc250_pgp_view_data data = {view, loc->RenderTargetArrayIndex,
-                loc->ViewportArrayIndex, list->fb_layer_count, list->dynamic_state.viewport_count};
+                loc->ViewportArrayIndex, list->fb_layer_count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE};
         /* ExecuteIndirect can defer one view's draws. Submit that batch while
          * its old snapshot is still selected, before advancing to this view. */
         d3d12_command_list_flush_dgc_batch(list);
@@ -14347,6 +14362,10 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPipelineState(d3d12_command_
 
     if (list->state == state)
         return;
+
+    if (d3d12_pipeline_state_uses_viewport_array(list->state) !=
+            d3d12_pipeline_state_uses_viewport_array(state))
+        list->dynamic_state.dirty_flags |= VKD3D_DYNAMIC_STATE_VIEWPORT | VKD3D_DYNAMIC_STATE_SCISSOR;
 
     /* Two linked programs can share all shader libraries and still supply
      * different rasterizers. Equal dynamic-state masks do not imply equal values. */
