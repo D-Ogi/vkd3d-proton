@@ -10189,7 +10189,20 @@ static struct d3d12_view_draw_scope d3d12_command_list_begin_view_draw(
     bool use_fast;
     uint32_t mask, i;
 
-    if (!d3d12_pipeline_state_is_graphics(list->state) || !list->state->graphics.multiview.count)
+    if (!d3d12_pipeline_state_is_graphics(list->state))
+        return scope;
+
+    if (list->state->graphics.multiview.dynamic_data && !list->state->graphics.multiview.count)
+    {
+        const struct bc250_pgp_view_data data = {0, 0, 0, list->fb_layer_count,
+                list->dynamic_state.viewport_count};
+        /* A reusable pixel library may read ViewID even without a view
+         * description. Snapshot zero for this draw, after older DGC work. */
+        d3d12_command_list_flush_dgc_batch(list);
+        list->device->bc250_cmd_set_pgp_view(list->cmd.vk_command_buffer, &data);
+        return scope;
+    }
+    if (!list->state->graphics.multiview.count)
         return scope;
 
     /* Deferred DGC retains an earlier PSO and logical mask. Drain it before
@@ -10224,6 +10237,17 @@ static void d3d12_command_list_select_view(struct d3d12_command_list *list,
 {
     if (!scope->loop)
         return;
+    if (scope->parent->graphics.multiview.dynamic_data)
+    {
+        const D3D12_VIEW_INSTANCE_LOCATION *loc = &scope->parent->graphics.multiview.locations[view];
+        const struct bc250_pgp_view_data data = {view, loc->RenderTargetArrayIndex,
+                loc->ViewportArrayIndex, list->fb_layer_count, list->dynamic_state.viewport_count};
+        /* ExecuteIndirect can defer one view's draws. Submit that batch while
+         * its old snapshot is still selected, before advancing to this view. */
+        d3d12_command_list_flush_dgc_batch(list);
+        list->device->bc250_cmd_set_pgp_view(list->cmd.vk_command_buffer, &data);
+        return;
+    }
     list->dynamic_state.view_id = view;
     list->dynamic_state.view_layer_count = list->fb_layer_count;
     d3d12_command_list_invalidate_current_pipeline(list, false);

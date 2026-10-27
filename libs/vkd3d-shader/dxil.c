@@ -21,6 +21,7 @@
 #define DXIL_SPV_ENABLE_EXPERIMENTAL_WORKGRAPHS
 #define DXIL_SPV_ENABLE_EXPERIMENTAL_MULTIVIEW
 #include "vkd3d_shader_private.h"
+#include "vkd3d_pgp_view.h"
 #include "vkd3d_utf8.h"
 #include "vkd3d_string.h"
 #include "vkd3d_shader_diagnostics.h"
@@ -1448,7 +1449,14 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
                 return VKD3D_ERROR_NOT_IMPLEMENTED;
             }
 
-            if (compiler_args->multiview.draw_loop)
+            if (compiler_args->multiview.dynamic_data)
+            {
+                struct dxil_spv_option_view_instancing_dynamic_data dynamic =
+                        {{ DXIL_SPV_OPTION_VIEW_INSTANCING_DYNAMIC_DATA }, BC250_PGP_VIEW_REVISION};
+                if (dxil_spv_converter_add_option(converter, &dynamic.base) != DXIL_SPV_SUCCESS)
+                    return VKD3D_ERROR_NOT_IMPLEMENTED;
+            }
+            else if (compiler_args->multiview.draw_loop)
             {
                 struct dxil_spv_option_view_instancing_draw_loop loop = {{ DXIL_SPV_OPTION_VIEW_INSTANCING_DRAW_LOOP }};
                 loop.base_spec_id = VKD3D_SHADER_VIEW_DRAW_LOOP_BASE_SPEC_CONSTANT;
@@ -1458,7 +1466,9 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
 
             /* Set a dummy meta descriptor so that dxil-spirv doesn't assert. */
             dxil_spv_converter_set_meta_descriptor(converter, DXIL_SPV_META_DESCRIPTOR_DYNAMIC_VIEW_INSTANCING_OFFSETS,
-                    DXIL_SPV_META_DESCRIPTOR_KIND_UBO_CONTAINING_CONSTANT, 0, 0);
+                    DXIL_SPV_META_DESCRIPTOR_KIND_UBO_CONTAINING_CONSTANT,
+                    compiler_args->multiview.dynamic_data ? BC250_PGP_VIEW_DESCRIPTOR_SET : 0,
+                    compiler_args->multiview.dynamic_data ? BC250_PGP_VIEW_DESCRIPTOR_BINDING : 0);
         }
     }
 

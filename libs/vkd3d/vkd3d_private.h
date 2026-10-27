@@ -33,6 +33,7 @@
 #include "vkd3d_build.h"
 #include "vkd3d_version.h"
 #include "vkd3d_shader.h"
+#include "vkd3d_pgp_view.h"
 #include "vkd3d_threads.h"
 #include "vkd3d_platform.h"
 #include "vkd3d_swapchain_factory.h"
@@ -2425,6 +2426,7 @@ struct d3d12_graphics_pipeline_state
         uint32_t count;
         D3D12_VIEW_INSTANCE_LOCATION locations[D3D12_MAX_VIEW_INSTANCE_COUNT];
         bool draw_loop;
+        bool dynamic_data;
         /* Owned public reference, retained as long as this parent PSO lives. */
         struct d3d12_pipeline_state *fallback;
         uint32_t default_mask;
@@ -2433,6 +2435,7 @@ struct d3d12_graphics_pipeline_state
 
     bool disable_optimization;
     bool partial_mesh_input;
+    bool partial_pipeline; /* Independent GPL composition, never an ordinary noop-FS PSO. */
 };
 
 static inline uint32_t vkd3d_view_mask_to_multiview_mask(
@@ -6592,6 +6595,7 @@ struct d3d12_device
     IAmdExtAntiLagApi IAmdExtAntiLagApi_iface;
     ID3D12DeviceConfiguration1 ID3D12DeviceConfiguration1_iface;
     uint32_t bc250_tir_revisions;
+    PFN_bc250_cmd_set_pgp_view bc250_cmd_set_pgp_view;
     LONG refcount;
 
     VkDevice vk_device;

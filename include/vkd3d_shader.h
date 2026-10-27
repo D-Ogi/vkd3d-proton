@@ -651,6 +651,7 @@ struct vkd3d_shader_compile_arguments
         bool enable;
         bool last_pre_rasterization;
         bool draw_loop;
+        bool dynamic_data;
     } multiview;
 };
 

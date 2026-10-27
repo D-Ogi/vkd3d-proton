@@ -3269,11 +3269,13 @@ static void d3d12_pipeline_state_init_compile_arguments(struct d3d12_pipeline_st
         compile_arguments->output_swizzle_count = state->graphics.rt_count;
     }
 
-    if (stage != VK_SHADER_STAGE_COMPUTE_BIT && state->graphics.multiview.count)
+    if (stage != VK_SHADER_STAGE_COMPUTE_BIT &&
+            (state->graphics.multiview.count || state->graphics.multiview.dynamic_data))
     {
         VkShaderStageFlags active_pre_raster = state->graphics.stage_flags & ~VK_SHADER_STAGE_FRAGMENT_BIT;
         compile_arguments->multiview.enable = true;
         compile_arguments->multiview.draw_loop = state->graphics.multiview.draw_loop;
+        compile_arguments->multiview.dynamic_data = state->graphics.multiview.dynamic_data;
         /* Only last pre-raster stage needs to "support" multiview properly.
          * Other stages can query ViewID. */
         compile_arguments->multiview.last_pre_rasterization =
@@ -5540,7 +5542,7 @@ static bool d3d12_graphics_pipeline_state_needs_noop_fs(
         const struct d3d12_device *device,
         const struct d3d12_graphics_pipeline_state *graphics)
 {
-    return !graphics->partial_exclude_pixel_shader &&
+    return !graphics->partial_pipeline &&
             (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) &&
             !(graphics->stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT) &&
             !VKD3D_CONFIG_FLAG_IS_SET(SKIP_DRIVER_WORKAROUNDS) &&
@@ -5574,6 +5576,21 @@ static bool d3d12_view_instancing_has_shader_location(const struct d3d12_pipelin
         vkd3d_shader_free_shader_signature(&signature);
         if (found)
             return true;
+        if (shaders[i] == &desc->ms)
+        {
+            /* Mesh per-primitive outputs use the patch-constant signature.
+             * A shader-written layer/viewport there needs the same exact
+             * draw-loop route as a per-vertex output. */
+            memset(&signature, 0, sizeof(signature));
+            if (vkd3d_shader_parse_patch_constant_signature(&code, &signature) < 0)
+                return true;
+            for (j = 0; j < signature.element_count; j++)
+                found |= signature.elements[j].sysval_semantic == VKD3D_SV_RENDER_TARGET_ARRAY_INDEX ||
+                        signature.elements[j].sysval_semantic == VKD3D_SV_VIEWPORT_ARRAY_INDEX;
+            vkd3d_shader_free_shader_signature(&signature);
+            if (found)
+                return true;
+        }
     }
     return false;
 }
@@ -6933,6 +6950,19 @@ static HRESULT d3d12_partial_graphics_enable_dynamic_raster(struct d3d12_pipelin
     return S_OK;
 }
 
+/* PGP view state is private draw data, never shader specialization at final
+ * linking. The queried backend owns each command-buffer upload snapshot. */
+static HRESULT d3d12_partial_graphics_enable_dynamic_view(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device)
+{
+    if (!device->bc250_cmd_set_pgp_view)
+        return E_NOTIMPL;
+    state->graphics.multiview.dynamic_data = true;
+    state->graphics.multiview.draw_loop = true;
+    state->graphics.multiview.view_mask = 0;
+    return S_OK;
+}
+
 static HRESULT d3d12_partial_graphics_library_compile_samples(struct d3d12_pipeline_state *source,
         VkGraphicsPipelineLibraryFlagsEXT subsets, struct d3d12_partial_graphics_library **library);
 
@@ -7064,11 +7094,14 @@ static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device 
     if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, &empty_cache, &state->vk_pso_cache)))
         goto fail;
 
-    /* ExcludePS must suppress the ordinary mesh noop-FS workaround before
-     * stage metadata is constructed. The final GPL supplies empty FS state. */
+    /* Independently composed programs must not acquire an ordinary synthetic
+     * shader. A no-PS final GPL supplies empty FS state, with or without ExcludePS. */
+    state->graphics.partial_pipeline = true;
     state->graphics.partial_exclude_pixel_shader = exclude_pixel_shader;
     vkd3d_compile_scope_begin(&scope, device);
     hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, input, !input && !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT));
+    if (SUCCEEDED(hr))
+        hr = d3d12_partial_graphics_enable_dynamic_view(state, device);
     if (SUCCEEDED(hr))
         hr = d3d12_partial_graphics_enable_dynamic_raster(state, device);
     if (SUCCEEDED(hr))
@@ -7662,6 +7695,7 @@ HRESULT d3d12_partial_graphics_libraries_link(struct d3d12_pipeline_state *state
                 !source->root_signature->layout_compatibility_hash ||
                 source->root_signature->layout_compatibility_hash != state->root_signature->layout_compatibility_hash)) ||
                 source->graphics.multiview.view_mask != state->graphics.multiview.view_mask ||
+                source->graphics.multiview.dynamic_data != state->graphics.multiview.dynamic_data ||
                 ((part->subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) &&
                 source->graphics.ms_desc.alphaToCoverageEnable != state->graphics.ms_desc.alphaToCoverageEnable))
             return E_INVALIDARG;
@@ -7746,11 +7780,14 @@ HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
     state->pipeline_cache_compat.root_signature_compat_hash = state->root_signature->pso_compatibility_hash;
     if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, &empty_cache, &state->vk_pso_cache)))
         goto fail;
+    state->graphics.partial_pipeline = true;
     for (i = 0; i < count; ++i)
         state->graphics.partial_exclude_pixel_shader |= parts[i]->source->graphics.partial_exclude_pixel_shader;
     if (FAILED(hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, NULL, false)))
         goto fail;
 
+    if (FAILED(hr = d3d12_partial_graphics_enable_dynamic_view(state, device)))
+        goto fail;
     if (FAILED(hr = d3d12_partial_graphics_enable_dynamic_raster(state, device)))
         goto fail;
     if (FAILED(hr = d3d12_partial_graphics_enable_dynamic_line(state, device, &desc->rasterizer_state)))
@@ -7998,7 +8035,7 @@ static VkPipeline d3d12_pipeline_state_create_pipeline_variant_internal(struct d
                 return VK_NULL_HANDLE;
         /* A changed view mask needs newly compiled preraster pieces. Never
          * silently link an incompatible viewMask or compile a monolithic PSO. */
-        if (key && (graphics->multiview.draw_loop ||
+        if (key && ((graphics->multiview.draw_loop && !graphics->multiview.dynamic_data) ||
                 (graphics->multiview.dynamic_mask && key->view_mask != graphics->multiview.view_mask) ||
                 (key->rasterization_samples && key->rasterization_samples != graphics->ms_desc.rasterizationSamples)))
             return VK_NULL_HANDLE;
@@ -8401,7 +8438,7 @@ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
     }
 
     /* The fallback specializes the logical view and current attachment bounds. */
-    if (graphics->multiview.draw_loop)
+    if (graphics->multiview.draw_loop && !graphics->multiview.dynamic_data)
         return VK_NULL_HANDLE;
 
     /* We also need a fallback pipeline if view instance mask does not match. */
@@ -8443,7 +8480,7 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
 
     pipeline_key.dsv_format = dsv_format ? dsv_format->vk_format : VK_FORMAT_UNDEFINED;
     pipeline_key.view_mask = graphics->multiview.dynamic_mask && !graphics->multiview.draw_loop ? dyn_state->view_mask : 0;
-    if (graphics->multiview.draw_loop)
+    if (graphics->multiview.draw_loop && !graphics->multiview.dynamic_data)
     {
         pipeline_key.view_id = dyn_state->view_id;
         pipeline_key.view_layer_count = dyn_state->view_layer_count;

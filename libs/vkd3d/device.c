@@ -11009,6 +11009,15 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     device->bc250_tir_revisions = bc250_tir_query_revisions(instance->vk_global_procs.vkGetInstanceProcAddr,
             device->vk_physical_device);
 
+    {
+        PFN_bc250_pgp_view_query query = (PFN_bc250_pgp_view_query)
+                instance->vk_global_procs.vkGetInstanceProcAddr(VK_NULL_HANDLE, BC250_PGP_VIEW_QUERY_NAME);
+        PFN_bc250_cmd_set_pgp_view command = NULL;
+        if (query && query(device->vk_physical_device, BC250_PGP_VIEW_REVISION,
+                sizeof(struct bc250_pgp_view_data), &command) == VK_SUCCESS)
+            device->bc250_cmd_set_pgp_view = command;
+    }
+
     if (FAILED(hr = vkd3d_private_store_init(&device->private_store)))
         goto out_free_vk_resources;
 
