@@ -2390,6 +2390,7 @@ struct d3d12_graphics_pipeline_state
     unsigned int forced_sample_count;
     unsigned int partial_fixed_forced_samples;
     bool partial_tir_outputs;
+    bool partial_exclude_pixel_shader;
     VkPipelineDepthStencilStateCreateInfo ds_desc;
     VkPipelineColorBlendStateCreateInfo blend_desc;
 

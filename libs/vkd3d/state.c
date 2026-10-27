@@ -7093,10 +7093,11 @@ static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device 
                 state->graphics.disable_optimization = true;
         state->graphics.pipeline_layout = state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS ?
                 state->root_signature->mesh.vk_pipeline_layout : state->root_signature->graphics.vk_pipeline_layout;
-        /* Missing PS in an independent preraster piece does not mean discard;
-         * a pixel piece can be linked later unless ExcludePS says otherwise. */
+        /* ExcludePS forbids a fragment shader, not depth/stencil rasterization.
+         * The final output state decides whether rasterization is useful. */
+        state->graphics.partial_exclude_pixel_shader = exclude_pixel_shader;
         if (subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT)
-            state->graphics.rs_desc.rasterizerDiscardEnable = exclude_pixel_shader;
+            state->graphics.rs_desc.rasterizerDiscardEnable = VK_FALSE;
         hr = d3d12_pipeline_state_finish_graphics(state);
         finished = SUCCEEDED(hr);
     }
@@ -7485,6 +7486,11 @@ static void d3d12_pipeline_state_log_graphics_state(const struct d3d12_pipeline_
     ERR("Dynamic state: %#x (explicit: %#x)\n", graphics->pipeline_dynamic_states, graphics->explicit_dynamic_states);
 }
 
+static VkPipeline d3d12_pipeline_state_create_pipeline_variant_internal(struct d3d12_pipeline_state *state,
+        const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format,
+        VkPipelineCache vk_cache, VkGraphicsPipelineLibraryFlagsEXT library_flags,
+        uint32_t *dynamic_state_flags, bool record_library_flags);
+
 static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline_state *state,
         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
         uint32_t dynamic_state_flags, enum vkd3d_pipeline_link_policy link_policy,
@@ -7500,6 +7506,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     VkPipelineCreateFlags2CreateInfo flags2;
     struct vkd3d_pipeline_libraries libraries = {0};
     struct bc250_tir_pipeline tir;
+    VkPipeline empty_fragment = VK_NULL_HANDLE;
     VkResult vr;
 
     if (partial_libraries)
@@ -7525,6 +7532,26 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
                 d3d12_device_get_or_create_fragment_output_pipeline(state->device, &fragment_output_desc),
                 VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT))
             return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    /* A depth-only program still needs the fragment-shader library subset for
+     * depth/stencil state, even though it contains no fragment shader code. */
+    if (partial_libraries && !graphics->rs_desc.rasterizerDiscardEnable &&
+            !(libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT))
+    {
+        uint32_t ignored_dynamic_states;
+        if (graphics->stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        empty_fragment = d3d12_pipeline_state_create_pipeline_variant_internal(state, key, dsv_format,
+                vk_cache, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &ignored_dynamic_states, false);
+        if (!empty_fragment)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        if (!vkd3d_pipeline_libraries_add(&libraries, empty_fragment,
+                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT))
+        {
+            state->device->vk_procs.vkDestroyPipeline(state->device->vk_device, empty_fragment, NULL);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
     }
 
     memset(&flags2, 0, sizeof(flags2));
@@ -7568,6 +7595,8 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
      * band (struct vkd3d_pipeline_compile_limiter). */
     vkd3d_driver_cache_probe_begin(&state->device->disk_cache, &probe, &create_info);
     vr = vkd3d_create_graphics_pipeline_limited(state->device, vk_cache, &create_info, &flags2, !!key, vk_pipeline);
+    if (empty_fragment)
+        state->device->vk_procs.vkDestroyPipeline(state->device->vk_device, empty_fragment, NULL);
     vkd3d_driver_cache_probe_end(&state->device->disk_cache, &probe,
             link_policy == VKD3D_PIPELINE_LINK_MINIMAL ? "link-fast" : "link-lto", vk_cache, vr,
             vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key, 0, NULL);
@@ -7639,6 +7668,9 @@ HRESULT d3d12_partial_graphics_libraries_link(struct d3d12_pipeline_state *state
                     (unsigned int)fixed->ms_desc.rasterizationSamples != state->graphics.partial_fixed_forced_samples)
                 return E_INVALIDARG;
         }
+        if (source->graphics.partial_exclude_pixel_shader &&
+                (state->graphics.stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT))
+            return E_INVALIDARG;
         if (source->graphics.partial_tir_outputs && source->graphics.forced_sample_count != state->graphics.forced_sample_count)
             return E_INVALIDARG;
         selected = part->pipeline;
@@ -7656,7 +7688,7 @@ HRESULT d3d12_partial_graphics_libraries_link(struct d3d12_pipeline_state *state
             return E_INVALIDARG;
     }
     if (!(libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) ||
-            (!state->graphics.rs_desc.rasterizerDiscardEnable &&
+            ((state->graphics.stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT) &&
             !(libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) ||
             (state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS &&
             (libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT)))
@@ -7910,9 +7942,10 @@ HRESULT d3d12_partial_graphics_pipeline_link(struct d3d12_pipeline_state *state,
     return S_OK;
 }
 
-VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_state *state,
-        const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
-        VkGraphicsPipelineLibraryFlagsEXT library_flags, uint32_t *dynamic_state_flags)
+static VkPipeline d3d12_pipeline_state_create_pipeline_variant_internal(struct d3d12_pipeline_state *state,
+        const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format,
+        VkPipelineCache vk_cache, VkGraphicsPipelineLibraryFlagsEXT library_flags,
+        uint32_t *dynamic_state_flags, bool record_library_flags)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
     VkDynamicState dynamic_state_buffer[ARRAY_SIZE(vkd3d_dynamic_state_list)];
@@ -8069,7 +8102,8 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         flags2.flags |= VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR |
                 VK_PIPELINE_CREATE_2_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
 
-        graphics->library_flags = library_flags;
+        if (record_library_flags)
+            graphics->library_flags = library_flags;
     }
 
     /* A workaround for SottR, which creates pipelines with DSV_UNKNOWN, but still insists on using a depth buffer.
@@ -8287,7 +8321,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     if (feedback_info.pipelineStageCreationFeedbackCount)
         vkd3d_report_pipeline_creation_feedback_results(&feedback_info);
 
-    if (library_flags)
+    if (library_flags && record_library_flags)
         graphics->library_create_flags = flags2.flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
 err:
@@ -8299,6 +8333,14 @@ err:
     }
 
     return vk_pipeline;
+}
+
+VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_state *state,
+        const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
+        VkGraphicsPipelineLibraryFlagsEXT library_flags, uint32_t *dynamic_state_flags)
+{
+    return d3d12_pipeline_state_create_pipeline_variant_internal(state, key, dsv_format,
+            vk_cache, library_flags, dynamic_state_flags, true);
 }
 
 VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
