@@ -5540,7 +5540,8 @@ static bool d3d12_graphics_pipeline_state_needs_noop_fs(
         const struct d3d12_device *device,
         const struct d3d12_graphics_pipeline_state *graphics)
 {
-    return (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+    return !graphics->partial_exclude_pixel_shader &&
+            (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) &&
             !(graphics->stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT) &&
             !VKD3D_CONFIG_FLAG_IS_SET(SKIP_DRIVER_WORKAROUNDS) &&
             device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV;
@@ -7063,6 +7064,9 @@ static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device 
     if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, &empty_cache, &state->vk_pso_cache)))
         goto fail;
 
+    /* ExcludePS must suppress the ordinary mesh noop-FS workaround before
+     * stage metadata is constructed. The final GPL supplies empty FS state. */
+    state->graphics.partial_exclude_pixel_shader = exclude_pixel_shader;
     vkd3d_compile_scope_begin(&scope, device);
     hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, input, !input && !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT));
     if (SUCCEEDED(hr))
@@ -7742,6 +7746,8 @@ HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
     state->pipeline_cache_compat.root_signature_compat_hash = state->root_signature->pso_compatibility_hash;
     if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, &empty_cache, &state->vk_pso_cache)))
         goto fail;
+    for (i = 0; i < count; ++i)
+        state->graphics.partial_exclude_pixel_shader |= parts[i]->source->graphics.partial_exclude_pixel_shader;
     if (FAILED(hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, NULL, false)))
         goto fail;
 
