@@ -581,16 +581,24 @@ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3
         const char *semantic_name, unsigned int semantic_index)
 {
     struct vkd3d_shader_stage_io_entry *e;
+    char *name;
 
     if (vkd3d_shader_stage_io_map_find(map, semantic_name, semantic_index))
         return NULL;
 
-    if (!vkd3d_array_reserve((void **)&map->entries, &map->entries_size,
-            map->entry_count + 1, sizeof(*map->entries)))
+    if (!(name = vkd3d_strdup(semantic_name)))
         return NULL;
 
+    if (!vkd3d_array_reserve((void **)&map->entries, &map->entries_size,
+            map->entry_count + 1, sizeof(*map->entries)))
+    {
+        vkd3d_free(name);
+        return NULL;
+    }
+
     e = &map->entries[map->entry_count++];
-    e->semantic_name = vkd3d_strdup(semantic_name);
+    memset(e, 0, sizeof(*e));
+    e->semantic_name = name;
     e->semantic_index = semantic_index;
     return e;
 }
@@ -620,6 +628,71 @@ void vkd3d_shader_stage_io_map_free(struct vkd3d_shader_stage_io_map *map)
 
     vkd3d_free(map->entries);
     memset(map, 0, sizeof(*map));
+}
+
+bool vkd3d_shader_stage_io_map_copy(struct vkd3d_shader_stage_io_map *dst,
+        const struct vkd3d_shader_stage_io_map *src)
+{
+    struct vkd3d_shader_stage_io_map copy = {0};
+    struct vkd3d_shader_stage_io_entry *entry;
+    size_t i;
+
+    if (dst == src)
+        return true;
+
+    for (i = 0; i < src->entry_count; ++i)
+    {
+        if (!(entry = vkd3d_shader_stage_io_map_append(&copy,
+                src->entries[i].semantic_name, src->entries[i].semantic_index)))
+        {
+            vkd3d_shader_stage_io_map_free(&copy);
+            return false;
+        }
+        entry->vk_location = src->entries[i].vk_location;
+        entry->vk_component = src->entries[i].vk_component;
+        entry->vk_flags = src->entries[i].vk_flags;
+    }
+
+    vkd3d_shader_stage_io_map_free(dst);
+    *dst = copy;
+    return true;
+}
+
+void vkd3d_shader_mesh_linkage_free(struct vkd3d_shader_mesh_linkage *linkage)
+{
+    vkd3d_shader_free_shader_signature(&linkage->vertex);
+    vkd3d_shader_free_shader_signature(&linkage->primitive);
+    vkd3d_shader_stage_io_map_free(&linkage->map);
+    vkd3d_free((void *)linkage->representative.code);
+    memset(linkage, 0, sizeof(*linkage));
+}
+
+int vkd3d_shader_mesh_linkage_prepare(const struct vkd3d_shader_code *code,
+        struct vkd3d_shader_mesh_linkage *linkage)
+{
+    struct vkd3d_shader_mesh_linkage prepared = {0};
+    void *bytes;
+    int ret;
+
+    if (!code || !code->code || !code->size || !linkage)
+        return VKD3D_ERROR_INVALID_ARGUMENT;
+    if (!(bytes = vkd3d_malloc(code->size)))
+        return VKD3D_ERROR_OUT_OF_MEMORY;
+    memcpy(bytes, code->code, code->size);
+    prepared.representative = *code;
+    prepared.representative.code = bytes;
+
+    if ((ret = vkd3d_shader_parse_output_signature(&prepared.representative, &prepared.vertex)) < 0 ||
+            (ret = vkd3d_shader_parse_patch_constant_signature(&prepared.representative, &prepared.primitive)) < 0 ||
+            (ret = vkd3d_shader_scan_mesh_output_map(&prepared.representative, NULL, &prepared.map)) < 0)
+    {
+        vkd3d_shader_mesh_linkage_free(&prepared);
+        return ret;
+    }
+
+    vkd3d_shader_mesh_linkage_free(linkage);
+    *linkage = prepared;
+    return VKD3D_OK;
 }
 
 static int vkd3d_shader_parse_root_signature_for_version(const struct vkd3d_shader_code *dxbc,

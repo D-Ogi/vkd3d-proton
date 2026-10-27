@@ -483,6 +483,34 @@ static dxil_spv_bool dxil_shader_stage_output_capture(void *userdata, const dxil
     return true;
 }
 
+int vkd3d_shader_scan_mesh_output_map(const struct vkd3d_shader_code *code,
+        const char *entry, struct vkd3d_shader_stage_io_map *map)
+{
+    struct vkd3d_shader_stage_io_map captured = {0};
+    dxil_spv_parsed_blob blob = NULL;
+    int ret = VKD3D_ERROR_INVALID_ARGUMENT;
+
+    if (!code || !code->code || !code->size || !map)
+        return ret;
+    dxil_spv_begin_thread_allocator_context();
+    if (dxil_spv_parse_dxil_blob(code->code, code->size, &blob) != DXIL_SPV_SUCCESS)
+        goto end;
+    if (dxil_spv_parsed_blob_scan_mesh_outputs(blob, entry,
+            dxil_shader_stage_output_capture, &captured) != DXIL_SPV_SUCCESS)
+        goto end;
+
+    vkd3d_shader_stage_io_map_free(map);
+    *map = captured;
+    memset(&captured, 0, sizeof(captured));
+    ret = VKD3D_OK;
+end:
+    vkd3d_shader_stage_io_map_free(&captured);
+    if (blob)
+        dxil_spv_parsed_blob_free(blob);
+    dxil_spv_end_thread_allocator_context();
+    return ret;
+}
+
 static dxil_spv_bool dxil_shader_stage_input_remap(void *userdata, const dxil_spv_d3d_shader_stage_io *d3d_input,
                                                    dxil_spv_vulkan_shader_stage_io *vk_input)
 {

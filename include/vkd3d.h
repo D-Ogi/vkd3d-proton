@@ -194,6 +194,34 @@ struct vkd3d_borrowed_memory_info
 
 HRESULT vkd3d_create_heap_from_memory(ID3D12Device *device, const struct vkd3d_borrowed_memory_info *memory,
         const D3D12_HEAP_DESC *desc, REFIID iid, void **heap);
+/* Embedding bridge for independently compiled graphics libraries. Handles are
+ * opaque, engine-owned objects from this instance; they must remain live for
+ * the call. A successful PSO retains the parts, independently of the caller.
+ * This is not yet an entry in the versioned DDI engine function table. */
+struct d3d12_partial_graphics_library;
+struct vkd3d_shader_signature;
+struct vkd3d_shader_stage_io_map;
+/* Borrowed for the call only. A mesh pixel library can instead supply the
+ * representative bytecode below; the engine derives both signatures and map. */
+struct vkd3d_partial_graphics_linkage
+{
+    VkShaderStageFlagBits producer_stage;
+    const struct vkd3d_shader_signature *output_signature;
+    const struct vkd3d_shader_signature *primitive_signature;
+    const struct vkd3d_shader_stage_io_map *mesh_map;
+};
+HRESULT vkd3d_create_partial_graphics_library(ID3D12Device *device,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        bool exclude_pixel_shader, const struct vkd3d_partial_graphics_linkage *linkage,
+        const D3D12_SHADER_BYTECODE *representative_mesh, bool late_sample_desc, bool dual_source_blend,
+        struct d3d12_partial_graphics_library **library);
+/* NULL is permitted; otherwise the handle must be live and from this engine. */
+void vkd3d_partial_graphics_library_add_ref(struct d3d12_partial_graphics_library *library);
+void vkd3d_partial_graphics_library_release(struct d3d12_partial_graphics_library *library);
+HRESULT vkd3d_create_linked_graphics_pipeline(ID3D12Device *device,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count,
+        bool optimize, REFIID iid, void **pipeline);
 /* amdgpu-wddm fork (engine ABI 1.2 MapHeap and UnmapHeap): the CPU address of heap offset 0, which a
  * placed buffer at offset X maps at plus X. Only heaps whose memory the library keeps mapped have one;
  * anything else, including an object that is not a heap of this library, gives E_INVALIDARG. Map and

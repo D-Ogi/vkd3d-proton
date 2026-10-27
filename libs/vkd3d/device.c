@@ -19,6 +19,7 @@
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 
 #include "vkd3d_private.h"
+#include "vkd3d_tir.h"
 #include "vkd3d_sonames.h"
 #include "vkd3d_descriptor_debug.h"
 #include "vkd3d_timestamp_profiler.h"
@@ -2624,19 +2625,17 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
     descriptor_buffer->descriptorBufferImageLayoutIgnored = VK_FALSE;
     physical_device_info->descriptor_heap_features.descriptorHeapCaptureReplay = VK_FALSE;
 
-    /* We only use dynamic rasterization samples. Also Keep the following enabled for 11on12:
-     * alphaToCoverage, sampleMask, lineRasterizationMode, depthClipEnable. */
+    /* Keep queried raster features for independently compiled graphics libraries.
+     * A final program supplies their raster state without recompiling shaders.
+     * Also keep alphaToCoverage, sampleMask and lineRasterizationMode for 11on12. */
     extended_dynamic_state3 = &physical_device_info->extended_dynamic_state3_features;
     extended_dynamic_state3->extendedDynamicState3TessellationDomainOrigin = VK_FALSE;
-    extended_dynamic_state3->extendedDynamicState3DepthClampEnable = VK_FALSE;
-    extended_dynamic_state3->extendedDynamicState3PolygonMode = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3AlphaToOneEnable = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3LogicOpEnable = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3ColorBlendEnable = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3ColorBlendEquation = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3ColorWriteMask = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3RasterizationStream = VK_FALSE;
-    extended_dynamic_state3->extendedDynamicState3ConservativeRasterizationMode = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3ExtraPrimitiveOverestimationSize = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3SampleLocationsEnable = VK_FALSE;
     extended_dynamic_state3->extendedDynamicState3ColorBlendAdvanced = VK_FALSE;
@@ -11006,6 +11005,9 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     if (FAILED(hr = vkd3d_create_vk_device(device, create_info)))
         goto out_free_fragment_output_lock;
+
+    device->bc250_tir_revisions = bc250_tir_query_revisions(instance->vk_global_procs.vkGetInstanceProcAddr,
+            device->vk_physical_device);
 
     if (FAILED(hr = vkd3d_private_store_init(&device->private_store)))
         goto out_free_vk_resources;

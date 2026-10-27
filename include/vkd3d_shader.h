@@ -163,6 +163,7 @@ enum vkd3d_shader_parameter_type
 enum vkd3d_shader_parameter_spec_constant_mapping
 {
     /* Lower values are reserved for other instrumentation. */
+    VKD3D_SHADER_RASTERIZER_SAMPLE_COUNT_SPEC_CONSTANT = 999,
     VKD3D_SHADER_VIEW_INDEX_TO_VIEW_ID_SPEC_CONSTANT = 1000,
     VKD3D_SHADER_VIEW_ID_TO_VIEWPORT_SPEC_CONSTANT = 1001,
     VKD3D_SHADER_VIEW_DRAW_LOOP_BASE_SPEC_CONSTANT = 1010
@@ -292,6 +293,10 @@ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3
 const struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_find(const struct vkd3d_shader_stage_io_map *map,
         const char *semantic_name, unsigned int semantic_index);
 void vkd3d_shader_stage_io_map_free(struct vkd3d_shader_stage_io_map *map);
+bool vkd3d_shader_stage_io_map_copy(struct vkd3d_shader_stage_io_map *dst,
+        const struct vkd3d_shader_stage_io_map *src);
+int vkd3d_shader_scan_mesh_output_map(const struct vkd3d_shader_code *code,
+        const char *entry, struct vkd3d_shader_stage_io_map *map);
 
 struct vkd3d_shader_interface_info
 {
@@ -994,6 +999,8 @@ enum vkd3d_sysval_semantic
     VKD3D_SV_TESS_FACTOR_LINEDEN       = 16,
     VKD3D_SV_BARYCENTRICS              = 23,
     VKD3D_SV_SHADING_RATE              = 24,
+    VKD3D_SV_COVERAGE                  = 66,
+    VKD3D_SV_INNER_COVERAGE            = 70,
 
     VKD3D_FORCE_32_BIT_ENUM(VKD3D_SYSVAL_SEMANTIC),
 };
@@ -1024,6 +1031,19 @@ struct vkd3d_shader_signature
     struct vkd3d_shader_signature_element *elements;
     unsigned int element_count;
 };
+
+/* Owns the representative bytecode because parsed semantic names borrow its
+ * bytes. Initialize to zero before prepare; failed prepare retains old data. */
+struct vkd3d_shader_mesh_linkage
+{
+    struct vkd3d_shader_code representative;
+    struct vkd3d_shader_signature vertex;
+    struct vkd3d_shader_signature primitive;
+    struct vkd3d_shader_stage_io_map map;
+};
+int vkd3d_shader_mesh_linkage_prepare(const struct vkd3d_shader_code *code,
+        struct vkd3d_shader_mesh_linkage *linkage);
+void vkd3d_shader_mesh_linkage_free(struct vkd3d_shader_mesh_linkage *linkage);
 
 /* swizzle bits fields: wwzzyyxx */
 #define VKD3D_SWIZZLE_X (0u)

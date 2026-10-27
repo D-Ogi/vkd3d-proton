@@ -5,7 +5,8 @@
  * amdgpu_wddm_vkd3d.dll, vkd3d-proton fork branch amdgpu-wddm/ddi-engine). The DLL was bc250vkd3d.dll before
  * its file names took the project's amdgpu_wddm prefix; code identifiers keep their BC250 names.
  *
- * Revision r5-draft, ABI 1.3: NOT FROZEN. r5 adds 1.3, linear images (V13), and changes nothing of 1.2.
+ * Revision r6-draft, ABI 1.4: NOT FROZEN. r6 appends partial graphics library functions.
+ * r5 adds 1.3, linear images (V13), and changes nothing of 1.2.
  * r4 adds the instance mode (V12) to 1.2; the minor stays 1.2 because 1.2
  * is a draft, so an r3 engine does not know the field (V12 says how the shell tells). r3 adds 1.2 (imported memory
  * and the adapter query, V10 and V11) and raises the admission of the inline queue mode (V7) to three VkQueues.
@@ -320,7 +321,16 @@ extern "C" {
 #endif
 
 #define BC250_VKD3D_ENGINE_ABI_MAJOR 1u
-#define BC250_VKD3D_ENGINE_ABI_MINOR 3u
+/* 1.5 adds the dynamic raster contract to partial graphics libraries without
+ * changing their layouts: raster state is taken from the linked executable,
+ * and unsupported dynamic raster features fail library creation. A shell must
+ * require 1.5 before admitting LateLinkRasterizerState. */
+/* 1.7 adds dynamic depth/stencil state to every partial graphics library and
+ * linked program, including ordinary/partial pipeline transition restoration.
+ * Late depth format is supplied by the final fragment-output interface. */
+/* 1.8 retains PGP pipelines in command allocators through reset, including
+ * both versions of an asynchronously specialized program. */
+#define BC250_VKD3D_ENGINE_ABI_MINOR 9u
 #define BC250_VKD3D_ENGINE_ABI_VERSION ((BC250_VKD3D_ENGINE_ABI_MAJOR << 16) | BC250_VKD3D_ENGINE_ABI_MINOR)
 
 #define BC250_VKD3D_QUEUE_MODE_THREADED 0u         /* V3; also the mode when the 1.1 fields are absent */
@@ -451,6 +461,35 @@ typedef struct BC250_VKD3D_LINEAR_IMAGE_INFO
 struct D3D12_HEAP_DESC;
 struct D3D12_RESOURCE_DESC1;
 struct D3D12_CLEAR_VALUE;
+struct D3D12_PIPELINE_STATE_STREAM_DESC;
+
+/* 1.4 draft: partial graphics libraries. Signature enum values are the fixed
+ * vkd3d_shader public enum values of this header revision. Strings and arrays
+ * are borrowed for the call; handles belong to this engine DLL instance. */
+typedef struct BC250_VKD3D_SIGNATURE_ELEMENT
+{
+    const char *SemanticName;
+    UINT32 SemanticIndex, StreamIndex, SystemValue, ComponentType, RegisterIndex, Mask, MinimumPrecision;
+} BC250_VKD3D_SIGNATURE_ELEMENT;
+typedef struct BC250_VKD3D_PARTIAL_GRAPHICS_DESC
+{
+    UINT32 Size;
+    UINT32 Subsets; /* VkGraphicsPipelineLibraryFlagsEXT */
+    const struct D3D12_PIPELINE_STATE_STREAM_DESC *Stream;
+    BOOL ExcludePixelShader;
+    UINT32 ProducerStage; /* VkShaderStageFlagBits; zero when no linkage is supplied */
+    UINT32 SignatureCount;
+    const BC250_VKD3D_SIGNATURE_ELEMENT *Signature;
+    const void *RepresentativeMesh;
+    SIZE_T RepresentativeMeshSize;
+} BC250_VKD3D_PARTIAL_GRAPHICS_DESC;
+
+/* 1.6: Subsets carries this flag in addition to Vulkan library subset bits.
+ * The engine removes it before Vulkan validation. Sample variants are compiled
+ * at collection creation; final linking selects one without compiling shaders. */
+#define BC250_VKD3D_PARTIAL_LATE_SAMPLE_DESC 0x80000000u
+/* 1.9: fixed PS compilation property, independent of the final blend factors. */
+#define BC250_VKD3D_PARTIAL_DUAL_SOURCE_BLEND 0x40000000u
 
 typedef struct BC250_VKD3D_ENGINE_FUNCS
 {
@@ -513,7 +552,18 @@ typedef struct BC250_VKD3D_ENGINE_FUNCS
             const struct D3D12_RESOURCE_DESC1 *desc, UINT32 initialState,
             const struct D3D12_CLEAR_VALUE *optimizedClearValue, REFIID riid, void **resource,
             BC250_VKD3D_LINEAR_IMAGE_INFO *info);
+    /* 1.4: no PGP capability is implied by these entry points. The shell must
+     * separately validate runtime/DDI support and its completed implementation. */
+    HRESULT (APIENTRY *CreatePartialGraphicsLibrary)(void *device,
+            const BC250_VKD3D_PARTIAL_GRAPHICS_DESC *desc, void **library);
+    void (APIENTRY *AddRefPartialGraphicsLibrary)(void *library);
+    void (APIENTRY *ReleasePartialGraphicsLibrary)(void *library);
+    HRESULT (APIENTRY *CreateLinkedGraphicsPipeline)(void *device,
+            const struct D3D12_PIPELINE_STATE_STREAM_DESC *desc, void *const *libraries,
+            UINT32 count, BOOL optimize, REFIID riid, void **pipeline);
 } BC250_VKD3D_ENGINE_FUNCS;
+
+#define BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3 ((UINT32)offsetof(BC250_VKD3D_ENGINE_FUNCS, CreatePartialGraphicsLibrary))
 
 typedef struct BC250_VKD3D_ENGINE_FUNCS_1_0
 {
@@ -580,8 +630,14 @@ BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_3_order,
         offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryLinearImage) == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_2
         && offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateLinearPlacedResource)
                 == offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryLinearImage) + sizeof(void *)
-        && sizeof(BC250_VKD3D_ENGINE_FUNCS)
+        && BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3
                 == offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateLinearPlacedResource) + sizeof(void *));
+BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_4_tail,
+        sizeof(BC250_VKD3D_ENGINE_FUNCS) == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3 + 4 * sizeof(void *));
+BC250_VKD3D_STATIC_ASSERT(partial_signature_size,
+        sizeof(BC250_VKD3D_SIGNATURE_ELEMENT) == (sizeof(void *) == 8 ? 40 : 32));
+BC250_VKD3D_STATIC_ASSERT(partial_desc_size,
+        sizeof(BC250_VKD3D_PARTIAL_GRAPHICS_DESC) == (sizeof(void *) == 8 ? 56 : 36));
 #ifdef _WIN64
 BC250_VKD3D_STATIC_ASSERT(sizes_1_0_x64,
         sizeof(BC250_VKD3D_DEVICE_CREATE_INFO_1_0) == 32 && sizeof(BC250_VKD3D_ENGINE_FUNCS_1_0) == 16);
@@ -595,7 +651,7 @@ BC250_VKD3D_STATIC_ASSERT(sizes_1_2_x64,
         && sizeof(BC250_VKD3D_DEVICE_CREATE_INFO) == 48
         && offsetof(BC250_VKD3D_DEVICE_CREATE_INFO, InstanceMode) == 40);
 BC250_VKD3D_STATIC_ASSERT(sizes_1_3_x64,
-        sizeof(BC250_VKD3D_ENGINE_FUNCS) == 80 && sizeof(BC250_VKD3D_LINEAR_IMAGE_INFO) == 48
+        BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3 == 80 && sizeof(BC250_VKD3D_LINEAR_IMAGE_INFO) == 48
         && offsetof(BC250_VKD3D_LINEAR_IMAGE_INFO, Offset) == 8
         && offsetof(BC250_VKD3D_LINEAR_IMAGE_INFO, MemoryAlignment) == 40);
 #endif

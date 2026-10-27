@@ -2237,6 +2237,9 @@ enum vkd3d_dynamic_state_flag
     VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK    = (1 << 11),
     VKD3D_DYNAMIC_STATE_DEPTH_BIAS            = (1 << 12),
     VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES = (1 << 13),
+    VKD3D_DYNAMIC_STATE_PARTIAL_RASTER       = (1 << 14),
+    VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH        = (1 << 15),
+    VKD3D_DYNAMIC_STATE_PARTIAL_LINE         = (1 << 16),
 };
 
 struct vkd3d_shader_debug_ring_spec_constants
@@ -2384,6 +2387,9 @@ struct d3d12_graphics_pipeline_state
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE index_buffer_strip_cut_value;
     VkPipelineRasterizationStateCreateInfo rs_desc;
     VkPipelineMultisampleStateCreateInfo ms_desc;
+    unsigned int forced_sample_count;
+    unsigned int partial_fixed_forced_samples;
+    bool partial_tir_outputs;
     VkPipelineDepthStencilStateCreateInfo ds_desc;
     VkPipelineColorBlendStateCreateInfo blend_desc;
 
@@ -2401,6 +2407,9 @@ struct d3d12_graphics_pipeline_state
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
     VkPipeline library;
+    /* Independently compiled pieces retained by a linked partial-program PSO. */
+    struct d3d12_partial_graphics_library *partial_libraries[4];
+    unsigned int partial_library_count;
     VkGraphicsPipelineLibraryFlagsEXT library_flags;
     VkPipelineCreateFlags2 library_create_flags;
     struct list compiled_fallback_pipelines;
@@ -2422,6 +2431,7 @@ struct d3d12_graphics_pipeline_state
     } multiview;
 
     bool disable_optimization;
+    bool partial_mesh_input;
 };
 
 static inline uint32_t vkd3d_view_mask_to_multiview_mask(
@@ -2599,6 +2609,58 @@ struct vkd3d_pipeline_key
 };
 
 bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
+/* A compiled partial library owns its pipeline separately from the source
+ * state's ordinary pipeline. The source retains layout, root and shader data. */
+struct d3d12_partial_graphics_library
+{
+    LONG refcount;
+    struct d3d12_pipeline_state *source;
+    VkPipeline pipeline;
+    VkGraphicsPipelineLibraryFlagsEXT subsets;
+    /* Additional variants only; pipeline remains the original sample count. */
+    struct d3d12_partial_graphics_library *tir_outputs;
+    VkPipeline sample_variants[7];
+    VkSampleCountFlags sample_counts;
+};
+HRESULT d3d12_partial_graphics_library_adopt(struct d3d12_pipeline_state *source,
+        VkPipeline pipeline, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        struct d3d12_partial_graphics_library **library);
+void d3d12_partial_graphics_library_inc_ref(struct d3d12_partial_graphics_library *library);
+void d3d12_partial_graphics_library_dec_ref(struct d3d12_partial_graphics_library *library);
+/* source is a private, initialized compiler state, not a published PSO. Its
+ * shader linkage and late-bound fields must already have been resolved. */
+HRESULT d3d12_partial_graphics_library_compile(struct d3d12_pipeline_state *source,
+        VkGraphicsPipelineLibraryFlagsEXT subsets, struct d3d12_partial_graphics_library **library);
+/* Internal constructor for a resolved descriptor, before public PGP linkage
+ * and late-field translation. Only shaders belonging to subsets are supplied. */
+struct d3d12_partial_graphics_input
+{
+    VkShaderStageFlagBits producer_stage;
+    const struct vkd3d_shader_signature *output_signature;
+    const struct vkd3d_shader_signature *primitive_signature;
+    const struct vkd3d_shader_stage_io_map *mesh_map;
+};
+HRESULT d3d12_partial_graphics_library_create(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        bool exclude_pixel_shader, bool late_sample_desc, bool dual_source_blend, const struct d3d12_partial_graphics_input *input,
+        struct d3d12_partial_graphics_library **library);
+HRESULT d3d12_partial_graphics_library_create_mesh_pixel(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc, const struct vkd3d_shader_code *representative,
+        VkGraphicsPipelineLibraryFlagsEXT subsets, bool late_sample_desc, bool dual_source_blend,
+        struct d3d12_partial_graphics_library **library);
+/* Synchronous link of resolved parts. Caller owns the returned pipeline and
+ * keeps state (including its root/layout) alive until that pipeline is destroyed. */
+HRESULT d3d12_partial_graphics_libraries_link(struct d3d12_pipeline_state *state,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count,
+        bool optimize, VkPipeline *pipeline);
+/* state must be a private, fully initialized graphics PSO with resolved fields,
+ * without a pipeline. On failure neither state nor part ownership changes. */
+HRESULT d3d12_partial_graphics_pipeline_link(struct d3d12_pipeline_state *state,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count, bool optimize);
+HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count,
+        bool optimize, struct d3d12_pipeline_state **out);
 HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state);
 VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_state *state,
@@ -6528,6 +6590,7 @@ struct d3d12_device
     d3d_low_latency_device_iface ID3DLowLatencyDevice_iface;
     IAmdExtAntiLagApi IAmdExtAntiLagApi_iface;
     ID3D12DeviceConfiguration1 ID3D12DeviceConfiguration1_iface;
+    uint32_t bc250_tir_revisions;
     LONG refcount;
 
     VkDevice vk_device;

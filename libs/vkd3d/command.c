@@ -3102,15 +3102,16 @@ static bool d3d12_command_allocator_add_buffer_view(struct d3d12_command_allocat
     return true;
 }
 
-static void d3d12_command_allocator_retain_pipeline_state(struct d3d12_command_allocator *allocator,
+static bool d3d12_command_allocator_retain_pipeline_state(struct d3d12_command_allocator *allocator,
         struct d3d12_pipeline_state *state)
 {
     if (!vkd3d_array_reserve((void **)&allocator->pipelines, &allocator->pipelines_size,
             allocator->pipelines_count + 1, sizeof(*allocator->pipelines)))
-        return;
+        return false;
 
     d3d12_pipeline_state_inc_ref(state);
     allocator->pipelines[allocator->pipelines_count++] = state;
+    return true;
 }
 
 static void d3d12_command_allocator_retain_descriptor_heap(struct d3d12_command_allocator *allocator,
@@ -9322,6 +9323,42 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
     /* Make sure we only update states that are dynamic in the pipeline */
     dyn_state->dirty_flags &= list->dynamic_state.active_flags;
 
+    if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_PARTIAL_LINE)
+    {
+        const struct d3d12_graphics_pipeline_state *graphics = &list->state->graphics;
+        VK_CALL(vkCmdSetLineRasterizationModeEXT(list->cmd.vk_command_buffer, graphics->rs_line_info.lineRasterizationMode));
+        VK_CALL(vkCmdSetLineWidth(list->cmd.vk_command_buffer, graphics->rs_desc.lineWidth));
+    }
+
+    if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH)
+    {
+        const VkPipelineDepthStencilStateCreateInfo *ds = &list->state->graphics.ds_desc;
+        VK_CALL(vkCmdSetDepthTestEnable(list->cmd.vk_command_buffer, ds->depthTestEnable));
+        VK_CALL(vkCmdSetDepthCompareOp(list->cmd.vk_command_buffer, ds->depthCompareOp));
+        VK_CALL(vkCmdSetDepthBoundsTestEnable(list->cmd.vk_command_buffer, ds->depthBoundsTestEnable));
+        VK_CALL(vkCmdSetStencilTestEnable(list->cmd.vk_command_buffer, ds->stencilTestEnable));
+        VK_CALL(vkCmdSetStencilOp(list->cmd.vk_command_buffer, VK_STENCIL_FACE_FRONT_BIT,
+                ds->front.failOp, ds->front.passOp, ds->front.depthFailOp, ds->front.compareOp));
+        VK_CALL(vkCmdSetStencilOp(list->cmd.vk_command_buffer, VK_STENCIL_FACE_BACK_BIT,
+                ds->back.failOp, ds->back.passOp, ds->back.depthFailOp, ds->back.compareOp));
+        VK_CALL(vkCmdSetStencilCompareMask(list->cmd.vk_command_buffer, VK_STENCIL_FACE_FRONT_BIT, ds->front.compareMask));
+        VK_CALL(vkCmdSetStencilCompareMask(list->cmd.vk_command_buffer, VK_STENCIL_FACE_BACK_BIT, ds->back.compareMask));
+    }
+
+    if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_PARTIAL_RASTER)
+    {
+        const struct d3d12_graphics_pipeline_state *graphics = &list->state->graphics;
+        const VkPipelineRasterizationStateCreateInfo *raster = &graphics->rs_desc;
+        VK_CALL(vkCmdSetCullMode(list->cmd.vk_command_buffer, raster->cullMode));
+        VK_CALL(vkCmdSetFrontFace(list->cmd.vk_command_buffer, raster->frontFace));
+        VK_CALL(vkCmdSetPolygonModeEXT(list->cmd.vk_command_buffer, raster->polygonMode));
+        VK_CALL(vkCmdSetDepthClampEnableEXT(list->cmd.vk_command_buffer, raster->depthClampEnable));
+        VK_CALL(vkCmdSetDepthClipEnableEXT(list->cmd.vk_command_buffer,
+                graphics->rs_depth_clip_info.depthClipEnable));
+        VK_CALL(vkCmdSetConservativeRasterizationModeEXT(list->cmd.vk_command_buffer,
+                graphics->rs_conservative_info.conservativeRasterizationMode));
+    }
+
     if (dyn_state->viewport_count)
     {
         if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_VIEWPORT)
@@ -9399,7 +9436,9 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
     if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_DEPTH_WRITE_ENABLE)
     {
         VK_CALL(vkCmdSetDepthWriteEnable(list->cmd.vk_command_buffer,
-                (dyn_state->dsv_plane_write_enable & (1u << 0)) ? VK_TRUE : VK_FALSE));
+                ((dyn_state->dsv_plane_write_enable & (1u << 0)) &&
+                 (!(dyn_state->active_flags & VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH) ||
+                  list->state->graphics.ds_desc.depthWriteEnable)) ? VK_TRUE : VK_FALSE));
     }
 
     if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK)
@@ -14285,8 +14324,30 @@ static void STDMETHODCALLTYPE d3d12_command_list_SetPipelineState(d3d12_command_
     if (list->state == state)
         return;
 
-    if (VKD3D_CONFIG_FLAG_IS_SET(RETAIN_PSOS) && state)
-        d3d12_command_allocator_retain_pipeline_state(list->allocator, state);
+    /* Two linked programs can share all shader libraries and still supply
+     * different rasterizers. Equal dynamic-state masks do not imply equal values. */
+    if (state && state->pipeline_type != VKD3D_PIPELINE_TYPE_COMPUTE)
+        list->dynamic_state.dirty_flags |= state->graphics.explicit_dynamic_states &
+                (VKD3D_DYNAMIC_STATE_PARTIAL_RASTER | VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH | VKD3D_DYNAMIC_STATE_PARTIAL_LINE |
+                 VKD3D_DYNAMIC_STATE_DEPTH_WRITE_ENABLE | VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK);
+
+    /* Ordinary PSOs also use dynamic write masks. Leaving a PGP whose depth
+     * write value was false must restore the ordinary DSV-controlled value,
+     * even when the active dynamic-state masks have not changed. */
+    if (list->state && d3d12_pipeline_state_is_graphics(list->state) &&
+            (list->state->graphics.explicit_dynamic_states & VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH))
+        list->dynamic_state.dirty_flags |= VKD3D_DYNAMIC_STATE_DEPTH_WRITE_ENABLE |
+                VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK;
+
+    if (state && (VKD3D_CONFIG_FLAG_IS_SET(RETAIN_PSOS) ||
+            (d3d12_pipeline_state_is_graphics(state) && state->graphics.partial_library_count)))
+    {
+        if (!d3d12_command_allocator_retain_pipeline_state(list->allocator, state))
+        {
+            d3d12_command_list_mark_as_invalid(list, "Failed to retain pipeline until allocator reset.");
+            return;
+        }
+    }
 
     d3d12_command_list_invalidate_current_pipeline(list, false);
     /* SetPSO and SetPSO1 alias the same internal active pipeline state even if they are completely different types. */

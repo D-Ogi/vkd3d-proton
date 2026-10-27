@@ -12,6 +12,7 @@
 #include "vkd3d.h"
 #include "vkd3d_debug.h"
 #include "vkd3d_core_interface.h"
+#include "vkd3d_shader.h"
 
 #include "bc250_vkd3d_engine.h"
 
@@ -532,6 +533,91 @@ static HRESULT APIENTRY bc250_create_linear_placed_resource(void *device, void *
     return hr;
 }
 
+static HRESULT APIENTRY bc250_create_partial_graphics_library(void *device,
+        const BC250_VKD3D_PARTIAL_GRAPHICS_DESC *desc, void **library)
+{
+    struct vkd3d_shader_signature_element elements[128];
+    struct vkd3d_shader_signature signature = {elements, 0};
+    struct vkd3d_partial_graphics_linkage linkage = {0};
+    struct d3d12_partial_graphics_library *result = NULL;
+    D3D12_SHADER_BYTECODE representative;
+    HRESULT hr;
+    UINT32 i;
+    if (!library)
+        return E_INVALIDARG;
+    *library = NULL;
+    if (!device || !desc || desc->Size < sizeof(*desc) || !desc->Stream ||
+            desc->SignatureCount > 128 || (desc->SignatureCount && !desc->Signature) ||
+            (!!desc->RepresentativeMesh != !!desc->RepresentativeMeshSize) ||
+            (desc->RepresentativeMesh && (desc->ProducerStage || desc->SignatureCount)) ||
+            (!desc->ProducerStage && desc->SignatureCount))
+        return E_INVALIDARG;
+    for (i = 0; i < desc->SignatureCount; ++i)
+    {
+        const BC250_VKD3D_SIGNATURE_ELEMENT *in = &desc->Signature[i];
+        if (!in->SemanticName || !in->SemanticName[0] || !in->Mask || (in->Mask & ~15u) ||
+                in->StreamIndex > 3 || in->RegisterIndex >= 32 ||
+                in->ComponentType <= VKD3D_TYPE_VOID || in->ComponentType >= VKD3D_TYPE_COUNT ||
+                (in->SystemValue > VKD3D_SV_TESS_FACTOR_LINEDEN &&
+                 in->SystemValue != VKD3D_SV_BARYCENTRICS && in->SystemValue != VKD3D_SV_SHADING_RATE) ||
+                (in->MinimumPrecision != VKD3D_SHADER_MINIMUM_PRECISION_NONE &&
+                 in->MinimumPrecision != VKD3D_SHADER_MINIMUM_PRECISION_FLOAT_16 &&
+                 in->MinimumPrecision != VKD3D_SHADER_MINIMUM_PRECISION_FLOAT_8_2 &&
+                 in->MinimumPrecision != VKD3D_SHADER_MINIMUM_PRECISION_INT_16 &&
+                 in->MinimumPrecision != VKD3D_SHADER_MINIMUM_PRECISION_UINT_16))
+            return E_INVALIDARG;
+        elements[i].semantic_name = in->SemanticName;
+        elements[i].semantic_index = in->SemanticIndex;
+        elements[i].stream_index = in->StreamIndex;
+        elements[i].sysval_semantic = in->SystemValue;
+        elements[i].component_type = in->ComponentType;
+        elements[i].register_index = in->RegisterIndex;
+        elements[i].mask = in->Mask;
+        elements[i].min_precision = in->MinimumPrecision;
+    }
+    signature.element_count = desc->SignatureCount;
+    linkage.producer_stage = desc->ProducerStage;
+    linkage.output_signature = &signature;
+    representative.pShaderBytecode = desc->RepresentativeMesh;
+    representative.BytecodeLength = desc->RepresentativeMeshSize;
+    hr = vkd3d_create_partial_graphics_library((ID3D12Device *)device, desc->Stream,
+            desc->Subsets & ~(BC250_VKD3D_PARTIAL_LATE_SAMPLE_DESC | BC250_VKD3D_PARTIAL_DUAL_SOURCE_BLEND), !!desc->ExcludePixelShader,
+            desc->ProducerStage ? &linkage : NULL,
+            desc->RepresentativeMesh ? &representative : NULL,
+            !!(desc->Subsets & BC250_VKD3D_PARTIAL_LATE_SAMPLE_DESC),
+            !!(desc->Subsets & BC250_VKD3D_PARTIAL_DUAL_SOURCE_BLEND), &result);
+    if (SUCCEEDED(hr))
+        *library = result;
+    return hr;
+}
+
+static void APIENTRY bc250_add_ref_partial_graphics_library(void *library)
+{
+    vkd3d_partial_graphics_library_add_ref(library);
+}
+
+static void APIENTRY bc250_release_partial_graphics_library(void *library)
+{
+    vkd3d_partial_graphics_library_release(library);
+}
+
+static HRESULT APIENTRY bc250_create_linked_graphics_pipeline(void *device,
+        const struct D3D12_PIPELINE_STATE_STREAM_DESC *desc, void *const *libraries,
+        UINT32 count, BOOL optimize, REFIID riid, void **pipeline)
+{
+    struct d3d12_partial_graphics_library *parts[4];
+    UINT32 i;
+    if (!pipeline)
+        return E_INVALIDARG;
+    *pipeline = NULL;
+    if (!libraries || !count || count > 4)
+        return E_INVALIDARG;
+    for (i = 0; i < count; ++i)
+        parts[i] = libraries[i];
+    return vkd3d_create_linked_graphics_pipeline((ID3D12Device *)device, desc, parts,
+            count, !!optimize, riid, pipeline);
+}
+
 HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_FUNCS *funcs)
 {
     BC250_VKD3D_ENGINE_FUNCS out;
@@ -564,6 +650,13 @@ HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_
     {
         out.QueryLinearImage = bc250_query_linear_image;
         out.CreateLinearPlacedResource = bc250_create_linear_placed_resource;
+    }
+    if (minor >= 4)
+    {
+        out.CreatePartialGraphicsLibrary = bc250_create_partial_graphics_library;
+        out.AddRefPartialGraphicsLibrary = bc250_add_ref_partial_graphics_library;
+        out.ReleasePartialGraphicsLibrary = bc250_release_partial_graphics_library;
+        out.CreateLinkedGraphicsPipeline = bc250_create_linked_graphics_pipeline;
     }
     /* Fill at most Size bytes: a 1.0 structure ends before CreateCommandQueue, a 1.1 structure before
      * GetVulkanHandles, a 1.2 structure before QueryLinearImage, and a larger one keeps its zeroed tail. */

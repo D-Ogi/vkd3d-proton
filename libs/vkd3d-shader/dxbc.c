@@ -40,7 +40,7 @@
 
 static bool require_space(size_t offset, size_t count, size_t size, size_t data_size)
 {
-    return !count || (data_size - offset) / count >= size;
+    return offset <= data_size && (!count || (data_size - offset) / count >= size);
 }
 
 static void read_dword(const char **ptr, DWORD *d)
@@ -138,6 +138,9 @@ static int parse_dxbc(const char *data, size_t data_size,
     read_dword(&ptr, &chunk_count);
     TRACE("chunk count: %#x\n", (int)chunk_count);
 
+    if (!require_space(ptr - data, chunk_count, sizeof(DWORD), data_size))
+        return VKD3D_ERROR_INVALID_ARGUMENT;
+
     for (i = 0; i < chunk_count; ++i)
     {
         DWORD chunk_tag, chunk_size;
@@ -192,7 +195,10 @@ static int shader_parse_signature(DWORD tag, const char *data, DWORD data_size,
 
     skip_dword_unknown(&ptr, 1); /* It seems to always be 0x00000008. */
 
-    if (!require_space(ptr - data, count, 6 * sizeof(DWORD), data_size))
+    has_min_precision = tag == TAG_OSG1 || tag == TAG_PSG1 || tag == TAG_ISG1;
+    has_stream_index = tag == TAG_OSG5 || has_min_precision;
+    if (!require_space(ptr - data, count,
+            (6 + has_stream_index + has_min_precision) * sizeof(DWORD), data_size))
     {
         WARN("Invalid count %#x (data size %#x).\n", (int)count, (int)data_size);
         return VKD3D_ERROR_INVALID_ARGUMENT;
@@ -203,9 +209,6 @@ static int shader_parse_signature(DWORD tag, const char *data, DWORD data_size,
         ERR("Failed to allocate input signature memory.\n");
         return VKD3D_ERROR_OUT_OF_MEMORY;
     }
-
-    has_min_precision = tag == TAG_OSG1 || tag == TAG_PSG1 || tag == TAG_ISG1;
-    has_stream_index = tag == TAG_OSG5 || has_min_precision;
 
     for (i = 0; i < count; ++i)
     {

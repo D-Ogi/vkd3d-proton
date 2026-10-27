@@ -24,6 +24,8 @@
 #include "vkd3d_rw_spinlock.h"
 #include "vkd3d_timestamp_profiler.h"
 #include "vkd3d_shader_diagnostics.h"
+#include "vkd3d_pipeline_link.h"
+#include "vkd3d_tir.h"
 #include <stdio.h>
 
 /* ID3D12RootSignature */
@@ -2532,14 +2534,20 @@ static VkShaderStageFlags vkd3d_pipeline_state_desc_get_shader_stages(const stru
     return result;
 }
 
-HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_state_desc *desc,
-        const D3D12_PIPELINE_STATE_STREAM_DESC *d3d12_desc, VkPipelineBindPoint *vk_bind_point)
+static HRESULT d3d12_pipeline_state_desc_from_stream(struct d3d12_pipeline_state_desc *desc,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *d3d12_desc, VkPipelineBindPoint *vk_bind_point,
+        bool allow_partial_pixel)
 {
     VkShaderStageFlags defined_stages, disallowed_stages;
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE subobject_type;
     const char *stream_ptr, *stream_end;
     uint64_t defined_subobjects = 0;
     uint64_t subobject_bit;
+
+    if (!desc || !d3d12_desc || !vk_bind_point || !d3d12_desc->pPipelineStateSubobjectStream ||
+            !d3d12_desc->SizeInBytes || d3d12_desc->SizeInBytes >
+            UINTPTR_MAX - (uintptr_t)d3d12_desc->pPipelineStateSubobjectStream)
+        return E_INVALIDARG;
 
     /* Initialize defaults for undefined subobjects */
     d3d12_init_pipeline_state_desc(desc);
@@ -2558,6 +2566,8 @@ HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_s
         }
 
         subobject_type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE *)stream_ptr;
+        if ((unsigned int)subobject_type >= 64)
+            return E_INVALIDARG;
         subobject_bit = 1ull << subobject_type;
 
         if (defined_subobjects & subobject_bit)
@@ -2627,6 +2637,11 @@ HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_s
         disallowed_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_MESH_BIT_EXT;
         *vk_bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
     }
+    else if (allow_partial_pixel && defined_stages == VK_SHADER_STAGE_FRAGMENT_BIT)
+    {
+        disallowed_stages = 0;
+        *vk_bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    }
     else
     {
         ERR("Cannot deduce pipeline type from shader stages 0x%#x.\n", defined_stages);
@@ -2646,6 +2661,12 @@ HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_s
 
 #undef VKD3D_HANDLE_SUBOBJECT
 #undef VKD3D_HANDLE_SUBOBJECT_EXPLICIT
+
+HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_state_desc *desc,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *d3d12_desc, VkPipelineBindPoint *vk_bind_point)
+{
+    return d3d12_pipeline_state_desc_from_stream(desc, d3d12_desc, vk_bind_point, false);
+}
 
 struct vkd3d_compiled_pipeline
 {
@@ -2803,6 +2824,7 @@ static void d3d12_pipeline_state_destroy_graphics(struct d3d12_pipeline_state *s
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_compiled_pipeline *current, *e;
+    unsigned int i;
 
     d3d12_pipeline_state_destroy_shader_modules(state, device);
     if (graphics->multiview.fallback)
@@ -2816,6 +2838,8 @@ static void d3d12_pipeline_state_destroy_graphics(struct d3d12_pipeline_state *s
 
     VK_CALL(vkDestroyPipeline(device->vk_device, graphics->pipeline, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, graphics->library, NULL));
+    for (i = 0; i < graphics->partial_library_count; ++i)
+        d3d12_partial_graphics_library_dec_ref(graphics->partial_libraries[i]);
 }
 
 static void d3d12_pipeline_state_set_name(struct d3d12_pipeline_state *state, const char *name)
@@ -2948,6 +2972,67 @@ static ULONG STDMETHODCALLTYPE d3d12_pipeline_state_Release(ID3D12PipelineState 
     }
 
     return refcount;
+}
+
+/* On failure the caller still owns pipeline. On success the new library owns
+ * it; do not also attach the same handle to source->graphics. The caller must
+ * hold a live source reference for the duration of this operation. */
+HRESULT d3d12_partial_graphics_library_adopt(struct d3d12_pipeline_state *source,
+        VkPipeline pipeline, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        struct d3d12_partial_graphics_library **library)
+{
+    struct vkd3d_pipeline_libraries checked = {0};
+    struct d3d12_partial_graphics_library *object;
+
+    if (!library)
+        return E_INVALIDARG;
+    *library = NULL;
+    if (!source || !d3d12_pipeline_state_is_graphics(source) ||
+            !(subsets & (VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) ||
+            !vkd3d_pipeline_libraries_add(&checked, pipeline, subsets))
+        return E_INVALIDARG;
+    if (pipeline == source->graphics.library || pipeline == source->graphics.pipeline)
+        return E_INVALIDARG;
+    if (!(object = vkd3d_malloc(sizeof(*object))))
+        return E_OUTOFMEMORY;
+
+    memset(object, 0, sizeof(*object));
+    object->refcount = 1;
+    object->source = source;
+    object->pipeline = pipeline;
+    object->subsets = subsets;
+    /* A private pipeline reference alone does not retain the device: the last
+     * public PSO release drops that device reference independently. */
+    d3d12_device_add_ref(source->device);
+    d3d12_pipeline_state_inc_ref(source);
+    *library = object;
+    return S_OK;
+}
+
+void d3d12_partial_graphics_library_inc_ref(struct d3d12_partial_graphics_library *library)
+{
+    InterlockedIncrement(&library->refcount);
+}
+
+void d3d12_partial_graphics_library_dec_ref(struct d3d12_partial_graphics_library *library)
+{
+    struct d3d12_device *device;
+    const struct vkd3d_vk_device_procs *vk_procs;
+    unsigned int i;
+    if (InterlockedDecrement(&library->refcount))
+        return;
+    device = library->source->device;
+    vk_procs = &device->vk_procs;
+    VK_CALL(vkDestroyPipeline(device->vk_device, library->pipeline, NULL));
+    for (i = 0; i < ARRAY_SIZE(library->sample_variants); ++i)
+        if (library->sample_variants[i])
+            VK_CALL(vkDestroyPipeline(device->vk_device, library->sample_variants[i], NULL));
+    if (library->tir_outputs)
+        d3d12_partial_graphics_library_dec_ref(library->tir_outputs);
+    d3d12_pipeline_state_dec_ref(library->source);
+    d3d12_device_release(device);
+    vkd3d_free(library);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_pipeline_state_GetPrivateData(ID3D12PipelineState *iface,
@@ -3133,7 +3218,7 @@ static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_sta
         shader_interface->stage_output_map = &state->graphics.cached_desc.stage_io_map_ms_ps;
     }
     else if ((stage == VK_SHADER_STAGE_FRAGMENT_BIT) &&
-            (state->graphics.stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
+            ((state->graphics.stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) || state->graphics.partial_mesh_input))
     {
         shader_interface->stage_input_map = &state->graphics.cached_desc.stage_io_map_ms_ps;
     }
@@ -3406,7 +3491,8 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
         if (stage == VK_SHADER_STAGE_FRAGMENT_BIT)
         {
             /* At this point we don't need the map anymore. */
-            vkd3d_shader_stage_io_map_free(&state->graphics.cached_desc.stage_io_map_ms_ps);
+            if (!state->graphics.partial_mesh_input)
+                vkd3d_shader_stage_io_map_free(&state->graphics.cached_desc.stage_io_map_ms_ps);
         }
         else if (stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
         {
@@ -4525,6 +4611,20 @@ vkd3d_dynamic_state_list[] =
     { VKD3D_DYNAMIC_STATE_DEPTH_BIAS,            VK_DYNAMIC_STATE_DEPTH_BIAS },
     { VKD3D_DYNAMIC_STATE_DEPTH_BIAS,            VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE },
     { VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES, VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_LINE,          VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_LINE,          VK_DYNAMIC_STATE_LINE_WIDTH },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH,         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH,         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH,         VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH,         VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH,         VK_DYNAMIC_STATE_STENCIL_OP },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH,         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_RASTER,        VK_DYNAMIC_STATE_CULL_MODE },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_RASTER,        VK_DYNAMIC_STATE_FRONT_FACE },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_RASTER,        VK_DYNAMIC_STATE_POLYGON_MODE_EXT },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_RASTER,        VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_RASTER,        VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT },
+    { VKD3D_DYNAMIC_STATE_PARTIAL_RASTER,        VK_DYNAMIC_STATE_CONSERVATIVE_RASTERIZATION_MODE_EXT },
 };
 
 uint32_t vkd3d_init_dynamic_state_array(VkDynamicState *dynamic_states, uint32_t dynamic_state_flags)
@@ -4546,7 +4646,7 @@ void vkd3d_vertex_input_pipeline_desc_init(struct vkd3d_vertex_input_pipeline_de
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
 
     /* Mesh shader pipelines do not use vertex input state */
-    assert(!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT));
+    assert(!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) && !graphics->partial_mesh_input);
 
     /* Do not set up pointers here as they would complicate hash table lookup */
     memset(desc, 0, sizeof(*desc));
@@ -4828,7 +4928,7 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
 
     dynamic_state_flags = graphics->explicit_dynamic_states;
 
-    is_mesh_pipeline = !!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT);
+    is_mesh_pipeline = !!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) || graphics->partial_mesh_input;
     is_tess_pipeline = !!(graphics->stage_flags & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT);
 
     /* Enable dynamic states as necessary */
@@ -4867,7 +4967,8 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
      * unlike Vulkan.
      * Target Independent Rasterization (ForcedSampleCount) is not supported when this is used
      * so we don't need to worry about side effects when there are no render targets. */
-    if (d3d12_device_supports_variable_shading_rate_tier_1(state->device) && graphics->rt_count)
+    if (d3d12_device_supports_variable_shading_rate_tier_1(state->device) && graphics->rt_count &&
+            !graphics->forced_sample_count)
     {
         /* If sample rate shading, ROVs are used, or depth stencil export is used force default VRS state.
          * Do this by not enabling the dynamic state.
@@ -4898,7 +4999,8 @@ uint32_t d3d12_graphics_pipeline_state_get_dynamic_state_flags(struct d3d12_pipe
 
     /* Enable dynamic sample count for multisampled pipelines so we can work around
      * bugs where the app may render to a single sampled render target. */
-    if (d3d12_graphics_pipeline_needs_dynamic_rasterization_samples(&state->graphics) &&
+    if (!graphics->forced_sample_count &&
+            d3d12_graphics_pipeline_needs_dynamic_rasterization_samples(&state->graphics) &&
             state->device->device_info.extended_dynamic_state3_features.extendedDynamicState3RasterizationSamples)
         dynamic_state_flags |= VKD3D_DYNAMIC_STATE_RASTERIZATION_SAMPLES;
 
@@ -5125,6 +5227,11 @@ static HRESULT d3d12_pipeline_state_graphics_handle_meta(struct d3d12_pipeline_s
         if (graphics->cached_desc.bytecode_stages[i] == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
             graphics->patch_vertex_count = graphics->code[i].meta.patch_vertex_count;
 
+        if (graphics->forced_sample_count &&
+                (graphics->code[i].meta.flags & (VKD3D_SHADER_META_FLAG_USES_SAMPLE_RATE_SHADING |
+                VKD3D_SHADER_META_FLAG_USES_DEPTH_STENCIL_WRITE)))
+            return E_INVALIDARG;
+
         if (graphics->code[i].meta.flags & VKD3D_SHADER_META_FLAG_USES_SAMPLE_RATE_SHADING)
         {
             graphics->ms_desc.sampleShadingEnable = VK_TRUE;
@@ -5246,6 +5353,8 @@ static bool vkd3d_shader_semantic_is_generated_for_stage(enum vkd3d_sysval_seman
         case VKD3D_SV_SAMPLE_INDEX:
         case VKD3D_SV_BARYCENTRICS:
         case VKD3D_SV_SHADING_RATE:
+        case VKD3D_SV_COVERAGE:
+        case VKD3D_SV_INNER_COVERAGE:
             return curr_stage == VK_SHADER_STAGE_FRAGMENT_BIT;
 
         default:
@@ -5365,6 +5474,31 @@ static bool vkd3d_validate_mesh_shader_io_signatures(const struct vkd3d_shader_s
         }
     }
 
+    return true;
+}
+
+static bool vkd3d_validate_partial_pixel_signature(VkShaderStageFlagBits producer_stage,
+        const struct vkd3d_shader_signature *out_sig, const struct vkd3d_shader_signature *in_sig)
+{
+    const struct vkd3d_shader_signature_element *out_element, *in_element;
+    unsigned int i;
+
+    if (!vkd3d_validate_shader_io_signatures(producer_stage, out_sig, VK_SHADER_STAGE_FRAGMENT_BIT, in_sig))
+        return false;
+
+    /* Explicit PGP linkage describes exactly the non-system-value PS inputs,
+     * unlike the subset consumption allowed for ordinary complete pipelines. */
+    for (i = 0; i < out_sig->element_count; ++i)
+    {
+        out_element = &out_sig->elements[i];
+        if (out_element->sysval_semantic != VKD3D_SV_NONE)
+            continue;
+        in_element = vkd3d_shader_find_signature_element(in_sig, out_element->semantic_name,
+                out_element->semantic_index, out_element->stream_index);
+        if (!in_element || in_element->sysval_semantic != VKD3D_SV_NONE ||
+                (in_element->mask & 0xf) != (out_element->mask & 0xf))
+            return false;
+    }
     return true;
 }
 
@@ -5489,7 +5623,8 @@ static bool d3d12_pipeline_state_validate_view_instancing(struct d3d12_device *d
 }
 
 static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipeline_state *state,
-        struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc)
+        struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
+        const struct d3d12_partial_graphics_input *partial_input, bool standalone_pixel)
 {
     struct vkd3d_shader_signature vs_input_signature, pc_input_signature, io_input_signature;
     const VkPhysicalDeviceFeatures *features = &device->device_info.features2.features;
@@ -5537,7 +5672,8 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     graphics->stage_count = 0;
     graphics->primitive_topology_type = desc->primitive_topology_type;
 
-    state->pipeline_type = (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT)
+    graphics->partial_mesh_input = partial_input && partial_input->producer_stage == VK_SHADER_STAGE_MESH_BIT_EXT;
+    state->pipeline_type = ((graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) || graphics->partial_mesh_input)
             ? VKD3D_PIPELINE_TYPE_MESH_GRAPHICS
             : VKD3D_PIPELINE_TYPE_GRAPHICS;
 
@@ -5564,7 +5700,8 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
      * format, SampleDesc.Count can be any count of SupportedSampleCountsWithNoOutputs. If it is
      * larger than 1, ForcedSampleCount must be 0 (multisample rasterization) or 1 (single-sample
      * rasterization). If it is 1, ForcedSampleCount (TIR: 1, 4, 8 or 16) gives the rasterization
-     * sample count, with pixel-frequency shading. With outputs, ForcedSampleCount stays ignored. */
+     * sample count, with pixel-frequency shading. With render targets, the validated private
+     * TIR contract below carries separate rasterizer and attachment sample counts. */
     if (!desc->rtv_formats.NumRenderTargets && desc->dsv_format == DXGI_FORMAT_UNKNOWN)
     {
         const UINT no_output_counts = device->d3d12_caps.options19.SupportedSampleCountsWithNoOutputs;
@@ -5599,7 +5736,15 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     }
     else if (desc->rasterizer_state.ForcedSampleCount)
     {
-        FIXME("Ignoring ForcedSampleCount %#x with outputs.\n", desc->rasterizer_state.ForcedSampleCount);
+        const struct bc250_tir_pipeline tir = {BC250_STRUCTURE_TYPE_TIR, NULL, BC250_TIR_REVISION,
+                desc->rasterizer_state.ForcedSampleCount, desc->sample_desc.Count, desc->sample_mask};
+        if (!bc250_tir_valid(&tir) || desc->dsv_format != DXGI_FORMAT_UNKNOWN ||
+                desc->depth_stencil_state.DepthEnable || desc->depth_stencil_state.StencilEnable)
+            return E_INVALIDARG;
+        /* Never silently run this as ordinary MSAA on an ICD without the private contract. */
+        if (!(device->bc250_tir_revisions & (1u << BC250_TIR_REVISION)))
+            return E_NOTIMPL;
+        graphics->forced_sample_count = tir.forced_samples;
     }
 
     rt_count = desc->rtv_formats.NumRenderTargets;
@@ -5811,7 +5956,8 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     shader_param->name = VKD3D_SHADER_PARAMETER_NAME_RASTERIZER_SAMPLE_COUNT;
     shader_param->type = VKD3D_SHADER_PARAMETER_TYPE_IMMEDIATE_CONSTANT;
     shader_param->data_type = VKD3D_SHADER_PARAMETER_DATA_TYPE_UINT32;
-    shader_param->immediate_constant.u32 = sample_count;
+    shader_param->immediate_constant.u32 = desc->rasterizer_state.ForcedSampleCount ?
+            desc->rasterizer_state.ForcedSampleCount : sample_count;
 
     if (desc->view_instancing_desc.ViewInstanceCount)
     {
@@ -5937,7 +6083,20 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
         {
             vkd3d_shader_parse_input_signature(&dxbc, &io_input_signature);
 
-            if (state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
+            if (partial_input && curr_stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+            {
+                bool valid = graphics->partial_mesh_input ?
+                        vkd3d_validate_mesh_shader_io_signatures(partial_input->output_signature,
+                                partial_input->primitive_signature, &io_input_signature) :
+                        vkd3d_validate_partial_pixel_signature(partial_input->producer_stage,
+                                partial_input->output_signature, &io_input_signature);
+                if (!valid)
+                {
+                    hr = E_INVALIDARG;
+                    goto fail;
+                }
+            }
+            else if (state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
             {
                 /* Mesh shaders are special since register assignment is based on semantics. */
                 if (!vkd3d_validate_mesh_shader_io_signatures(&io_output_signature, &pc_output_signature, &io_input_signature))
@@ -5948,7 +6107,10 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
             }
             else
             {
-                if (!vkd3d_validate_shader_io_signatures(prev_stage,
+                /* Independent fragment libraries have no producer yet. The
+                 * final linked pipeline validates their real stage interface. */
+                if (!(standalone_pixel && curr_stage == VK_SHADER_STAGE_FRAGMENT_BIT) &&
+                        !vkd3d_validate_shader_io_signatures(prev_stage,
                         &io_output_signature, curr_stage, &io_input_signature))
                 {
                     hr = E_INVALIDARG;
@@ -6019,7 +6181,7 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
     vkd3d_shader_free_shader_signature(&pc_output_signature);
     vkd3d_shader_free_shader_signature(&io_output_signature);
 
-    graphics->attribute_count = (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT)
+    graphics->attribute_count = ((graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) || graphics->partial_mesh_input)
             ? 0 : desc->input_layout.NumElements;
 
     if (graphics->attribute_count > ARRAY_SIZE(graphics->attributes))
@@ -6275,7 +6437,8 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
     /* VUID-VkGraphicsPipelineCreateInfo-pLibraries-06627 is very annoying.
      * We cannot modify the viewMask of pre-raster if output viewMask has a mismatch.
      * Just fallback to stall-ful compile if we have to. */
-    has_gpl = state->device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary &&
+    has_gpl = !graphics->forced_sample_count &&
+            state->device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary &&
             !graphics->multiview.dynamic_mask && !graphics->multiview.draw_loop;
 
     library_flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
@@ -6289,7 +6452,7 @@ static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_s
         create_library = true;
     }
 
-    if (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT)
+    if ((graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) || graphics->partial_mesh_input)
     {
         can_compile_pipeline_early = true;
 
@@ -6628,7 +6791,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 
             case VK_PIPELINE_BIND_POINT_GRAPHICS:
                 /* Creating a graphics PSO is more involved ... */
-                hr = d3d12_pipeline_state_init_graphics_create_info(object, device, desc);
+                hr = d3d12_pipeline_state_init_graphics_create_info(object, device, desc, NULL, false);
                 if (SUCCEEDED(hr))
                     hr = d3d12_pipeline_state_init_graphics_spirv(object, desc, desc_cached_pso);
                 if (SUCCEEDED(hr))
@@ -6729,6 +6892,443 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 
     *state = object;
     return S_OK;
+}
+
+static HRESULT d3d12_partial_graphics_copy_mesh_map(struct d3d12_pipeline_state *state,
+        const struct d3d12_partial_graphics_input *input)
+{
+    if (!input || input->producer_stage != VK_SHADER_STAGE_MESH_BIT_EXT)
+        return S_OK;
+    return vkd3d_shader_stage_io_map_copy(&state->graphics.cached_desc.stage_io_map_ms_ps, input->mesh_map) ?
+            S_OK : E_OUTOFMEMORY;
+}
+
+static HRESULT d3d12_partial_graphics_enable_dynamic_raster(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device)
+{
+    const VkPhysicalDeviceExtendedDynamicState3FeaturesEXT *features =
+            &device->device_info.extended_dynamic_state3_features;
+
+    /* Both independent pieces and the linked PSO must declare the same dynamic
+     * state. This also lets a fixed preraster piece accept the pixel piece's
+     * rasterizer without regenerating the preraster shader library. Never enable
+     * an unsupported feature merely because the exported entry point exists. */
+    if (!features->extendedDynamicState3PolygonMode ||
+            !features->extendedDynamicState3DepthClampEnable ||
+            !features->extendedDynamicState3DepthClipEnable ||
+            !features->extendedDynamicState3ConservativeRasterizationMode ||
+            !device->vk_info.EXT_depth_clip_enable || !device->vk_info.EXT_conservative_rasterization)
+        return E_NOTIMPL;
+
+    if (device->api_version < VK_API_VERSION_1_3)
+        return E_NOTIMPL;
+
+    /* Every PGP library declares the same depth/stencil dynamics. The linked
+     * program supplies values without recompiling either shader library. */
+    state->graphics.explicit_dynamic_states |= VKD3D_DYNAMIC_STATE_PARTIAL_RASTER |
+            VKD3D_DYNAMIC_STATE_DEPTH_BIAS | VKD3D_DYNAMIC_STATE_PARTIAL_DEPTH |
+            VKD3D_DYNAMIC_STATE_DEPTH_WRITE_ENABLE | VKD3D_DYNAMIC_STATE_STENCIL_WRITE_MASK |
+            VKD3D_DYNAMIC_STATE_STENCIL_REFERENCE | VKD3D_DYNAMIC_STATE_DEPTH_BOUNDS;
+    return S_OK;
+}
+
+static HRESULT d3d12_partial_graphics_library_compile_samples(struct d3d12_pipeline_state *source,
+        VkGraphicsPipelineLibraryFlagsEXT subsets, struct d3d12_partial_graphics_library **library);
+
+static HRESULT d3d12_partial_graphics_enable_dynamic_line(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device, const D3D12_RASTERIZER_DESC2 *desc)
+{
+    const VkPhysicalDeviceLineRasterizationFeaturesEXT *line = &device->device_info.line_rasterization_features;
+    bool dynamic = device->vk_info.EXT_line_rasterization &&
+            device->device_info.extended_dynamic_state3_features.extendedDynamicState3LineRasterizationMode;
+
+    switch (desc->LineRasterizationMode)
+    {
+        case D3D12_LINE_RASTERIZATION_MODE_ALIASED:
+            break;
+        case D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED:
+            if (!dynamic || !line->smoothLines)
+                return E_NOTIMPL;
+            break;
+        case D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE:
+            if (!device->device_info.features2.features.wideLines)
+                return E_NOTIMPL;
+            /* Fall through: both quad modes need rectangular coverage. */
+        case D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW:
+            if (!dynamic || !line->rectangularLines)
+                return E_NOTIMPL;
+            break;
+        default:
+            return E_INVALIDARG;
+    }
+
+    /* The pre-raster library cannot know the PS partial's fixed line mode.
+     * Declare the same dynamics in every PGP piece and the final executable.
+     * Ordinary PSOs retain their existing static mode/width behavior. */
+    if (dynamic)
+        state->graphics.explicit_dynamic_states |= VKD3D_DYNAMIC_STATE_PARTIAL_LINE;
+    return S_OK;
+}
+
+static void d3d12_partial_graphics_enable_late_samples(struct d3d12_pipeline_state *state)
+{
+    unsigned int i;
+    for (i = 0; i < state->graphics.cached_desc.shader_parameters_count; ++i)
+        if (state->graphics.cached_desc.shader_parameters[i].name == VKD3D_SHADER_PARAMETER_NAME_RASTERIZER_SAMPLE_COUNT)
+        {
+            state->graphics.cached_desc.shader_parameters[i].type = VKD3D_SHADER_PARAMETER_TYPE_SPECIALIZATION_CONSTANT;
+            state->graphics.cached_desc.shader_parameters[i].specialization_constant.id =
+                    VKD3D_SHADER_RASTERIZER_SAMPLE_COUNT_SPEC_CONSTANT;
+        }
+}
+
+static HRESULT d3d12_partial_graphics_enable_dual_source(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device)
+{
+    if (!device->device_info.features2.features.dualSrcBlend)
+        return E_NOTIMPL;
+    state->graphics.cached_desc.is_dual_source_blending = true;
+    state->graphics.rtv_active_mask &= 1u;
+    memset(state->graphics.blend_attachments + 1, 0,
+            sizeof(state->graphics.blend_attachments) - sizeof(state->graphics.blend_attachments[0]));
+    return S_OK;
+}
+
+static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        bool exclude_pixel_shader, bool late_sample_desc, bool dual_source_blend, const struct d3d12_partial_graphics_input *input,
+        struct d3d12_partial_graphics_library **library, bool tir_outputs)
+{
+    const struct vkd3d_vk_device_procs *vk_procs;
+    struct d3d12_cached_pipeline_state empty_cache = {0};
+    struct d3d12_pipeline_state *state;
+    struct vkd3d_compile_scope scope;
+    bool finished = false;
+    unsigned int i;
+    HRESULT hr;
+
+    if (!library)
+        return E_INVALIDARG;
+    *library = NULL;
+    if (!device || !desc || !desc->root_signature || !vkd3d_pipeline_library_subsets_valid(subsets) ||
+            !(subsets & (VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) || desc->cs.BytecodeLength ||
+            desc->stream_output.NumEntries || desc->cached_pso.blob.CachedBlobSizeInBytes)
+        return E_INVALIDARG;
+    if (!device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary)
+        return E_NOTIMPL;
+    if (late_sample_desc && (!(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) ||
+            (subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT)))
+        return E_INVALIDARG;
+    if (!(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) && desc->ps.BytecodeLength)
+        return E_INVALIDARG;
+    if (!(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) &&
+            (desc->vs.BytecodeLength || desc->hs.BytecodeLength || desc->ds.BytecodeLength ||
+            desc->gs.BytecodeLength || desc->as.BytecodeLength || desc->ms.BytecodeLength))
+        return E_INVALIDARG;
+    if ((subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) &&
+            !desc->vs.BytecodeLength && !desc->ms.BytecodeLength)
+        return E_INVALIDARG;
+    if ((subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) &&
+            (!desc->ps.BytecodeLength || exclude_pixel_shader))
+        return E_INVALIDARG;
+    if (input && (!input->output_signature ||
+            !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) ||
+            (subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) ||
+            (input->producer_stage != VK_SHADER_STAGE_VERTEX_BIT &&
+            input->producer_stage != VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT &&
+            input->producer_stage != VK_SHADER_STAGE_GEOMETRY_BIT &&
+            input->producer_stage != VK_SHADER_STAGE_MESH_BIT_EXT)))
+        return E_INVALIDARG;
+    if (input && input->producer_stage == VK_SHADER_STAGE_MESH_BIT_EXT &&
+            (!input->primitive_signature || !input->mesh_map))
+        return E_INVALIDARG;
+    if (!(state = vkd3d_calloc(1, sizeof(*state))))
+        return E_OUTOFMEMORY;
+    if (rwlock_init(&state->lock))
+    {
+        vkd3d_free(state);
+        return E_FAIL;
+    }
+    vk_procs = &device->vk_procs;
+    state->ID3D12PipelineState_iface.lpVtbl = &d3d12_pipeline_state_vtbl;
+    state->refcount = state->internal_refcount = 1;
+    /* The collection translator supplies its resolved root association. */
+    state->root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
+    d3d12_root_signature_inc_ref(state->root_signature);
+
+    vkd3d_pipeline_cache_compat_from_state_desc(&state->pipeline_cache_compat, desc);
+    state->pipeline_cache_compat.root_signature_compat_hash = state->root_signature->pso_compatibility_hash;
+    /* Do not publish partial objects under ordinary PSO disk-cache keys. */
+    if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, &empty_cache, &state->vk_pso_cache)))
+        goto fail;
+
+    vkd3d_compile_scope_begin(&scope, device);
+    hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, input, !input && !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT));
+    if (SUCCEEDED(hr))
+        hr = d3d12_partial_graphics_enable_dynamic_raster(state, device);
+    if (SUCCEEDED(hr))
+        hr = d3d12_partial_graphics_enable_dynamic_line(state, device, &desc->rasterizer_state);
+    if (SUCCEEDED(hr))
+        hr = d3d12_partial_graphics_copy_mesh_map(state, input);
+    if (SUCCEEDED(hr) && tir_outputs)
+    {
+        state->graphics.partial_tir_outputs = true;
+        /* Rasterizer sample count belongs to the fixed PS fields, not to the
+         * late attachment count. The private backend supplies coverage. */
+        for (i = 0; i < state->graphics.cached_desc.shader_parameters_count; ++i)
+            if (state->graphics.cached_desc.shader_parameters[i].name == VKD3D_SHADER_PARAMETER_NAME_RASTERIZER_SAMPLE_COUNT)
+                state->graphics.cached_desc.shader_parameters[i].immediate_constant.u32 = desc->rasterizer_state.ForcedSampleCount;
+    }
+    if (SUCCEEDED(hr) && late_sample_desc)
+        d3d12_partial_graphics_enable_late_samples(state);
+    if (SUCCEEDED(hr) && dual_source_blend)
+        hr = d3d12_partial_graphics_enable_dual_source(state, device);
+    if (SUCCEEDED(hr))
+        hr = d3d12_pipeline_state_init_graphics_spirv(state, desc, &empty_cache);
+    if (SUCCEEDED(hr))
+    {
+        for (i = 0; i < state->graphics.stage_count; ++i)
+            if (state->graphics.code[i].meta.flags & VKD3D_SHADER_META_FLAG_DISABLE_OPTIMIZATIONS)
+                state->graphics.disable_optimization = true;
+        state->graphics.pipeline_layout = state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS ?
+                state->root_signature->mesh.vk_pipeline_layout : state->root_signature->graphics.vk_pipeline_layout;
+        /* Missing PS in an independent preraster piece does not mean discard;
+         * a pixel piece can be linked later unless ExcludePS says otherwise. */
+        if (subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT)
+            state->graphics.rs_desc.rasterizerDiscardEnable = exclude_pixel_shader;
+        hr = d3d12_pipeline_state_finish_graphics(state);
+        finished = SUCCEEDED(hr);
+    }
+    if (SUCCEEDED(hr))
+        hr = late_sample_desc ? d3d12_partial_graphics_library_compile_samples(state, subsets, library) :
+                d3d12_partial_graphics_library_compile(state, subsets, library);
+    vkd3d_compile_scope_end(&scope);
+
+    if (finished)
+    {
+        /* Successful adoption retained the source/device independently. */
+        ID3D12PipelineState_Release(&state->ID3D12PipelineState_iface);
+        return hr;
+    }
+fail:
+    d3d12_pipeline_state_free_spirv_code(state);
+    d3d12_pipeline_state_free_spirv_code_debug(state);
+    d3d12_pipeline_state_destroy_shader_modules(state, device);
+    if (d3d12_pipeline_state_is_graphics(state))
+        d3d12_pipeline_state_free_cached_desc(&state->graphics.cached_desc);
+    if (state->root_signature)
+        d3d12_root_signature_dec_ref(state->root_signature);
+    VK_CALL(vkDestroyPipelineCache(device->vk_device, state->vk_pso_cache, NULL));
+    rwlock_destroy(&state->lock);
+    vkd3d_free(state);
+    return hr;
+}
+
+HRESULT d3d12_partial_graphics_library_create(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        bool exclude_pixel_shader, bool late_sample_desc, bool dual_source_blend, const struct d3d12_partial_graphics_input *input,
+        struct d3d12_partial_graphics_library **library)
+{
+    struct d3d12_pipeline_state_desc no_outputs, outputs;
+    HRESULT hr;
+    if (!desc || !library)
+        return E_INVALIDARG;
+    *library = NULL;
+    if (!desc->rasterizer_state.ForcedSampleCount ||
+            !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT))
+        return d3d12_partial_graphics_library_create_single(device, desc, subsets,
+                exclude_pixel_shader, late_sample_desc, dual_source_blend, input, library, false);
+    if (!device || desc->dsv_format != DXGI_FORMAT_UNKNOWN ||
+            desc->depth_stencil_state.DepthEnable || desc->depth_stencil_state.StencilEnable ||
+            (desc->rasterizer_state.ForcedSampleCount > 1 && desc->sample_desc.Count != 1))
+        return E_INVALIDARG;
+    if (!(device->bc250_tir_revisions & (1u << BC250_TIR_PGP_REVISION)))
+        return E_NOTIMPL;
+    /* At most two native libraries. Final linking chooses by declared RTV
+     * presence; no-output must keep ignoring the API sample mask. All format,
+     * sample-count and mask output-interface state is linked from the final PSO. */
+    subsets &= ~VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+    no_outputs = *desc;
+    memset(&no_outputs.rtv_formats, 0, sizeof(no_outputs.rtv_formats));
+    no_outputs.sample_desc.Count = 1;
+    no_outputs.sample_desc.Quality = 0;
+    hr = d3d12_partial_graphics_library_create_single(device, &no_outputs, subsets,
+            exclude_pixel_shader, false, dual_source_blend, input, library, false);
+    if (FAILED(hr))
+        return hr;
+    outputs = no_outputs;
+    outputs.rtv_formats.NumRenderTargets = 1;
+    outputs.rtv_formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    outputs.sample_mask = ~0u;
+    hr = d3d12_partial_graphics_library_create_single(device, &outputs, subsets,
+            exclude_pixel_shader, false, dual_source_blend, input, &(*library)->tir_outputs, true);
+    if (FAILED(hr))
+    {
+        d3d12_partial_graphics_library_dec_ref(*library);
+        *library = NULL;
+    }
+    return hr;
+}
+
+HRESULT d3d12_partial_graphics_library_create_mesh_pixel(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc, const struct vkd3d_shader_code *representative,
+        VkGraphicsPipelineLibraryFlagsEXT subsets, bool late_sample_desc, bool dual_source_blend,
+        struct d3d12_partial_graphics_library **library)
+{
+    struct vkd3d_shader_mesh_linkage linkage = {0};
+    struct d3d12_partial_graphics_input input = {0};
+    HRESULT hr;
+    int ret;
+
+    if (!library)
+        return E_INVALIDARG;
+    *library = NULL;
+    if (!device || !desc ||
+            !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) ||
+            (subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT))
+        return E_INVALIDARG;
+    if ((ret = vkd3d_shader_mesh_linkage_prepare(representative, &linkage)) < 0)
+        return hresult_from_vkd3d_result(ret);
+    input.producer_stage = VK_SHADER_STAGE_MESH_BIT_EXT;
+    input.output_signature = &linkage.vertex;
+    input.primitive_signature = &linkage.primitive;
+    input.mesh_map = &linkage.map;
+    hr = d3d12_partial_graphics_library_create(device, desc, subsets, false, late_sample_desc, dual_source_blend, &input, library);
+    vkd3d_shader_mesh_linkage_free(&linkage);
+    return hr;
+}
+
+HRESULT d3d12_partial_graphics_library_compile(struct d3d12_pipeline_state *source,
+        VkGraphicsPipelineLibraryFlagsEXT subsets, struct d3d12_partial_graphics_library **library)
+{
+    const struct vkd3d_vk_device_procs *vk_procs;
+    VkGraphicsPipelineLibraryFlagsEXT saved_subsets;
+    VkPipelineCreateFlags2 saved_flags;
+    uint32_t dynamic_states;
+    VkPipeline pipeline;
+    HRESULT hr;
+
+    if (!library)
+        return E_INVALIDARG;
+    *library = NULL;
+    if (!source || !d3d12_pipeline_state_is_graphics(source) || !source->device ||
+            !source->root_signature || (!source->graphics.pipeline_layout &&
+            !d3d12_device_use_descriptor_heap(source->device)) ||
+            source->graphics.pipeline || source->graphics.library ||
+            !(subsets & (VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)))
+        return E_INVALIDARG;
+    if (!vkd3d_pipeline_library_subsets_valid(subsets))
+        return E_INVALIDARG;
+    if (!source->device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary)
+        return E_NOTIMPL;
+
+    /* This compiler state is private to the collection constructor. The normal
+     * variant builder records library bookkeeping on it; retain that state so
+     * a second independently owned piece does not replace the first one. */
+    saved_subsets = source->graphics.library_flags;
+    saved_flags = source->graphics.library_create_flags;
+    pipeline = d3d12_pipeline_state_create_pipeline_variant(source, NULL, source->graphics.dsv_format,
+            source->vk_pso_cache, subsets, &dynamic_states);
+    source->graphics.library_flags = saved_subsets;
+    source->graphics.library_create_flags = saved_flags;
+    if (!pipeline)
+        return E_FAIL;
+
+    hr = d3d12_partial_graphics_library_adopt(source, pipeline, subsets, library);
+    if (FAILED(hr))
+    {
+        vk_procs = &source->device->vk_procs;
+        VK_CALL(vkDestroyPipeline(source->device->vk_device, pipeline, NULL));
+    }
+    return hr;
+}
+
+static HRESULT d3d12_partial_graphics_library_compile_samples(struct d3d12_pipeline_state *source,
+        VkGraphicsPipelineLibraryFlagsEXT subsets, struct d3d12_partial_graphics_library **library)
+{
+    struct d3d12_graphics_pipeline_state *graphics = &source->graphics;
+    const VkPhysicalDeviceLimits *limits = &source->device->device_info.properties2.properties.limits;
+    const VkSpecializationInfo *saved_specs[ARRAY_SIZE(graphics->stages)];
+    struct vkd3d_shader_spec_info specs[ARRAY_SIZE(graphics->stages)];
+    VkSampleCountFlagBits original = graphics->ms_desc.rasterizationSamples;
+    VkGraphicsPipelineLibraryFlagsEXT saved_subsets = graphics->library_flags;
+    VkPipelineCreateFlags2 saved_flags = graphics->library_create_flags;
+    VkSampleCountFlags counts;
+    uint32_t dynamic_states;
+    unsigned int i, n, bit;
+    HRESULT hr;
+
+    *library = NULL;
+    counts = limits->framebufferColorSampleCounts | limits->framebufferDepthSampleCounts |
+            limits->framebufferStencilSampleCounts | limits->framebufferNoAttachmentsSampleCounts;
+    if (graphics->rt_count)
+        counts &= limits->framebufferColorSampleCounts;
+    if (graphics->ds_desc.depthTestEnable)
+        counts &= limits->framebufferDepthSampleCounts;
+    if (graphics->ds_desc.stencilTestEnable)
+        counts &= limits->framebufferStencilSampleCounts;
+    counts &= 0x7f;
+    if (!(counts & original))
+        return E_INVALIDARG;
+
+    /* One DXIL translation, bounded native variants at collection creation.
+     * Final linking never specializes or recompiles these shader libraries. */
+    memset(specs, 0, sizeof(specs));
+    for (i = 0; i < graphics->stage_count; ++i)
+    {
+        const VkSpecializationInfo *old = saved_specs[i] = graphics->stages[i].pSpecializationInfo;
+        struct vkd3d_shader_spec_info *info = &specs[i];
+        n = old ? old->mapEntryCount : 0;
+        if (n >= VKD3D_SHADER_SPEC_INFO_MAP_ENTRIES || (old && old->dataSize > 7 * sizeof(uint32_t)))
+            return E_NOTIMPL;
+        if (old)
+        {
+            memcpy(info->map_entries, old->pMapEntries, n * sizeof(*info->map_entries));
+            memcpy(info->generic_u32, old->pData, old->dataSize);
+        }
+        info->map_entries[n].constantID = VKD3D_SHADER_RASTERIZER_SAMPLE_COUNT_SPEC_CONSTANT;
+        info->map_entries[n].offset = 7 * sizeof(uint32_t);
+        info->map_entries[n].size = sizeof(uint32_t);
+        info->generic_u32[7] = original;
+        info->spec_info.pData = info->generic_u32;
+        info->spec_info.dataSize = 8 * sizeof(uint32_t);
+        info->spec_info.pMapEntries = info->map_entries;
+        info->spec_info.mapEntryCount = n + 1;
+    }
+    for (i = 0; i < graphics->stage_count; ++i)
+        graphics->stages[i].pSpecializationInfo = &specs[i].spec_info;
+
+    hr = d3d12_partial_graphics_library_compile(source, subsets, library);
+    if (SUCCEEDED(hr))
+    {
+        (*library)->sample_counts = counts;
+        for (bit = 0; bit < 7; ++bit)
+        {
+            VkSampleCountFlagBits count = (VkSampleCountFlagBits)(1u << bit);
+            if (!(counts & count) || count == original)
+                continue;
+            graphics->ms_desc.rasterizationSamples = count;
+            for (i = 0; i < graphics->stage_count; ++i)
+                specs[i].generic_u32[7] = count;
+            (*library)->sample_variants[bit] = d3d12_pipeline_state_create_pipeline_variant(source, NULL,
+                    graphics->dsv_format, source->vk_pso_cache, subsets, &dynamic_states);
+            graphics->library_flags = saved_subsets;
+            graphics->library_create_flags = saved_flags;
+            if (!(*library)->sample_variants[bit])
+            {
+                d3d12_partial_graphics_library_dec_ref(*library);
+                *library = NULL;
+                hr = E_FAIL;
+                break;
+            }
+        }
+    }
+    graphics->ms_desc.rasterizationSamples = original;
+    for (i = 0; i < graphics->stage_count; ++i)
+        graphics->stages[i].pSpecializationInfo = saved_specs[i];
+    return hr;
 }
 
 static VkPipeline d3d12_pipeline_state_find_compiled_pipeline(struct d3d12_pipeline_state *state,
@@ -6887,9 +7487,9 @@ static void d3d12_pipeline_state_log_graphics_state(const struct d3d12_pipeline_
 
 static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline_state *state,
         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
-        uint32_t dynamic_state_flags, VkPipeline *vk_pipeline)
+        uint32_t dynamic_state_flags, enum vkd3d_pipeline_link_policy link_policy,
+        const struct vkd3d_pipeline_libraries *partial_libraries, VkPipeline *vk_pipeline)
 {
-    const struct vkd3d_vk_device_procs *vk_procs = &state->device->vk_procs;
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
     struct vkd3d_fragment_output_pipeline_desc fragment_output_desc;
     struct vkd3d_vertex_input_pipeline_desc vertex_input_desc;
@@ -6898,24 +7498,33 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     struct vkd3d_driver_cache_probe probe;
     VkGraphicsPipelineCreateInfo create_info;
     VkPipelineCreateFlags2CreateInfo flags2;
-    VkPipeline vk_libraries[3];
-    uint32_t library_count = 0;
+    struct vkd3d_pipeline_libraries libraries = {0};
+    struct bc250_tir_pipeline tir;
     VkResult vr;
 
-    vk_libraries[library_count++] = graphics->library;
+    if (partial_libraries)
+        libraries = *partial_libraries;
+    else if (!vkd3d_pipeline_libraries_add(&libraries, graphics->library, graphics->library_flags))
+        return VK_ERROR_INITIALIZATION_FAILED;
 
-    if ((!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT)) &&
-            (!(graphics->library_flags & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT)))
+    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) && !graphics->partial_mesh_input &&
+            (!(libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT)))
     {
         vkd3d_vertex_input_pipeline_desc_init(&vertex_input_desc, state, key, dynamic_state_flags);
-        vk_libraries[library_count++] = d3d12_device_get_or_create_vertex_input_pipeline(state->device, &vertex_input_desc);
+        if (!vkd3d_pipeline_libraries_add(&libraries,
+                d3d12_device_get_or_create_vertex_input_pipeline(state->device, &vertex_input_desc),
+                VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT))
+            return VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    if (!(graphics->library_flags & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT))
+    if (!(libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT))
     {
         vkd3d_fragment_output_pipeline_desc_init(&fragment_output_desc, state, dsv_format,
                 key ? key->view_mask : 0, dynamic_state_flags);
-        vk_libraries[library_count++] = d3d12_device_get_or_create_fragment_output_pipeline(state->device, &fragment_output_desc);
+        if (!vkd3d_pipeline_libraries_add(&libraries,
+                d3d12_device_get_or_create_fragment_output_pipeline(state->device, &fragment_output_desc),
+                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT))
+            return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     memset(&flags2, 0, sizeof(flags2));
@@ -6924,8 +7533,8 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
 
     memset(&library_info, 0, sizeof(library_info));
     library_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
-    library_info.libraryCount = library_count;
-    library_info.pLibraries = vk_libraries;
+    library_info.libraryCount = libraries.count;
+    library_info.pLibraries = libraries.handles;
 
     memset(&create_info, 0, sizeof(create_info));
     create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -6933,15 +7542,17 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     create_info.basePipelineIndex = -1;
 
     vk_prepend_struct(&create_info, &library_info);
+    if (graphics->partial_tir_outputs)
+    {
+        tir = (struct bc250_tir_pipeline){BC250_STRUCTURE_TYPE_TIR, NULL, BC250_TIR_PGP_REVISION,
+                graphics->forced_sample_count, graphics->ms_desc.rasterizationSamples, graphics->sample_mask};
+        vk_prepend_struct(&create_info, &tir);
+    }
 
     if (graphics->disable_optimization)
         flags2.flags |= VK_PIPELINE_CREATE_2_DISABLE_OPTIMIZATION_BIT;
 
-    /* Only use LINK_TIME_OPTIMIZATION for the primary pipeline for now,
-     * accept a small runtime perf hit on subsequent compiles in order
-     * to avoid stutter. */
-    if (!key)
-        flags2.flags |= VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT;
+    flags2.flags = vkd3d_pipeline_link_flags(flags2.flags, link_policy);
 
     cookie = vkd3d_queue_timeline_trace_register_pso_compile(&state->device->queue_timeline_trace);
 
@@ -6957,7 +7568,8 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
      * band (struct vkd3d_pipeline_compile_limiter). */
     vkd3d_driver_cache_probe_begin(&state->device->disk_cache, &probe, &create_info);
     vr = vkd3d_create_graphics_pipeline_limited(state->device, vk_cache, &create_info, &flags2, !!key, vk_pipeline);
-    vkd3d_driver_cache_probe_end(&state->device->disk_cache, &probe, key ? "link-fast" : "link-lto", vk_cache, vr,
+    vkd3d_driver_cache_probe_end(&state->device->disk_cache, &probe,
+            link_policy == VKD3D_PIPELINE_LINK_MINIMAL ? "link-fast" : "link-lto", vk_cache, vr,
             vkd3d_pipeline_cache_compatibility_condense(&state->pipeline_cache_compat), key, 0, NULL);
 
     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
@@ -6976,6 +7588,328 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     return vr;
 }
 
+HRESULT d3d12_partial_graphics_libraries_link(struct d3d12_pipeline_state *state,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count,
+        bool optimize, VkPipeline *pipeline)
+{
+    VkDynamicState dynamic_states[ARRAY_SIZE(vkd3d_dynamic_state_list)];
+    VkPipelineDynamicStateCreateInfo dynamic_info;
+    struct vkd3d_pipeline_libraries libraries = {0};
+    struct d3d12_pipeline_state *source;
+    uint32_t dynamic_flags;
+    unsigned int i;
+    VkResult vr;
+
+    if (!pipeline)
+        return E_INVALIDARG;
+    *pipeline = VK_NULL_HANDLE;
+    if (!state || !state->device || !state->root_signature ||
+            !d3d12_pipeline_state_is_graphics(state) || !parts || !count || count > 4)
+        return E_INVALIDARG;
+
+    /* The collection translator resolves late fields before this call.
+     * Separate collections may own separate objects for identical roots. Use
+     * the engine's root and layout compatibility keys, as for embedded roots,
+     * instead of comparing Vulkan handles. Zero denotes an unkeyed root and
+     * is only accepted when the very same root object is shared.
+     * Ownership of the parts and the resolved state stays with the caller. */
+    for (i = 0; i < count; ++i)
+    {
+        VkPipeline selected;
+        unsigned int bit;
+        struct d3d12_partial_graphics_library *part = parts[i];
+        if (part && state->graphics.rt_count && part->tir_outputs)
+            part = part->tir_outputs;
+        if (!part || !(source = part->source) || source->device != state->device ||
+                source->pipeline_type != state->pipeline_type ||
+                !source->root_signature ||
+                (source->root_signature != state->root_signature &&
+                (!source->root_signature->pso_compatibility_hash ||
+                source->root_signature->pso_compatibility_hash != state->root_signature->pso_compatibility_hash ||
+                !source->root_signature->layout_compatibility_hash ||
+                source->root_signature->layout_compatibility_hash != state->root_signature->layout_compatibility_hash)) ||
+                source->graphics.multiview.view_mask != state->graphics.multiview.view_mask ||
+                ((part->subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) &&
+                source->graphics.ms_desc.alphaToCoverageEnable != state->graphics.ms_desc.alphaToCoverageEnable))
+            return E_INVALIDARG;
+        if (part->subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)
+        {
+            const struct d3d12_graphics_pipeline_state *fixed = &parts[i]->source->graphics;
+            if (parts[i]->tir_outputs &&
+                    (unsigned int)fixed->ms_desc.rasterizationSamples != state->graphics.partial_fixed_forced_samples)
+                return E_INVALIDARG;
+        }
+        if (source->graphics.partial_tir_outputs && source->graphics.forced_sample_count != state->graphics.forced_sample_count)
+            return E_INVALIDARG;
+        selected = part->pipeline;
+        if ((part->subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) &&
+                !source->graphics.partial_tir_outputs &&
+                source->graphics.ms_desc.rasterizationSamples != state->graphics.ms_desc.rasterizationSamples)
+        {
+            if (!(part->sample_counts & state->graphics.ms_desc.rasterizationSamples))
+                return E_INVALIDARG;
+            for (bit = 0; bit < 7 && (1u << bit) != (unsigned int)state->graphics.ms_desc.rasterizationSamples; ++bit) {}
+            if (bit == 7 || !(selected = part->sample_variants[bit]))
+                return E_INVALIDARG;
+        }
+        if (!vkd3d_pipeline_libraries_add(&libraries, selected, part->subsets))
+            return E_INVALIDARG;
+    }
+    if (!(libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) ||
+            (!state->graphics.rs_desc.rasterizerDiscardEnable &&
+            !(libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) ||
+            (state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS &&
+            (libraries.subsets & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT)))
+        return E_INVALIDARG;
+
+    for (i = 0; i < count; ++i)
+        d3d12_partial_graphics_library_inc_ref(parts[i]);
+    dynamic_flags = d3d12_graphics_pipeline_state_init_dynamic_state(state, &dynamic_info, dynamic_states, NULL);
+    vr = d3d12_pipeline_state_link_pipeline_variant(state, NULL, state->graphics.dsv_format,
+            vkd3d_pipeline_library_driver_cache(&state->device->disk_cache, state->vk_pso_cache),
+            dynamic_flags, optimize ? VKD3D_PIPELINE_LINK_OPTIMIZE : VKD3D_PIPELINE_LINK_MINIMAL,
+            &libraries, pipeline);
+    for (i = 0; i < count; ++i)
+        d3d12_partial_graphics_library_dec_ref(parts[i]);
+    return hresult_from_vk_result(vr);
+}
+
+HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count,
+        bool optimize, struct d3d12_pipeline_state **out)
+{
+    struct d3d12_cached_pipeline_state empty_cache = {0};
+    const struct vkd3d_vk_device_procs *vk_procs;
+    struct d3d12_pipeline_state *state;
+    unsigned int i, j, k;
+    HRESULT hr;
+
+    if (!out)
+        return E_INVALIDARG;
+    *out = NULL;
+    if (!device || !desc || !desc->root_signature || !parts || !count || count > 4 ||
+            desc->cs.BytecodeLength || desc->stream_output.NumEntries || desc->cached_pso.blob.CachedBlobSizeInBytes)
+        return E_INVALIDARG;
+    for (i = 0; i < count; ++i)
+        if (!parts[i] || !parts[i]->source || parts[i]->source->device != device)
+            return E_INVALIDARG;
+    if (!(state = vkd3d_calloc(1, sizeof(*state))))
+        return E_OUTOFMEMORY;
+    if (rwlock_init(&state->lock))
+    {
+        vkd3d_free(state);
+        return E_FAIL;
+    }
+    vk_procs = &device->vk_procs;
+    state->ID3D12PipelineState_iface.lpVtbl = &d3d12_pipeline_state_vtbl;
+    state->refcount = state->internal_refcount = 1;
+    state->root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
+    d3d12_root_signature_inc_ref(state->root_signature);
+    vkd3d_pipeline_cache_compat_from_state_desc(&state->pipeline_cache_compat, desc);
+    state->pipeline_cache_compat.root_signature_compat_hash = state->root_signature->pso_compatibility_hash;
+    if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, &empty_cache, &state->vk_pso_cache)))
+        goto fail;
+    if (FAILED(hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, NULL, false)))
+        goto fail;
+
+    if (FAILED(hr = d3d12_partial_graphics_enable_dynamic_raster(state, device)))
+        goto fail;
+    if (FAILED(hr = d3d12_partial_graphics_enable_dynamic_line(state, device, &desc->rasterizer_state)))
+        goto fail;
+
+    state->graphics.partial_tir_outputs = state->graphics.forced_sample_count && state->graphics.rt_count;
+    state->graphics.partial_fixed_forced_samples = desc->rasterizer_state.ForcedSampleCount;
+
+    /* The resolved description supplies signatures and fixed state, not a new
+     * shader compile. Copy only metadata: modules, code and specialization
+     * pointers remain owned by the independent libraries. */
+    for (i = 0; i < state->graphics.stage_count; ++i)
+    {
+        VkShaderStageFlagBits stage = state->graphics.cached_desc.bytecode_stages[i];
+        const struct vkd3d_shader_meta *meta = NULL;
+        struct vkd3d_shader_code bytecode = {.code = state->graphics.cached_desc.bytecode[i].pShaderBytecode,
+                .size = state->graphics.cached_desc.bytecode[i].BytecodeLength};
+        for (j = 0; j < count; ++j)
+        {
+            const struct d3d12_graphics_pipeline_state *source = &parts[j]->source->graphics;
+            VkGraphicsPipelineLibraryFlagsEXT subset = stage == VK_SHADER_STAGE_FRAGMENT_BIT ?
+                    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT :
+                    VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+            if (!(parts[j]->subsets & subset))
+                continue;
+            for (k = 0; k < source->stage_count; ++k)
+                if (source->stages[k].stage == stage)
+                {
+                    if (meta)
+                    {
+                        hr = E_INVALIDARG;
+                        goto fail;
+                    }
+                    meta = &source->code[k].meta;
+                }
+        }
+        if (!meta || !bytecode.size || meta->hash != vkd3d_shader_hash(&bytecode))
+        {
+            hr = E_INVALIDARG;
+            goto fail;
+        }
+        state->graphics.code[i].meta = *meta;
+        state->graphics.stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        state->graphics.stages[i].stage = stage;
+        state->graphics.stages[i].pName = "main";
+        state->graphics.disable_optimization |= !!(meta->flags & VKD3D_SHADER_META_FLAG_DISABLE_OPTIMIZATIONS);
+    }
+    for (j = 0; j < count; ++j)
+    {
+        const struct d3d12_graphics_pipeline_state *source = &parts[j]->source->graphics;
+        for (k = 0; k < source->stage_count; ++k)
+        {
+            VkShaderStageFlagBits stage = source->stages[k].stage;
+            VkGraphicsPipelineLibraryFlagsEXT subset = stage == VK_SHADER_STAGE_FRAGMENT_BIT ?
+                    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT :
+                    VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+            if ((parts[j]->subsets & subset) && !(state->graphics.stage_flags & stage))
+            {
+                hr = E_INVALIDARG;
+                goto fail;
+            }
+        }
+    }
+    if (FAILED(hr = d3d12_pipeline_state_graphics_handle_meta(state, device)))
+        goto fail;
+    state->graphics.pipeline_layout = state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS ?
+            state->root_signature->mesh.vk_pipeline_layout : state->root_signature->graphics.vk_pipeline_layout;
+    if (FAILED(hr = d3d12_pipeline_state_finish_graphics(state)))
+        goto fail;
+    if (FAILED(hr = d3d12_partial_graphics_pipeline_link(state, parts, count, optimize)))
+    {
+        ID3D12PipelineState_Release(&state->ID3D12PipelineState_iface);
+        return hr;
+    }
+    *out = state;
+    return S_OK;
+
+fail:
+    if (d3d12_pipeline_state_is_graphics(state))
+        d3d12_pipeline_state_free_cached_desc(&state->graphics.cached_desc);
+    d3d12_root_signature_dec_ref(state->root_signature);
+    VK_CALL(vkDestroyPipelineCache(device->vk_device, state->vk_pso_cache, NULL));
+    rwlock_destroy(&state->lock);
+    vkd3d_free(state);
+    return hr;
+}
+
+HRESULT vkd3d_create_linked_graphics_pipeline(ID3D12Device *device_iface,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count,
+        bool optimize, REFIID iid, void **pipeline)
+{
+    struct d3d12_pipeline_state_desc resolved;
+    struct d3d12_pipeline_state *state;
+    VkPipelineBindPoint bind_point;
+    HRESULT hr;
+
+    if (!pipeline)
+        return E_INVALIDARG;
+    *pipeline = NULL;
+    if (!device_iface || !desc || !iid || !parts || !count || count > 4)
+        return E_INVALIDARG;
+    if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_stream_desc(&resolved, desc, &bind_point)))
+        return hr;
+    if (bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS)
+        return E_INVALIDARG;
+    if (FAILED(hr = d3d12_partial_graphics_pipeline_create(
+            impl_from_ID3D12Device((d3d12_device_iface *)device_iface), &resolved,
+            parts, count, optimize, &state)))
+        return hr;
+    return return_interface(&state->ID3D12PipelineState_iface,
+            &IID_ID3D12PipelineState, iid, pipeline);
+}
+
+HRESULT vkd3d_create_partial_graphics_library(ID3D12Device *device_iface,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        bool exclude_pixel_shader, const struct vkd3d_partial_graphics_linkage *linkage,
+        const D3D12_SHADER_BYTECODE *representative_mesh, bool late_sample_desc, bool dual_source_blend,
+        struct d3d12_partial_graphics_library **library)
+{
+    struct d3d12_pipeline_state_desc resolved;
+    struct d3d12_partial_graphics_input input;
+    struct d3d12_device *device;
+    VkPipelineBindPoint bind_point;
+    HRESULT hr;
+    if (!library)
+        return E_INVALIDARG;
+    *library = NULL;
+    if (!device_iface || !desc || !vkd3d_pipeline_library_subsets_valid(subsets) ||
+            (representative_mesh && (linkage || exclude_pixel_shader ||
+            !representative_mesh->pShaderBytecode || !representative_mesh->BytecodeLength)))
+        return E_INVALIDARG;
+    hr = d3d12_pipeline_state_desc_from_stream(&resolved, desc, &bind_point, true);
+    if (FAILED(hr))
+        return hr;
+    if (bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS)
+        return E_INVALIDARG;
+    device = impl_from_ID3D12Device((d3d12_device_iface *)device_iface);
+    if (representative_mesh)
+    {
+        struct vkd3d_shader_code code = {.code = representative_mesh->pShaderBytecode,
+                .size = representative_mesh->BytecodeLength};
+        return d3d12_partial_graphics_library_create_mesh_pixel(device, &resolved, &code, subsets, late_sample_desc, dual_source_blend, library);
+    }
+    if (linkage)
+    {
+        input.producer_stage = linkage->producer_stage;
+        input.output_signature = linkage->output_signature;
+        input.primitive_signature = linkage->primitive_signature;
+        input.mesh_map = linkage->mesh_map;
+    }
+    return d3d12_partial_graphics_library_create(device, &resolved, subsets, exclude_pixel_shader,
+            late_sample_desc, dual_source_blend, linkage ? &input : NULL, library);
+}
+
+void vkd3d_partial_graphics_library_add_ref(struct d3d12_partial_graphics_library *library)
+{
+    if (library)
+        d3d12_partial_graphics_library_inc_ref(library);
+}
+
+void vkd3d_partial_graphics_library_release(struct d3d12_partial_graphics_library *library)
+{
+    if (library)
+        d3d12_partial_graphics_library_dec_ref(library);
+}
+
+HRESULT d3d12_partial_graphics_pipeline_link(struct d3d12_pipeline_state *state,
+        struct d3d12_partial_graphics_library *const *parts, unsigned int count, bool optimize)
+{
+    VkDynamicState dynamic_states[ARRAY_SIZE(vkd3d_dynamic_state_list)];
+    VkPipelineDynamicStateCreateInfo dynamic_info;
+    VkPipeline pipeline;
+    unsigned int i;
+    HRESULT hr;
+
+    if (!state || !d3d12_pipeline_state_is_graphics(state) || !parts || !count || count > 4 ||
+            state->graphics.pipeline || state->graphics.library || state->graphics.partial_library_count)
+        return E_INVALIDARG;
+    for (i = 0; i < count; ++i)
+        if (!parts[i] || parts[i]->source == state)
+            return E_INVALIDARG; /* Avoid a PSO -> part -> same PSO reference cycle. */
+
+    if (FAILED(hr = d3d12_partial_graphics_libraries_link(state, parts, count, optimize, &pipeline)))
+        return hr;
+    for (i = 0; i < count; ++i)
+    {
+        d3d12_partial_graphics_library_inc_ref(parts[i]);
+        state->graphics.partial_libraries[i] = parts[i];
+    }
+    state->graphics.partial_library_count = count;
+    state->graphics.pipeline_dynamic_states = d3d12_graphics_pipeline_state_init_dynamic_state(
+            state, &dynamic_info, dynamic_states, NULL);
+    state->graphics.pipeline = pipeline;
+    return S_OK;
+}
+
 VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_state *state,
         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
         VkGraphicsPipelineLibraryFlagsEXT library_flags, uint32_t *dynamic_state_flags)
@@ -6986,6 +7920,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     VkPipelineCreationFeedbackEXT feedbacks[VKD3D_MAX_SHADER_STAGES];
     struct vkd3d_fragment_output_pipeline_desc fragment_output_desc;
     VkPipelineShaderStageCreateInfo stages[VKD3D_MAX_SHADER_STAGES];
+    VkPipelineShaderStageCreateInfo library_stages[VKD3D_MAX_SHADER_STAGES];
     struct vkd3d_shader_spec_info loop_specs[VKD3D_MAX_SHADER_STAGES];
     VkGraphicsPipelineLibraryCreateInfoEXT library_create_info;
     struct vkd3d_vertex_input_pipeline_desc vertex_input_desc;
@@ -6999,6 +7934,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     struct vkd3d_driver_cache_probe probe;
     const char *probe_path;
     VkGraphicsPipelineCreateInfo pipeline_desc;
+    struct bc250_tir_pipeline tir;
     VkPipelineViewportStateCreateInfo vp_desc;
     VkPipelineCreateFlags2CreateInfo flags2;
     VkPipelineCreationFeedbackEXT feedback;
@@ -7014,19 +7950,40 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     /* amdgpu-wddm fork: the device's persisted driver cache, also for fallback variants. */
     vk_cache = vkd3d_pipeline_library_driver_cache(&device->disk_cache, vk_cache);
 
+    if (!library_flags && graphics->partial_library_count)
+    {
+        struct vkd3d_pipeline_libraries libraries = {0};
+        for (i = 0; i < graphics->partial_library_count; ++i)
+            if (!vkd3d_pipeline_libraries_add(&libraries, graphics->partial_libraries[i]->pipeline,
+                    graphics->partial_libraries[i]->subsets))
+                return VK_NULL_HANDLE;
+        /* A changed view mask needs newly compiled preraster pieces. Never
+         * silently link an incompatible viewMask or compile a monolithic PSO. */
+        if (key && (graphics->multiview.draw_loop ||
+                (graphics->multiview.dynamic_mask && key->view_mask != graphics->multiview.view_mask) ||
+                (key->rasterization_samples && key->rasterization_samples != graphics->ms_desc.rasterizationSamples)))
+            return VK_NULL_HANDLE;
+        if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format, vk_cache,
+                *dynamic_state_flags, key ? VKD3D_PIPELINE_LINK_MINIMAL : VKD3D_PIPELINE_LINK_OPTIMIZE,
+                &libraries, &vk_pipeline) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        return vk_pipeline;
+    }
+
     if (!library_flags && graphics->library)
     {
         if (d3d12_pipeline_state_link_pipeline_variant(state, key, dsv_format,
-                vk_cache, *dynamic_state_flags, &vk_pipeline) == VK_SUCCESS)
+                vk_cache, *dynamic_state_flags,
+                key ? VKD3D_PIPELINE_LINK_MINIMAL : VKD3D_PIPELINE_LINK_OPTIMIZE, NULL, &vk_pipeline) == VK_SUCCESS)
             return vk_pipeline;
     }
 
-    has_vertex_input_state = !(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+    has_vertex_input_state = !(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) && !graphics->partial_mesh_input &&
             (!library_flags || (library_flags & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT));
 
     has_fragment_output_state = !library_flags || (library_flags & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT);
 
-    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
+    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) && !graphics->partial_mesh_input)
     {
         vkd3d_vertex_input_pipeline_desc_init(&vertex_input_desc, state, key, *dynamic_state_flags);
         vkd3d_vertex_input_pipeline_desc_prepare(&vertex_input_desc);
@@ -7067,6 +8024,14 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
 
     vk_prepend_struct(&pipeline_desc, &fragment_output_desc.rt_info);
 
+    if (graphics->forced_sample_count)
+    {
+        tir = (struct bc250_tir_pipeline){BC250_STRUCTURE_TYPE_TIR, NULL,
+                graphics->partial_tir_outputs ? BC250_TIR_PGP_REVISION : BC250_TIR_REVISION,
+                graphics->forced_sample_count, graphics->ms_desc.rasterizationSamples, graphics->sample_mask};
+        vk_prepend_struct(&pipeline_desc, &tir);
+    }
+
     if (d3d12_device_supports_variable_shading_rate_tier_2(device))
         flags2.flags |= VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
@@ -7079,7 +8044,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         pipeline_desc.pInputAssemblyState = &vertex_input_desc.ia_info;
     }
 
-    if (has_fragment_output_state || graphics->ms_desc.sampleShadingEnable)
+    if (has_fragment_output_state || graphics->ms_desc.sampleShadingEnable || graphics->partial_tir_outputs)
     {
         multisample_info = graphics->ms_desc;
 
@@ -7188,8 +8153,17 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         pipeline_desc.pStages = stages;
     }
 
+    /* Filter after specialization and temporary-module creation so that their
+     * ownership indices remain unchanged. Repeat selection after cache misses. */
+    if (library_flags)
+    {
+        pipeline_desc.stageCount = vkd3d_pipeline_library_stages(pipeline_desc.pStages,
+                graphics->stage_count, library_flags, library_stages);
+        pipeline_desc.pStages = library_stages;
+    }
+
     /* If we're using identifiers, set the appropriate flag. */
-    for (i = 0; i < graphics->stage_count; i++)
+    for (i = 0; i < pipeline_desc.stageCount; i++)
         if (pipeline_desc.pStages[i].module == VK_NULL_HANDLE)
             flags2.flags |= VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
@@ -7221,6 +8195,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     vk_prepend_struct(&pipeline_desc, &flags2);
 
     probe_path = library_flags ? "gfx-lib" : key ? "gfx-variant" : "gfx";
+    vkd3d_pipeline_library_fixed_state(&pipeline_desc, library_flags, graphics->partial_tir_outputs);
     /* amdgpu-wddm fork: only a real compile takes a slot; a variant at draw time (key) is exempt from the thermal
      * band (struct vkd3d_pipeline_compile_limiter). */
     vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_desc);
@@ -7275,6 +8250,12 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
 
         /* Internal modules are known to be non-null now. */
         pipeline_desc.pStages = state->graphics.stages;
+        if (library_flags)
+        {
+            pipeline_desc.stageCount = vkd3d_pipeline_library_stages(state->graphics.stages,
+                    graphics->stage_count, library_flags, library_stages);
+            pipeline_desc.pStages = library_stages;
+        }
 
         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
         vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_desc);
@@ -7403,7 +8384,7 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
     memset(&pipeline_key, 0, sizeof(pipeline_key));
 
     /* Try to keep as much dynamic state as possible so we don't have to rebind state unnecessarily. */
-    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
+    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT) && !graphics->partial_mesh_input)
     {
         if (graphics->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
             graphics->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
