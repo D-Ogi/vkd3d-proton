@@ -78,7 +78,7 @@
  *   It waits about 10 s, and vkd3d-proton logs the timeout as an error.
  *
  * Usage: amdgpu_wddm_vkd3d_engine_test.exe <path to amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]
- *        [--fl <hex>] [--inline | --hang | --diagnostics-only <new log file>]
+ *        [--fl <hex>] [--abi-only | --inline | --hang | --diagnostics-only <new log file>]
  *   adapter substring  picks the DXGI adapter whose description contains it (default: first hardware adapter)
  *   --icd              loads that Vulkan driver DLL directly (entry vk_icdGetInstanceProcAddr), as the shell
  *                      loads hosted RADV, instead of the Vulkan loader (vulkan-1.dll)
@@ -3976,7 +3976,7 @@ int main(int argc, char **argv)
     ID3D12Device *device = NULL;
     UINT32 min_fl = 0xb000;
     HMODULE engine, driver;
-    BOOL inline_mode = FALSE, hang_mode = FALSE, tail_kept;
+    BOOL inline_mode = FALSE, hang_mode = FALSE, abi_only = FALSE, tail_kept;
     char full[MAX_PATH];
     unsigned int k;
     LUID luid;
@@ -3985,7 +3985,7 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         printf("usage: amdgpu_wddm_vkd3d_engine_test <amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]"
-                " [--fl <hex>] [--inline | --hang | --diagnostics-only <new log file>]\n");
+                " [--fl <hex>] [--abi-only | --inline | --hang | --diagnostics-only <new log file>]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -3998,6 +3998,8 @@ int main(int argc, char **argv)
             min_fl = (UINT32)strtoul(argv[++i], NULL, 16);
         else if (!strcmp(argv[i], "--inline"))
             inline_mode = TRUE;
+        else if (!strcmp(argv[i], "--abi-only"))
+            abi_only = TRUE;
         else if (!strcmp(argv[i], "--hang"))
             hang_mode = TRUE;
         else if (!strcmp(argv[i], "--diagnostics-only") && i + 1 < argc)
@@ -4010,9 +4012,9 @@ int main(int argc, char **argv)
         else
             filter = argv[i];
     }
-    if (inline_mode && hang_mode)
+    if ((inline_mode && hang_mode) || (abi_only && (inline_mode || hang_mode || diagnostic_log || icd || filter)))
     {
-        printf("FAIL  --inline and --hang are separate runs\n");
+        printf("FAIL  --inline and --hang are separate runs; --abi-only cannot use GPU or diagnostic options\n");
         return 2;
     }
     if (diagnostic_log)
@@ -4057,33 +4059,6 @@ int main(int argc, char **argv)
         DeleteCriticalSection(&vkw.lock);
         return failures ? 1 : 0;
     }
-    if (icd)
-    {
-        if (!GetFullPathNameA(icd, MAX_PATH, full, NULL)
-                || !(driver = LoadLibraryExA(full, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)))
-        {
-            printf("FAIL  LoadLibrary %s: %lu\n", icd, GetLastError());
-            return 1;
-        }
-        gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(driver, "vk_icdGetInstanceProcAddr");
-    }
-    else if ((driver = LoadLibraryW(L"vulkan-1.dll")))
-    {
-        gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(driver, "vkGetInstanceProcAddr");
-    }
-    if (!gipa)
-    {
-        printf("FAIL  no Vulkan entry point (%s)\n", icd ? icd : "vulkan-1.dll");
-        return 1;
-    }
-    if (!find_adapter(filter, &luid))
-    {
-        printf("FAIL  no hardware DXGI adapter%s%s\n", filter ? " matching " : "", filter ? filter : "");
-        return 1;
-    }
-    check(census_init(engine),
-            "thread census: NtQueryInformationThread and the module range of amdgpu_wddm_vkd3d.dll");
-
     /* Export and version rules. */
     get_funcs = (PFN_BC250_VKD3D_ENGINE_GET_FUNCS)(void *)GetProcAddress(engine, BC250_VKD3D_ENGINE_GET_FUNCS_NAME);
     check(get_funcs != NULL, "export " BC250_VKD3D_ENGINE_GET_FUNCS_NAME);
@@ -4142,14 +4117,71 @@ int main(int argc, char **argv)
             "GetFuncs(1.2) with a 1.3-sized table fills the entries up to 1.2, and the 1.3 entries NULL");
     memset(&funcs, 0, sizeof(funcs));
     funcs.Size = sizeof(funcs);
-    check(get_funcs(ABI_1_3, &funcs) == S_OK && funcs.AbiVersion == ABI_1_3 && funcs.CreateDevice
+    check(get_funcs(ABI_1_3, &funcs) == S_OK && funcs.AbiVersion == BC250_VKD3D_ENGINE_ABI_VERSION && funcs.CreateDevice
             && funcs.CreateCommandQueue && funcs.GetVulkanHandles && funcs.CreateHeapFromMemory && funcs.MapHeap
             && funcs.UnmapHeap && funcs.QueryAdapterCaps && funcs.QueryLinearImage
-            && funcs.CreateLinearPlacedResource, "GetFuncs(1.3) fills every entry");
+            && funcs.CreateLinearPlacedResource && !funcs.CreatePartialGraphicsLibrary
+            && !funcs.AddRefPartialGraphicsLibrary && !funcs.ReleasePartialGraphicsLibrary
+            && !funcs.CreateLinkedGraphicsPipeline, "GetFuncs(1.3) fills legacy entries only and reports provider ABI");
+    memset(&funcs, 0x5e, sizeof(funcs));
+    funcs.Size = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3;
+    check(get_funcs(ABI_1_3, &funcs) == S_OK && funcs.CreateLinearPlacedResource,
+            "GetFuncs(1.3) accepts the original table size");
+    for (k = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3, tail_kept = TRUE; k < sizeof(funcs); ++k)
+        tail_kept &= ((const BYTE *)&funcs)[k] == 0x5e;
+    check(tail_kept, "GetFuncs(1.3) leaves the newer tail untouched");
+    for (k = 4; k <= BC250_VKD3D_ENGINE_ABI_MINOR; ++k)
+    {
+        memset(&funcs, 0, sizeof(funcs));
+        funcs.Size = sizeof(funcs);
+        checkf(get_funcs((1u << 16) | k, &funcs) == S_OK
+                && funcs.AbiVersion == BC250_VKD3D_ENGINE_ABI_VERSION
+                && funcs.CreateDevice && funcs.CreateCommandQueue && funcs.GetVulkanHandles
+                && funcs.CreateHeapFromMemory && funcs.MapHeap && funcs.UnmapHeap && funcs.QueryAdapterCaps
+                && funcs.QueryLinearImage && funcs.CreateLinearPlacedResource
+                && funcs.CreatePartialGraphicsLibrary && funcs.AddRefPartialGraphicsLibrary
+                && funcs.ReleasePartialGraphicsLibrary && funcs.CreateLinkedGraphicsPipeline,
+                "GetFuncs(1.%u) fills all entries and reports provider ABI", k);
+    }
     if (!funcs.CreateDevice || !funcs.CreateCommandQueue || !funcs.GetVulkanHandles || !funcs.CreateHeapFromMemory
             || !funcs.MapHeap || !funcs.UnmapHeap || !funcs.QueryAdapterCaps || !funcs.QueryLinearImage
             || !funcs.CreateLinearPlacedResource)
         return 1;
+
+    if (abi_only)
+    {
+        FreeLibrary(engine);
+        DeleteCriticalSection(&vkw.lock);
+        printf("ABI-only %s (%d failures)\n", failures ? "FAILED" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
+
+    if (icd)
+    {
+        if (!GetFullPathNameA(icd, MAX_PATH, full, NULL)
+                || !(driver = LoadLibraryExA(full, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)))
+        {
+            printf("FAIL  LoadLibrary %s: %lu\n", icd, GetLastError());
+            return 1;
+        }
+        gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(driver, "vk_icdGetInstanceProcAddr");
+    }
+    else if ((driver = LoadLibraryW(L"vulkan-1.dll")))
+    {
+        gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(driver, "vkGetInstanceProcAddr");
+    }
+    if (!gipa)
+    {
+        printf("FAIL  no Vulkan entry point (%s)\n", icd ? icd : "vulkan-1.dll");
+        return 1;
+    }
+    if (!find_adapter(filter, &luid))
+    {
+        printf("FAIL  no hardware DXGI adapter%s%s\n", filter ? " matching " : "", filter ? filter : "");
+        return 1;
+    }
+    check(census_init(engine),
+            "thread census: NtQueryInformationThread and the module range of amdgpu_wddm_vkd3d.dll");
 
     memset(&info, 0, sizeof(info));
     info.Size = sizeof(info);
