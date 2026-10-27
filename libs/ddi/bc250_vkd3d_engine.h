@@ -330,7 +330,13 @@ extern "C" {
  * Late depth format is supplied by the final fragment-output interface. */
 /* 1.8 retains PGP pipelines in command allocators through reset, including
  * both versions of an asynchronously specialized program. */
-#define BC250_VKD3D_ENGINE_ABI_MINOR 9u
+/* 1.10 admits stream-output declarations on final linked graphics programs.
+ * ALLOW_STREAM_OUTPUT classic producers compile a reusable capture variant at
+ * collection creation. Final linking selects it and copies a component mapping;
+ * it does not translate the original shader again. The private hosted capture
+ * capability is queried explicitly and absence fails closed. Table layouts and
+ * the entrypoints requested by ABI 1.0 through 1.9 remain unchanged. */
+#define BC250_VKD3D_ENGINE_ABI_MINOR 10u
 #define BC250_VKD3D_ENGINE_ABI_VERSION ((BC250_VKD3D_ENGINE_ABI_MAJOR << 16) | BC250_VKD3D_ENGINE_ABI_MINOR)
 
 #define BC250_VKD3D_QUEUE_MODE_THREADED 0u         /* V3; also the mode when the 1.1 fields are absent */

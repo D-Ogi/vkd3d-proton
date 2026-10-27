@@ -34,6 +34,7 @@
 #include "vkd3d_version.h"
 #include "vkd3d_shader.h"
 #include "vkd3d_pgp_view.h"
+#include "vkd3d_pgp_so.h"
 #include "vkd3d_threads.h"
 #include "vkd3d_platform.h"
 #include "vkd3d_swapchain_factory.h"
@@ -2343,6 +2344,7 @@ struct d3d12_graphics_pipeline_state_cached_desc
     bool is_dual_source_blending;
     VkShaderStageFlagBits xfb_stage;
     struct vkd3d_shader_transform_feedback_info *xfb_info;
+    struct bc250_pgp_so_table *partial_so_table;
     struct vkd3d_shader_stage_io_map stage_io_map_ms_ps;
 
     D3D12_SHADER_BYTECODE bytecode[VKD3D_MAX_SHADER_STAGES];
@@ -2391,6 +2393,7 @@ struct d3d12_graphics_pipeline_state
     unsigned int forced_sample_count;
     unsigned int partial_fixed_forced_samples;
     bool partial_tir_outputs;
+    bool partial_so_capture;
     bool partial_exclude_pixel_shader;
     VkPipelineDepthStencilStateCreateInfo ds_desc;
     VkPipelineColorBlendStateCreateInfo blend_desc;
@@ -2624,6 +2627,7 @@ struct d3d12_partial_graphics_library
     VkGraphicsPipelineLibraryFlagsEXT subsets;
     /* Additional variants only; pipeline remains the original sample count. */
     struct d3d12_partial_graphics_library *tir_outputs;
+    struct d3d12_partial_graphics_library *so_capture;
     VkPipeline sample_variants[7];
     VkSampleCountFlags sample_counts;
 };
@@ -6597,6 +6601,7 @@ struct d3d12_device
     ID3D12DeviceConfiguration1 ID3D12DeviceConfiguration1_iface;
     uint32_t bc250_tir_revisions;
     PFN_bc250_cmd_set_pgp_view bc250_cmd_set_pgp_view;
+    bool bc250_pgp_so_supported;
     LONG refcount;
 
     VkDevice vk_device;

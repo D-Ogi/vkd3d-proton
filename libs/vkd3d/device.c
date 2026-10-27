@@ -10661,6 +10661,12 @@ static void vkd3d_compute_shader_interface_key(struct d3d12_device *device)
      * but it is useful to be able to modify the internal revision while developing since
      * we have no mechanism for emitting dirty Git revisions. */
     key = hash_fnv1_iterate_u64(key, vkd3d_shader_get_revision(NULL));
+    /* Canonical stream-output capture changes the generated SPIR-V even when
+     * the application's PSO descriptor and shader bytecode are unchanged.
+     * Keep native XFB and each negotiated canonical contract in distinct
+     * cache namespaces, including development builds at the same git revision. */
+    key = hash_fnv1_iterate_u32(key,
+            device->bc250_pgp_so_supported ? BC250_PGP_SO_REVISION : 0);
     key = hash_fnv1_iterate_u32(key, device->d3d12_caps.options1.WaveLaneCountMin);
     key = hash_fnv1_iterate_u32(key, device->d3d12_caps.options1.WaveLaneCountMax);
     key = hash_fnv1_iterate_u32(key, device->bindless_state.flags);
@@ -11016,6 +11022,13 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
         if (query && query(device->vk_physical_device, BC250_PGP_VIEW_REVISION,
                 sizeof(struct bc250_pgp_view_data), &command) == VK_SUCCESS)
             device->bc250_cmd_set_pgp_view = command;
+    }
+
+    {
+        PFN_bc250_pgp_so_query query = (PFN_bc250_pgp_so_query)
+                instance->vk_global_procs.vkGetInstanceProcAddr(VK_NULL_HANDLE, BC250_PGP_SO_QUERY_NAME);
+        device->bc250_pgp_so_supported = query && query(device->vk_physical_device, BC250_PGP_SO_REVISION,
+                sizeof(struct bc250_pgp_so_pipeline), sizeof(struct bc250_pgp_so_table)) == VK_SUCCESS;
     }
 
     if (FAILED(hr = vkd3d_private_store_init(&device->private_store)))

@@ -2869,6 +2869,7 @@ static void d3d12_pipeline_state_free_cached_desc(struct d3d12_graphics_pipeline
 {
     unsigned int i;
     vkd3d_shader_transform_feedback_info_free(cached_desc->xfb_info);
+    vkd3d_free(cached_desc->partial_so_table);
     vkd3d_shader_stage_io_map_free(&cached_desc->stage_io_map_ms_ps);
     while (cached_desc->bytecode_duped_mask)
     {
@@ -3030,6 +3031,8 @@ void d3d12_partial_graphics_library_dec_ref(struct d3d12_partial_graphics_librar
             VK_CALL(vkDestroyPipeline(device->vk_device, library->sample_variants[i], NULL));
     if (library->tir_outputs)
         d3d12_partial_graphics_library_dec_ref(library->tir_outputs);
+    if (library->so_capture)
+        d3d12_partial_graphics_library_dec_ref(library->so_capture);
     d3d12_pipeline_state_dec_ref(library->source);
     d3d12_device_release(device);
     vkd3d_free(library);
@@ -5645,6 +5648,9 @@ static bool d3d12_pipeline_state_validate_view_instancing(struct d3d12_device *d
     return true;
 }
 
+static HRESULT d3d12_pipeline_state_prepare_component_stream_output(struct d3d12_pipeline_state *state,
+        const struct d3d12_pipeline_state_desc *desc);
+
 static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipeline_state *state,
         struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
         const struct d3d12_partial_graphics_input *partial_input, bool standalone_pixel)
@@ -6055,6 +6061,13 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
             graphics->cached_desc.xfb_stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
         else
             graphics->cached_desc.xfb_stage = VK_SHADER_STAGE_VERTEX_BIT;
+
+        /* The DXIL whole-variable XFB callback cannot represent split or
+         * reordered components. Use the hosted canonical capture mapping for
+         * ordinary PSOs as well as partial programs, before shader translation. */
+        if (!graphics->partial_pipeline && device->bc250_pgp_so_supported &&
+                FAILED(hr = d3d12_pipeline_state_prepare_component_stream_output(state, desc)))
+            goto fail;
     }
 
     graphics->patch_vertex_count = 0;
@@ -7031,10 +7044,315 @@ static HRESULT d3d12_partial_graphics_enable_dual_source(struct d3d12_pipeline_s
     return S_OK;
 }
 
+/* Collection-time canonical capture declaration. Each component has one
+ * stable word ID; final output packing never changes the compiled shader. */
+static HRESULT d3d12_partial_so_capture_desc(const struct d3d12_pipeline_state_desc *desc,
+        struct vkd3d_shader_signature *signature, D3D12_SO_DECLARATION_ENTRY entries[512],
+        D3D12_STREAM_OUTPUT_DESC *so, UINT strides[4])
+{
+    const D3D12_SHADER_BYTECODE *last = desc->gs.BytecodeLength ? &desc->gs :
+            desc->ds.BytecodeLength ? &desc->ds : &desc->vs;
+    struct vkd3d_shader_code code = {last->pShaderBytecode, last->BytecodeLength};
+    unsigned int words[4] = {0}, i, c, n = 0;
+    int ret;
+    if (!last->BytecodeLength || desc->ms.BytecodeLength)
+        return E_INVALIDARG;
+    if ((ret = vkd3d_shader_parse_output_signature(&code, signature)) < 0)
+        return hresult_from_vkd3d_result(ret);
+    for (i = 0; i < signature->element_count; ++i)
+    {
+        const struct vkd3d_shader_signature_element *e = &signature->elements[i];
+        if (!e->semantic_name || e->stream_index >= 4 || (!desc->gs.BytecodeLength && e->stream_index))
+            return E_INVALIDARG;
+        for (c = 0; c < 4; ++c)
+            if (e->mask & (1u << c))
+            {
+                if (words[e->stream_index]++ >= 128 || n >= 512)
+                    return E_INVALIDARG;
+                entries[n++] = (D3D12_SO_DECLARATION_ENTRY){e->stream_index,
+                        e->semantic_name, e->semantic_index, c, 1, e->stream_index};
+            }
+    }
+    if (!n)
+        return E_INVALIDARG;
+    for (i = 0; i < 4; ++i)
+        strides[i] = 512;
+    *so = (D3D12_STREAM_OUTPUT_DESC){entries, n, strides, 4, 0};
+    return S_OK;
+}
+
+static HRESULT d3d12_partial_so_build_table(const D3D12_STREAM_OUTPUT_DESC *so,
+        const struct vkd3d_shader_transform_feedback_info *canonical, bool geometry,
+        struct bc250_pgp_so_table *table)
+{
+    unsigned int positions[4] = {0}, canonical_words[4], tails[512];
+    unsigned int i, j, c, source, n, buffer, stream, component;
+    if (!so || !canonical || !table || !so->NumEntries || !so->pSODeclaration ||
+            !so->NumStrides || so->NumStrides > 4 || !so->pBufferStrides ||
+            (so->RasterizedStream != D3D12_SO_NO_RASTERIZED_STREAM && so->RasterizedStream >= 4))
+        return E_INVALIDARG;
+    memset(table, 0, sizeof(*table));
+    memset(table->raster_source, 0xff, sizeof(table->raster_source));
+    memset(table->raster_system_param, 0xff, sizeof(table->raster_system_param));
+    table->rasterized_stream = so->RasterizedStream;
+    memset(table->head, 0xff, sizeof(table->head));
+    memset(tails, 0xff, sizeof(tails));
+    memset(table->buffer_stream, 0xff, sizeof(table->buffer_stream));
+    for (i = 0; i < so->NumStrides; ++i)
+    {
+        if (so->pBufferStrides[i] > 2048 || (so->pBufferStrides[i] & 3u))
+            return E_INVALIDARG;
+        table->stride[i] = so->pBufferStrides[i];
+    }
+    for (i = 0; i < so->NumEntries; ++i)
+    {
+        const D3D12_SO_DECLARATION_ENTRY *e = &so->pSODeclaration[i];
+        buffer = e->OutputSlot; stream = e->Stream;
+        if (buffer >= so->NumStrides || stream >= 4 || (!geometry && stream) ||
+                !e->ComponentCount || (e->SemanticName && (e->StartComponent >= 4 ||
+                e->ComponentCount > 4 - e->StartComponent)))
+            return E_INVALIDARG;
+        if (positions[buffer] > table->stride[buffer] ||
+                e->ComponentCount > (table->stride[buffer] - positions[buffer]) / 4)
+            return E_INVALIDARG;
+        if (table->buffer_stream[buffer] != BC250_PGP_SO_END && table->buffer_stream[buffer] != stream)
+            return E_INVALIDARG;
+        table->buffer_stream[buffer] = stream;
+        if (!e->SemanticName)
+        {
+            positions[buffer] += 4 * e->ComponentCount;
+            continue;
+        }
+        table->buffer_mask |= 1u << buffer;
+        for (c = 0; c < e->ComponentCount; ++c)
+        {
+            component = e->StartComponent + c;
+            source = BC250_PGP_SO_END;
+            memset(canonical_words, 0, sizeof(canonical_words));
+            for (j = 0; j < canonical->element_count; ++j)
+            {
+                const struct vkd3d_shader_transform_feedback_element *ce = &canonical->elements[j];
+                unsigned int id;
+                if (ce->output_slot >= 4 || ce->component_count != 1 || canonical_words[ce->output_slot] >= 128)
+                    return E_INVALIDARG;
+                id = ce->output_slot * 128 + canonical_words[ce->output_slot]++;
+                if (ce->stream_index == stream && ce->semantic_name &&
+                        !ascii_strcasecmp(ce->semantic_name, e->SemanticName) &&
+                        ce->semantic_index == e->SemanticIndex && ce->component_index == component)
+                {
+                    if (source != BC250_PGP_SO_END)
+                        return E_INVALIDARG;
+                    source = id;
+                }
+            }
+            n = table->destination_count;
+            if (source == BC250_PGP_SO_END || n >= BC250_PGP_SO_DESTINATIONS || positions[buffer] > 508)
+                return E_INVALIDARG;
+            table->destinations[n] = (struct bc250_pgp_so_destination){buffer, positions[buffer], BC250_PGP_SO_END};
+            if (tails[source] == BC250_PGP_SO_END)
+                table->head[source] = n;
+            else
+                table->destinations[tails[source]].next = n;
+            tails[source] = n;
+            ++table->destination_count;
+            positions[buffer] += 4;
+        }
+    }
+    if (!table->destination_count)
+        return E_INVALIDARG;
+    return S_OK;
+}
+
+static HRESULT d3d12_partial_so_map_raster_inputs(const struct vkd3d_shader_signature *gs,
+        const struct vkd3d_shader_signature *ps,
+        const struct vkd3d_shader_transform_feedback_info *canonical, struct bc250_pgp_so_table *table)
+{
+    unsigned int i, j, c, k, source_component, destination, source, input_mask, output_mask, words[4];
+    unsigned int used_params = 0, clip_count = 0, clip_cursor = 0, cull_cursor = 0;
+    unsigned int system_slot, system_component, parameter;
+    for (i = 0; i < ps->element_count; ++i)
+    {
+        const struct vkd3d_shader_signature_element *input = &ps->elements[i];
+        if (input->sysval_semantic == VKD3D_SV_NONE)
+        {
+            if (input->register_index >= 32)
+                return E_INVALIDARG;
+            used_params |= 1u << input->register_index;
+        }
+        else if (input->sysval_semantic == VKD3D_SV_CLIP_DISTANCE)
+            for (c = 0; c < 4; ++c)
+                clip_count += !!(input->mask & (1u << c));
+    }
+    if (clip_count > 8)
+        return E_INVALIDARG;
+    for (i = 0; i < ps->element_count; ++i)
+    {
+        const struct vkd3d_shader_signature_element *input = &ps->elements[i], *output = NULL;
+        if (input->sysval_semantic != VKD3D_SV_NONE &&
+                input->sysval_semantic != VKD3D_SV_CLIP_DISTANCE &&
+                input->sysval_semantic != VKD3D_SV_CULL_DISTANCE &&
+                input->sysval_semantic != VKD3D_SV_RENDER_TARGET_ARRAY_INDEX &&
+                input->sysval_semantic != VKD3D_SV_VIEWPORT_ARRAY_INDEX &&
+                input->sysval_semantic != VKD3D_SV_PRIMITIVE_ID)
+            continue;
+        /* Signature masks also carry the read/write mask in bits 8..15.
+         * Link declared components, not optimized usage, so later PS reuse
+         * cannot alter the immutable component correspondence. */
+        input_mask = input->mask & 15u;
+        if (!input->semantic_name || (input->sysval_semantic == VKD3D_SV_NONE &&
+                input->register_index >= 32) || !input_mask || (input->mask & 0xf0u))
+            return E_INVALIDARG;
+        for (j = 0; j < gs->element_count; ++j)
+        {
+            const struct vkd3d_shader_signature_element *e = &gs->elements[j];
+            if (e->stream_index == table->rasterized_stream && e->semantic_name &&
+                    !ascii_strcasecmp(e->semantic_name, input->semantic_name) &&
+                    e->semantic_index == input->semantic_index)
+            {
+                if (output)
+                    return E_INVALIDARG;
+                output = e;
+            }
+        }
+        if (!output || output->sysval_semantic != input->sysval_semantic ||
+                output->component_type != input->component_type || !(output->mask & 15u) || (output->mask & 0xf0u))
+            return E_INVALIDARG;
+        output_mask = output->mask & 15u;
+        source_component = 0;
+        for (c = 0; c < 4; ++c)
+        {
+            if (!(input_mask & (1u << c)))
+                continue;
+            while (source_component < 4 && !(output_mask & (1u << source_component)))
+                ++source_component;
+            if (source_component == 4)
+                return E_INVALIDARG;
+            source = BC250_PGP_SO_END;
+            memset(words, 0, sizeof(words));
+            for (k = 0; k < canonical->element_count; ++k)
+            {
+                const struct vkd3d_shader_transform_feedback_element *ce = &canonical->elements[k];
+                unsigned int id;
+                if (ce->output_slot >= 4 || ce->component_count != 1 || words[ce->output_slot] >= 128)
+                    return E_INVALIDARG;
+                id = ce->output_slot * 128 + words[ce->output_slot]++;
+                if (ce->stream_index == table->rasterized_stream && ce->semantic_name &&
+                        !ascii_strcasecmp(ce->semantic_name, input->semantic_name) &&
+                        ce->semantic_index == input->semantic_index && ce->component_index == source_component)
+                {
+                    if (source != BC250_PGP_SO_END)
+                        return E_INVALIDARG;
+                    source = id;
+                }
+            }
+            if (input->sysval_semantic == VKD3D_SV_NONE)
+                destination = input->register_index * 4 + c;
+            else
+            {
+                system_component = 0;
+                if (input->sysval_semantic == VKD3D_SV_CLIP_DISTANCE ||
+                        input->sysval_semantic == VKD3D_SV_CULL_DISTANCE)
+                {
+                    unsigned int scalar = input->sysval_semantic == VKD3D_SV_CLIP_DISTANCE ?
+                            clip_cursor++ : clip_count + cull_cursor++;
+                    if (scalar >= 8)
+                        return E_INVALIDARG;
+                    system_slot = scalar / 4;
+                    system_component = scalar % 4;
+                }
+                else
+                    system_slot = input->sysval_semantic == VKD3D_SV_RENDER_TARGET_ARRAY_INDEX ?
+                            BC250_PGP_SO_SYSTEM_LAYER : input->sysval_semantic == VKD3D_SV_VIEWPORT_ARRAY_INDEX ?
+                            BC250_PGP_SO_SYSTEM_VIEWPORT : BC250_PGP_SO_SYSTEM_PRIMITIVE_ID;
+                parameter = table->raster_system_param[system_slot];
+                if (parameter == BC250_PGP_SO_END)
+                {
+                    for (parameter = 0; parameter < 32 && (used_params & (1u << parameter)); ++parameter)
+                        ;
+                    if (parameter == 32)
+                        return E_INVALIDARG;
+                    table->raster_system_param[system_slot] = parameter;
+                    used_params |= 1u << parameter;
+                }
+                destination = parameter * 4 + system_component;
+            }
+            if (source == BC250_PGP_SO_END || table->raster_source[destination] != BC250_PGP_SO_END)
+                return E_INVALIDARG;
+            table->raster_source[destination] = source;
+            ++source_component;
+        }
+        /* A consumer may use fewer components than its producer declares.
+         * The partial-program API validates any stricter exact-linkage
+         * requirement before this common ordinary/final mapping path. */
+    }
+    return S_OK;
+}
+
+static HRESULT d3d12_partial_so_build_raster_table(const struct d3d12_pipeline_state_desc *desc,
+        const struct vkd3d_shader_transform_feedback_info *canonical, struct bc250_pgp_so_table *table)
+{
+    struct vkd3d_shader_signature gs = {0}, ps = {0};
+    struct vkd3d_shader_code code;
+    HRESULT hr;
+    int ret;
+    if (!desc->gs.BytecodeLength || !desc->ps.BytecodeLength || table->rasterized_stream == BC250_PGP_SO_END)
+        return S_OK;
+    code = (struct vkd3d_shader_code){desc->gs.pShaderBytecode, desc->gs.BytecodeLength};
+    if ((ret = vkd3d_shader_parse_output_signature(&code, &gs)) < 0)
+        return hresult_from_vkd3d_result(ret);
+    code = (struct vkd3d_shader_code){desc->ps.pShaderBytecode, desc->ps.BytecodeLength};
+    if ((ret = vkd3d_shader_parse_input_signature(&code, &ps)) < 0)
+        hr = hresult_from_vkd3d_result(ret);
+    else
+        hr = d3d12_partial_so_map_raster_inputs(&gs, &ps, canonical, table);
+    vkd3d_shader_free_shader_signature(&ps);
+    vkd3d_shader_free_shader_signature(&gs);
+    return hr;
+}
+
+static HRESULT d3d12_pipeline_state_prepare_component_stream_output(struct d3d12_pipeline_state *state,
+        const struct d3d12_pipeline_state_desc *desc)
+{
+    struct d3d12_graphics_pipeline_state_cached_desc *cached = &state->graphics.cached_desc;
+    struct vkd3d_shader_signature signature = {0};
+    struct vkd3d_shader_transform_feedback_info *canonical = NULL;
+    struct bc250_pgp_so_table *table = NULL;
+    D3D12_SO_DECLARATION_ENTRY entries[512];
+    D3D12_STREAM_OUTPUT_DESC capture;
+    UINT strides[4];
+    HRESULT hr;
+
+    if (FAILED(hr = d3d12_partial_so_capture_desc(desc, &signature, entries, &capture, strides)))
+        goto done;
+    if (!(canonical = vkd3d_shader_transform_feedback_info_dup(&capture)) ||
+            !(table = vkd3d_malloc(sizeof(*table))))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+    if (FAILED(hr = d3d12_partial_so_build_table(&desc->stream_output, canonical,
+            !!desc->gs.BytecodeLength, table)))
+        goto done;
+    if (FAILED(hr = d3d12_partial_so_build_raster_table(desc, canonical, table)))
+        goto done;
+
+    vkd3d_shader_transform_feedback_info_free(cached->xfb_info);
+    cached->xfb_info = canonical;
+    cached->partial_so_table = table;
+    state->graphics.partial_so_capture = true;
+    canonical = NULL;
+    table = NULL;
+done:
+    vkd3d_shader_transform_feedback_info_free(canonical);
+    vkd3d_free(table);
+    vkd3d_shader_free_shader_signature(&signature);
+    return hr;
+}
+
 static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device *device,
         const struct d3d12_pipeline_state_desc *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
         bool exclude_pixel_shader, bool late_sample_desc, bool dual_source_blend, const struct d3d12_partial_graphics_input *input,
-        struct d3d12_partial_graphics_library **library, bool tir_outputs)
+        struct d3d12_partial_graphics_library **library, bool tir_outputs, bool so_capture)
 {
     const struct vkd3d_vk_device_procs *vk_procs;
     struct d3d12_cached_pipeline_state empty_cache = {0};
@@ -7050,7 +7368,7 @@ static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device 
     if (!device || !desc || !desc->root_signature || !vkd3d_pipeline_library_subsets_valid(subsets) ||
             !(subsets & (VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
             VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) || desc->cs.BytecodeLength ||
-            desc->stream_output.NumEntries || desc->cached_pso.blob.CachedBlobSizeInBytes)
+            (desc->stream_output.NumEntries && !so_capture) || desc->cached_pso.blob.CachedBlobSizeInBytes)
         return E_INVALIDARG;
     if (!device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary)
         return E_NOTIMPL;
@@ -7103,6 +7421,7 @@ static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device 
     /* Independently composed programs must not acquire an ordinary synthetic
      * shader. A no-PS final GPL supplies empty FS state, with or without ExcludePS. */
     state->graphics.partial_pipeline = true;
+    state->graphics.partial_so_capture = so_capture;
     state->graphics.partial_exclude_pixel_shader = exclude_pixel_shader;
     state->graphics.partial_deferred_input_layout =
             (subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) &&
@@ -7172,7 +7491,7 @@ fail:
     return hr;
 }
 
-HRESULT d3d12_partial_graphics_library_create(struct d3d12_device *device,
+static HRESULT d3d12_partial_graphics_library_create_base(struct d3d12_device *device,
         const struct d3d12_pipeline_state_desc *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
         bool exclude_pixel_shader, bool late_sample_desc, bool dual_source_blend, const struct d3d12_partial_graphics_input *input,
         struct d3d12_partial_graphics_library **library)
@@ -7185,7 +7504,7 @@ HRESULT d3d12_partial_graphics_library_create(struct d3d12_device *device,
     if (!desc->rasterizer_state.ForcedSampleCount ||
             !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT))
         return d3d12_partial_graphics_library_create_single(device, desc, subsets,
-                exclude_pixel_shader, late_sample_desc, dual_source_blend, input, library, false);
+                exclude_pixel_shader, late_sample_desc, dual_source_blend, input, library, false, false);
     if (!device || desc->dsv_format != DXGI_FORMAT_UNKNOWN ||
             desc->depth_stencil_state.DepthEnable || desc->depth_stencil_state.StencilEnable ||
             (desc->rasterizer_state.ForcedSampleCount > 1 && desc->sample_desc.Count != 1))
@@ -7201,7 +7520,7 @@ HRESULT d3d12_partial_graphics_library_create(struct d3d12_device *device,
     no_outputs.sample_desc.Count = 1;
     no_outputs.sample_desc.Quality = 0;
     hr = d3d12_partial_graphics_library_create_single(device, &no_outputs, subsets,
-            exclude_pixel_shader, false, dual_source_blend, input, library, false);
+            exclude_pixel_shader, false, dual_source_blend, input, library, false, false);
     if (FAILED(hr))
         return hr;
     outputs = no_outputs;
@@ -7209,7 +7528,42 @@ HRESULT d3d12_partial_graphics_library_create(struct d3d12_device *device,
     outputs.rtv_formats.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     outputs.sample_mask = ~0u;
     hr = d3d12_partial_graphics_library_create_single(device, &outputs, subsets,
-            exclude_pixel_shader, false, dual_source_blend, input, &(*library)->tir_outputs, true);
+            exclude_pixel_shader, false, dual_source_blend, input, &(*library)->tir_outputs, true, false);
+    if (FAILED(hr))
+    {
+        d3d12_partial_graphics_library_dec_ref(*library);
+        *library = NULL;
+    }
+    return hr;
+}
+
+HRESULT d3d12_partial_graphics_library_create(struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc, VkGraphicsPipelineLibraryFlagsEXT subsets,
+        bool exclude_pixel_shader, bool late_sample_desc, bool dual_source_blend,
+        const struct d3d12_partial_graphics_input *input, struct d3d12_partial_graphics_library **library)
+{
+    struct d3d12_pipeline_state_desc capture;
+    struct vkd3d_shader_signature signature = {0};
+    D3D12_SO_DECLARATION_ENTRY entries[512];
+    UINT strides[4];
+    HRESULT hr;
+    if (FAILED(hr = d3d12_partial_graphics_library_create_base(device, desc, subsets,
+            exclude_pixel_shader, late_sample_desc, dual_source_blend, input, library)))
+        return hr;
+    if (!(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) || desc->ms.BytecodeLength ||
+            !(impl_from_ID3D12RootSignature(desc->root_signature)->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT))
+        return S_OK;
+    if (!device->bc250_pgp_so_supported)
+        hr = E_NOTIMPL;
+    else
+    {
+        capture = *desc;
+        hr = d3d12_partial_so_capture_desc(desc, &signature, entries, &capture.stream_output, strides);
+        if (SUCCEEDED(hr))
+            hr = d3d12_partial_graphics_library_create_single(device, &capture, subsets,
+                    exclude_pixel_shader, late_sample_desc, dual_source_blend, input, &(*library)->so_capture, false, true);
+        vkd3d_shader_free_shader_signature(&signature);
+    }
     if (FAILED(hr))
     {
         d3d12_partial_graphics_library_dec_ref(*library);
@@ -7552,6 +7906,7 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     VkPipelineCreateFlags2CreateInfo flags2;
     struct vkd3d_pipeline_libraries libraries = {0};
     struct bc250_tir_pipeline tir;
+    struct bc250_pgp_so_pipeline so_contract;
     VkPipeline empty_fragment = VK_NULL_HANDLE;
     VkResult vr;
 
@@ -7615,6 +7970,12 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
     create_info.basePipelineIndex = -1;
 
     vk_prepend_struct(&create_info, &library_info);
+    if (graphics->cached_desc.partial_so_table)
+    {
+        so_contract = (struct bc250_pgp_so_pipeline){BC250_STRUCTURE_TYPE_PGP_SO, NULL,
+                BC250_PGP_SO_REVISION, BC250_PGP_SO_LINK, graphics->cached_desc.partial_so_table};
+        vk_prepend_struct(&create_info, &so_contract);
+    }
     if (graphics->partial_tir_outputs)
     {
         tir = (struct bc250_tir_pipeline){BC250_STRUCTURE_TYPE_TIR, NULL, BC250_TIR_PGP_REVISION,
@@ -7693,6 +8054,13 @@ HRESULT d3d12_partial_graphics_libraries_link(struct d3d12_pipeline_state *state
         VkPipeline selected;
         unsigned int bit;
         struct d3d12_partial_graphics_library *part = parts[i];
+        if (part && state->graphics.cached_desc.partial_so_table &&
+                (part->subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT))
+        {
+            if (!part->so_capture)
+                return E_INVALIDARG;
+            part = part->so_capture;
+        }
         if (part && state->graphics.rt_count && part->tir_outputs)
             part = part->tir_outputs;
         if (!part || !(source = part->source) || source->device != state->device ||
@@ -7768,7 +8136,7 @@ HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
         return E_INVALIDARG;
     *out = NULL;
     if (!device || !desc || !desc->root_signature || !parts || !count || count > 4 ||
-            desc->cs.BytecodeLength || desc->stream_output.NumEntries || desc->cached_pso.blob.CachedBlobSizeInBytes)
+            desc->cs.BytecodeLength || desc->cached_pso.blob.CachedBlobSizeInBytes)
         return E_INVALIDARG;
     for (i = 0; i < count; ++i)
         if (!parts[i] || !parts[i]->source || parts[i]->source->device != device)
@@ -7794,6 +8162,28 @@ HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
         state->graphics.partial_exclude_pixel_shader |= parts[i]->source->graphics.partial_exclude_pixel_shader;
     if (FAILED(hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, NULL, false)))
         goto fail;
+
+    if (desc->stream_output.NumEntries)
+    {
+        const struct vkd3d_shader_transform_feedback_info *canonical = NULL;
+        for (i = 0; i < count; ++i)
+            if (parts[i]->subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT)
+            {
+                if (canonical || !parts[i]->so_capture)
+                { hr = E_INVALIDARG; goto fail; }
+                canonical = parts[i]->so_capture->source->graphics.cached_desc.xfb_info;
+            }
+        if (!device->bc250_pgp_so_supported || !canonical)
+        { hr = E_NOTIMPL; goto fail; }
+        if (!(state->graphics.cached_desc.partial_so_table = vkd3d_malloc(sizeof(struct bc250_pgp_so_table))))
+        { hr = E_OUTOFMEMORY; goto fail; }
+        if (FAILED(hr = d3d12_partial_so_build_table(&desc->stream_output, canonical,
+                !!desc->gs.BytecodeLength, state->graphics.cached_desc.partial_so_table)))
+            goto fail;
+        if (FAILED(hr = d3d12_partial_so_build_raster_table(desc, canonical,
+                state->graphics.cached_desc.partial_so_table)))
+            goto fail;
+    }
 
     if (FAILED(hr = d3d12_partial_graphics_enable_dynamic_view(state, device)))
         goto fail;
@@ -8020,6 +8410,7 @@ static VkPipeline d3d12_pipeline_state_create_pipeline_variant_internal(struct d
     const char *probe_path;
     VkGraphicsPipelineCreateInfo pipeline_desc;
     struct bc250_tir_pipeline tir;
+    struct bc250_pgp_so_pipeline so_contract;
     VkPipelineViewportStateCreateInfo vp_desc;
     VkPipelineCreateFlags2CreateInfo flags2;
     VkPipelineCreationFeedbackEXT feedback;
@@ -8282,6 +8673,18 @@ static VkPipeline d3d12_pipeline_state_create_pipeline_variant_internal(struct d
 
     probe_path = library_flags ? "gfx-lib" : key ? "gfx-variant" : "gfx";
     vkd3d_pipeline_library_fixed_state(&pipeline_desc, library_flags, graphics->partial_tir_outputs);
+    if (graphics->partial_so_capture && (library_flags & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT))
+    {
+        so_contract = (struct bc250_pgp_so_pipeline){BC250_STRUCTURE_TYPE_PGP_SO, NULL,
+                BC250_PGP_SO_REVISION, BC250_PGP_SO_CAPTURE, NULL};
+        vk_prepend_struct(&pipeline_desc, &so_contract);
+    }
+    else if (graphics->partial_so_capture && !library_flags && graphics->cached_desc.partial_so_table)
+    {
+        so_contract = (struct bc250_pgp_so_pipeline){BC250_STRUCTURE_TYPE_PGP_SO, NULL,
+                BC250_PGP_SO_REVISION, BC250_PGP_SO_FULL, graphics->cached_desc.partial_so_table};
+        vk_prepend_struct(&pipeline_desc, &so_contract);
+    }
     /* amdgpu-wddm fork: only a real compile takes a slot; a variant at draw time (key) is exempt from the thermal
      * band (struct vkd3d_pipeline_compile_limiter). */
     vkd3d_driver_cache_probe_begin(&device->disk_cache, &probe, &pipeline_desc);
