@@ -2436,6 +2436,7 @@ struct d3d12_graphics_pipeline_state
     bool disable_optimization;
     bool partial_mesh_input;
     bool partial_pipeline; /* Independent GPL composition, never an ordinary noop-FS PSO. */
+    bool partial_deferred_input_layout; /* Collection-only; final link validates the layout. */
 };
 
 static inline uint32_t vkd3d_view_mask_to_multiview_mask(

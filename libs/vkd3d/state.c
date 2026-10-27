@@ -5504,10 +5504,15 @@ static bool vkd3d_validate_partial_pixel_signature(VkShaderStageFlagBits produce
     return true;
 }
 
-static bool vkd3d_validate_vertex_input_signature(const struct vkd3d_shader_signature *sig, const D3D12_INPUT_LAYOUT_DESC *input_layout)
+static bool vkd3d_validate_vertex_input_signature(const struct vkd3d_shader_signature *sig, const D3D12_INPUT_LAYOUT_DESC *input_layout, bool deferred)
 {
     unsigned int i, j;
     bool found;
+
+    /* A preraster library may deliberately omit its vertex-input interface.
+     * The final linked pipeline validates the resolved layout normally. */
+    if (deferred)
+        return true;
 
     for (i = 0; i < sig->element_count; i++)
     {
@@ -6155,7 +6160,8 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
                     goto fail;
                 }
 
-                if (!vkd3d_validate_vertex_input_signature(&vs_input_signature, &desc->input_layout))
+                if (!vkd3d_validate_vertex_input_signature(&vs_input_signature, &desc->input_layout,
+                        graphics->partial_deferred_input_layout))
                 {
                     hr = E_INVALIDARG;
                     goto fail;
@@ -7098,6 +7104,9 @@ static HRESULT d3d12_partial_graphics_library_create_single(struct d3d12_device 
      * shader. A no-PS final GPL supplies empty FS state, with or without ExcludePS. */
     state->graphics.partial_pipeline = true;
     state->graphics.partial_exclude_pixel_shader = exclude_pixel_shader;
+    state->graphics.partial_deferred_input_layout =
+            (subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) &&
+            !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT);
     vkd3d_compile_scope_begin(&scope, device);
     hr = d3d12_pipeline_state_init_graphics_create_info(state, device, desc, input, !input && !(subsets & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT));
     if (SUCCEEDED(hr))
