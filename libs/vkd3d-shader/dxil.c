@@ -1727,6 +1727,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
 
     if (dxil_spv_converter_run(converter) != DXIL_SPV_SUCCESS)
     {
+        WARN("dxil-spirv: the conversion of the shader failed.\n");
         ret = VKD3D_ERROR_INVALID_ARGUMENT;
         goto end;
     }

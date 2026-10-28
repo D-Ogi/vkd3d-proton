@@ -7045,7 +7045,11 @@ static HRESULT d3d12_partial_graphics_enable_dual_source(struct d3d12_pipeline_s
 }
 
 /* Collection-time canonical capture declaration. Each component has one
- * stable word ID; final output packing never changes the compiled shader. */
+ * stable word ID; final output packing never changes the compiled shader.
+ * A D3D12 StartComponent counts from the first component of the element,
+ * not from component x of its register: SV_CullDistance packed into .z of
+ * the clip distance register is component 0. The canonical entries use the
+ * same numbering. */
 static HRESULT d3d12_partial_so_capture_desc(const struct d3d12_pipeline_state_desc *desc,
         struct vkd3d_shader_signature *signature, D3D12_SO_DECLARATION_ENTRY entries[512],
         D3D12_STREAM_OUTPUT_DESC *so, UINT strides[4])
@@ -7053,7 +7057,7 @@ static HRESULT d3d12_partial_so_capture_desc(const struct d3d12_pipeline_state_d
     const D3D12_SHADER_BYTECODE *last = desc->gs.BytecodeLength ? &desc->gs :
             desc->ds.BytecodeLength ? &desc->ds : &desc->vs;
     struct vkd3d_shader_code code = {last->pShaderBytecode, last->BytecodeLength};
-    unsigned int words[4] = {0}, i, c, n = 0;
+    unsigned int words[4] = {0}, i, c, first, n = 0;
     int ret;
     if (!last->BytecodeLength || desc->ms.BytecodeLength)
         return E_INVALIDARG;
@@ -7062,15 +7066,17 @@ static HRESULT d3d12_partial_so_capture_desc(const struct d3d12_pipeline_state_d
     for (i = 0; i < signature->element_count; ++i)
     {
         const struct vkd3d_shader_signature_element *e = &signature->elements[i];
-        if (!e->semantic_name || e->stream_index >= 4 || (!desc->gs.BytecodeLength && e->stream_index))
+        if (!e->semantic_name || e->stream_index >= 4 || (!desc->gs.BytecodeLength && e->stream_index) ||
+                !(e->mask & 15u))
             return E_INVALIDARG;
-        for (c = 0; c < 4; ++c)
+        first = vkd3d_bitmask_tzcnt32(e->mask & 15u);
+        for (c = first; c < 4; ++c)
             if (e->mask & (1u << c))
             {
                 if (words[e->stream_index]++ >= 128 || n >= 512)
                     return E_INVALIDARG;
                 entries[n++] = (D3D12_SO_DECLARATION_ENTRY){e->stream_index,
-                        e->semantic_name, e->semantic_index, c, 1, e->stream_index};
+                        e->semantic_name, e->semantic_index, c - first, 1, e->stream_index};
             }
     }
     if (!n)
@@ -7169,7 +7175,7 @@ static HRESULT d3d12_partial_so_map_raster_inputs(const struct vkd3d_shader_sign
 {
     unsigned int i, j, c, k, source_component, destination, source, input_mask, output_mask, words[4];
     unsigned int used_params = 0, clip_count = 0, clip_cursor = 0, cull_cursor = 0;
-    unsigned int system_slot, system_component, parameter;
+    unsigned int system_slot, system_component, parameter, output_first;
     for (i = 0; i < ps->element_count; ++i)
     {
         const struct vkd3d_shader_signature_element *input = &ps->elements[i];
@@ -7218,6 +7224,9 @@ static HRESULT d3d12_partial_so_map_raster_inputs(const struct vkd3d_shader_sign
                 output->component_type != input->component_type || !(output->mask & 15u) || (output->mask & 0xf0u))
             return E_INVALIDARG;
         output_mask = output->mask & 15u;
+        /* source_component counts register components; the canonical
+         * entries count from the first component of the element. */
+        output_first = vkd3d_bitmask_tzcnt32(output_mask);
         source_component = 0;
         for (c = 0; c < 4; ++c)
         {
@@ -7238,7 +7247,8 @@ static HRESULT d3d12_partial_so_map_raster_inputs(const struct vkd3d_shader_sign
                 id = ce->output_slot * 128 + words[ce->output_slot]++;
                 if (ce->stream_index == table->rasterized_stream && ce->semantic_name &&
                         !ascii_strcasecmp(ce->semantic_name, input->semantic_name) &&
-                        ce->semantic_index == input->semantic_index && ce->component_index == source_component)
+                        ce->semantic_index == input->semantic_index &&
+                        ce->component_index == source_component - output_first)
                 {
                     if (source != BC250_PGP_SO_END)
                         return E_INVALIDARG;
@@ -7323,7 +7333,10 @@ static HRESULT d3d12_pipeline_state_prepare_component_stream_output(struct d3d12
     HRESULT hr;
 
     if (FAILED(hr = d3d12_partial_so_capture_desc(desc, &signature, entries, &capture, strides)))
+    {
+        WARN("Stream output: the canonical capture declaration failed, hr %#x.\n", hr);
         goto done;
+    }
     if (!(canonical = vkd3d_shader_transform_feedback_info_dup(&capture)) ||
             !(table = vkd3d_malloc(sizeof(*table))))
     {
@@ -7332,9 +7345,15 @@ static HRESULT d3d12_pipeline_state_prepare_component_stream_output(struct d3d12
     }
     if (FAILED(hr = d3d12_partial_so_build_table(&desc->stream_output, canonical,
             !!desc->gs.BytecodeLength, table)))
+    {
+        WARN("Stream output: the declaration table failed, hr %#x.\n", hr);
         goto done;
+    }
     if (FAILED(hr = d3d12_partial_so_build_raster_table(desc, canonical, table)))
+    {
+        WARN("Stream output: the rasterized stream mapping failed, hr %#x.\n", hr);
         goto done;
+    }
 
     vkd3d_shader_transform_feedback_info_free(cached->xfb_info);
     cached->xfb_info = canonical;
@@ -8243,6 +8262,12 @@ HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
             VkGraphicsPipelineLibraryFlagsEXT subset = stage == VK_SHADER_STAGE_FRAGMENT_BIT ?
                     VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT :
                     VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+            /* Stream output without a rasterized stream removes the fragment stage from the final description
+             * (vkd3d_pipeline_state_desc_get_shader_stages). The fragment library stays in the link; the stream
+             * output table makes the link discard rasterization, so its shader never runs. */
+            if (stage == VK_SHADER_STAGE_FRAGMENT_BIT && desc->stream_output.NumEntries &&
+                    desc->stream_output.RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM)
+                continue;
             if ((parts[j]->subsets & subset) && !(state->graphics.stage_flags & stage))
             {
                 hr = E_INVALIDARG;
