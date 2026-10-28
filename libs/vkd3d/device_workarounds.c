@@ -20,6 +20,7 @@
 
 #include "vkd3d_private.h"
 #include "vkd3d_platform.h"
+#include "profile_file.h"
 
 bool vkd3d_debug_control_is_test_suite(void);
 
@@ -740,11 +741,55 @@ uint32_t vkd3d_get_instance_application_version(void)
     return vkd3d_application_version;
 }
 
+#ifdef _WIN32
+static void vkd3d_profile_log_entry(void *data, unsigned int line, const char *section, bool add, const char *name)
+{
+#ifdef AMDGPU_WDDM_LAB_FLAVOUR
+    INFO("amdgpu-wddm profile: %s line %u: %s %s %s.\n", (const char *)data, line, section,
+            add ? "add" : "remove", name);
+#else
+    (void)data, (void)line, (void)section, (void)add, (void)name;
+#endif
+}
+#endif
+
+/* amdgpu-wddm fork: the machine profile file (profile_file.h), after the built-in table. Returns whether a section
+ * matched: as an entry of the table, a match turns off the Unreal Engine catch-all. */
+static bool vkd3d_instance_apply_profile_file(const char *app, const char *appid)
+{
+#ifdef _WIN32
+    char name[VKD3D_PATH_MAX * 3], why[256], error[256];
+    const struct vkd3d_debug_option *options;
+    unsigned int option_count, matched = 0;
+    size_t size = 0;
+    char *text;
+
+    if (!(text = vkd3d_profile_file_read(name, sizeof(name), &size, why, sizeof(why))))
+    {
+        if (*why)
+            ERR("amdgpu-wddm profile: %s is not read: %s.\n", name, why);
+        return false;
+    }
+    options = vkd3d_config_get_options(&option_count);
+    if (!vkd3d_profile_parse(text, size, app, appid, options, option_count, &vkd3d_config_flags, &matched,
+            vkd3d_profile_log_entry, name, error, sizeof(error)))
+        ERR("amdgpu-wddm profile: %s is not applied: %s.\n", name, error);
+    else
+        INFO("amdgpu-wddm profile: %s: %u section(s) match %s.\n", name, matched, app);
+    free(text);
+    return matched != 0;
+#else
+    (void)app, (void)appid;
+    return false;
+#endif
+}
+
 void vkd3d_instance_apply_application_workarounds(void)
 {
     uint32_t engine_major = 0, engine_minor = 0, engine_patch = 0;
     enum vkd3d_application_engine_class engine_class;
     char app[VKD3D_PATH_MAX];
+    bool profile_matched;
     char appid[32];
     size_t i;
 
@@ -812,7 +857,10 @@ void vkd3d_instance_apply_application_workarounds(void)
         }
     }
 
-    if (i == ARRAY_SIZE(application_override) && engine_class == VKD3D_APPLICATION_ENGINE_CLASS_UNREAL_ENGINE)
+    profile_matched = vkd3d_instance_apply_profile_file(app, appid);
+
+    if (i == ARRAY_SIZE(application_override) && !profile_matched &&
+            engine_class == VKD3D_APPLICATION_ENGINE_CLASS_UNREAL_ENGINE)
     {
 		/* Unreal Engine catch-all. ReBAR is a massive uplift on RX 7600 for example in Wukong.
 		 * AMD windows drivers also seem to have some kind of general app-opt for UE titles.

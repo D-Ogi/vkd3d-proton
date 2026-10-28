@@ -39,6 +39,7 @@ FORBIDDEN = (
     'VKD3D_QUEUE_PROFILE_ABSOLUTE',  # its companion: absolute timestamps in that trace
     'AMDGPU_WDDM_VKD3D_COMPILE_THREADS',  # the compile limiter's slots; release keeps 2 (lead decision 2)
     'AMDGPU_WDDM_VKD3D_COMPILE_THERMAL',  # the compile limiter's thermal band; release keeps it on
+    'AMDGPU_WDDM_PROFILE_DIR',  # reads the machine profile file (vkd3d-proton.conf) from another directory
 )
 SCAN = ('libs', 'include')
 EXTENSIONS = ('.c', '.cc', '.cpp', '.h', '.hpp')
