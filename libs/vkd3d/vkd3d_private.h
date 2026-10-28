@@ -8038,6 +8038,8 @@ void vkd3d_instance_apply_application_workarounds(void);
 void vkd3d_instance_deduce_config_flags_from_environment(void);
 /* For the module that embeds libvkd3d (amdgpu_wddm_vkd3d.dll); see device.c. */
 void vkd3d_config_set_embedder_defaults(const char *config);
+/* amdgpu-wddm fork: the VKD3D_CONFIG option table, for the machine profile file (profile_file.c). */
+const struct vkd3d_debug_option *vkd3d_config_get_options(unsigned int *count);
 void vkd3d_instance_apply_global_shader_quirks(void);
 void vkd3d_physical_device_info_apply_workarounds(struct vkd3d_physical_device_info *info, struct d3d12_device *device);
 void d3d12_device_caps_override_application(struct d3d12_device *device);

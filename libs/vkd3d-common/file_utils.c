@@ -34,22 +34,63 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+#ifdef _WIN32
+/* amdgpu-wddm fork: the paths are UTF-8 (the embedder's cache directory and vkd3d_get_program_name), and the file
+ * calls are the wide ones. An ANSI call turns a character outside the process code page into '?', and the call then
+ * fails, so a user name such as "Łucja" on an English Windows had no disk cache. A path that is not valid UTF-8 (a
+ * lab variable read with the ANSI environment call) is taken in the process code page, as before. The caller frees
+ * the result; NULL when the path cannot be converted. */
+WCHAR *vkd3d_file_wide_path(const char *path)
+{
+    UINT code_page = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    WCHAR *wide;
+    int count;
+
+    if (!path)
+        return NULL;
+    if (!(count = MultiByteToWideChar(code_page, flags, path, -1, NULL, 0)))
+    {
+        code_page = CP_ACP;
+        flags = 0;
+        if (!(count = MultiByteToWideChar(code_page, flags, path, -1, NULL, 0)))
+            return NULL;
+    }
+    if (!(wide = malloc(count * sizeof(*wide))))
+        return NULL;
+    if (!MultiByteToWideChar(code_page, flags, path, -1, wide, count))
+    {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+#endif
 
 bool vkd3d_file_rename_overwrite(const char *from_path, const char *to_path)
 {
 #ifdef _WIN32
-    DWORD code = ERROR_SUCCESS;
+    WCHAR *from = vkd3d_file_wide_path(from_path), *to = vkd3d_file_wide_path(to_path);
+    DWORD code = ERROR_INVALID_NAME;
 
-    if (!MoveFileA(from_path, to_path))
+    if (from && to)
     {
-        code = GetLastError();
-        if (code == ERROR_ALREADY_EXISTS)
+        code = ERROR_SUCCESS;
+        if (!MoveFileW(from, to))
         {
-            code = ERROR_SUCCESS;
-            if (!ReplaceFileA(to_path, from_path, NULL, 0, NULL, NULL))
-                code = GetLastError();
+            code = GetLastError();
+            if (code == ERROR_ALREADY_EXISTS)
+            {
+                code = ERROR_SUCCESS;
+                if (!ReplaceFileW(to, from, NULL, 0, NULL, NULL))
+                    code = GetLastError();
+            }
         }
     }
+    free(from);
+    free(to);
 
     return code == ERROR_SUCCESS;
 #else
@@ -60,10 +101,12 @@ bool vkd3d_file_rename_overwrite(const char *from_path, const char *to_path)
 bool vkd3d_file_rename_no_replace(const char *from_path, const char *to_path)
 {
 #ifdef _WIN32
-    DWORD code = ERROR_SUCCESS;
-    if (!MoveFileA(from_path, to_path))
-        code = GetLastError();
-    return code == ERROR_SUCCESS;
+    WCHAR *from = vkd3d_file_wide_path(from_path), *to = vkd3d_file_wide_path(to_path);
+    bool ok = from && to && MoveFileW(from, to);
+
+    free(from);
+    free(to);
+    return ok;
 #else
     return renameat2(AT_FDCWD, from_path, AT_FDCWD, to_path, RENAME_NOREPLACE) == 0;
 #endif
@@ -72,12 +115,33 @@ bool vkd3d_file_rename_no_replace(const char *from_path, const char *to_path)
 bool vkd3d_file_delete(const char *path)
 {
 #ifdef _WIN32
-    DWORD code = ERROR_SUCCESS;
-    if (!DeleteFileA(path))
-        code = GetLastError();
-    return code == ERROR_SUCCESS;
+    WCHAR *wide = vkd3d_file_wide_path(path);
+    bool ok = wide && DeleteFileW(wide);
+
+    free(wide);
+    return ok;
 #else
     return unlink(path) == 0;
+#endif
+}
+
+FILE *vkd3d_file_open(const char *path, const char *mode)
+{
+#ifdef _WIN32
+    WCHAR wide_mode[8];
+    FILE *file = NULL;
+    WCHAR *wide;
+    size_t i;
+
+    for (i = 0; mode[i] && i + 1 < ARRAYSIZE(wide_mode); i++)
+        wide_mode[i] = (unsigned char)mode[i];
+    wide_mode[i] = 0;
+    if ((wide = vkd3d_file_wide_path(path)))
+        file = _wfopen(wide, wide_mode);
+    free(wide);
+    return file;
+#else
+    return fopen(path, mode);
 #endif
 }
 
@@ -88,10 +152,14 @@ FILE *vkd3d_file_open_exclusive_write(const char *path)
      * through jank POSIX layer.
      * wbx kinda works, but Wine warns about it, despite it working anyways.
      * Older MSVC runtimes do not support wbx. */
+    WCHAR *wide = vkd3d_file_wide_path(path);
     FILE *file = NULL;
-    int fd;
-    fd = _open(path, _O_BINARY | _O_WRONLY | _O_CREAT | _O_EXCL | _O_TRUNC | _O_SEQUENTIAL,
-            _S_IWRITE | _S_IREAD);
+    int fd = -1;
+
+    if (wide)
+        fd = _wopen(wide, _O_BINARY | _O_WRONLY | _O_CREAT | _O_EXCL | _O_TRUNC | _O_SEQUENTIAL,
+                _S_IWRITE | _S_IREAD);
+    free(wide);
     if (fd >= 0)
     {
         file = _fdopen(fd, "wb");
@@ -124,6 +192,7 @@ bool vkd3d_file_map_read_only(const char *path, struct vkd3d_memory_mapped_file 
     DWORD size_hi, size_lo;
     HANDLE file_mapping;
     HANDLE handle;
+    WCHAR *wide;
 #else
     struct stat stat_buf;
     int fd;
@@ -133,9 +202,13 @@ bool vkd3d_file_map_read_only(const char *path, struct vkd3d_memory_mapped_file 
     file->mapped_size = 0;
 
 #ifdef _WIN32
-    handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
-            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-            INVALID_HANDLE_VALUE);
+    handle = INVALID_HANDLE_VALUE;
+    if ((wide = vkd3d_file_wide_path(path)))
+    {
+        handle = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        free(wide);
+    }
     if (handle == INVALID_HANDLE_VALUE)
         goto out;
 

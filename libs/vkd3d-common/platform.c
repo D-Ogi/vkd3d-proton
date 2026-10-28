@@ -169,26 +169,43 @@ const char *vkd3d_dlerror(void)
     return "Not implemented for this platform.";
 }
 
+/* The longest path Windows has, in characters (PATHCCH_MAX_CCH). The executable path can be longer
+ * than MAX_PATH (a long-path-aware process, a game in a deep directory): a MAX_PATH buffer gets a
+ * cut path, whose last component is not the file name. */
+#define VKD3D_WIN32_PATH_MAX 32768
+
+/* amdgpu-wddm fork: the name is UTF-8, from the wide module path. The ANSI path has '?' for a character outside the
+ * process code page, and a '?' in the disk cache file name makes every file call fail. For an ASCII name, the only
+ * kind the application profiles hold, the result is the same as before. */
 bool vkd3d_get_program_name(char program_name[VKD3D_PATH_MAX])
 {
-    char *name;
-    char exe_path[VKD3D_PATH_MAX];
-    GetModuleFileNameA(NULL, exe_path, VKD3D_PATH_MAX);
+    WCHAR *exe_path, *name, *slash;
+    DWORD length;
 
-    if ((name = strrchr(exe_path, '/')))
+    program_name[0] = '\0';
+    if (!(exe_path = malloc(VKD3D_WIN32_PATH_MAX * sizeof(*exe_path))))
+        return false;
+    length = GetModuleFileNameW(NULL, exe_path, VKD3D_WIN32_PATH_MAX);
+    if (!length || length >= VKD3D_WIN32_PATH_MAX)
     {
-        ++name;
-    }
-    else if ((name = strrchr(exe_path, '\\')))
-    {
-        ++name;
-    }
-    else
-    {
-        name = exe_path;
+        free(exe_path);
+        return false;
     }
 
-    strncpy(program_name, name, VKD3D_PATH_MAX);
+    name = exe_path;
+    if ((slash = wcsrchr(name, L'/')))
+        name = slash + 1;
+    if ((slash = wcsrchr(name, L'\\')))
+        name = slash + 1;
+
+    if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, program_name, VKD3D_PATH_MAX, NULL, NULL))
+    {
+        /* Longer than VKD3D_PATH_MAX bytes in UTF-8. */
+        program_name[0] = '\0';
+        free(exe_path);
+        return false;
+    }
+    free(exe_path);
     return true;
 }
 
@@ -269,26 +286,32 @@ done:
     return engine_class;
 }
 
-enum vkd3d_application_engine_class vkd3d_get_engine_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
+/* exe_path and path hold cch characters each. */
+static enum vkd3d_application_engine_class vkd3d_get_engine_version_paths(WCHAR *exe_path, WCHAR *path, size_t cch,
+        uint32_t *major, uint32_t *minor, uint32_t *patch)
 {
-    WCHAR exe_path[VKD3D_PATH_MAX], path[VKD3D_PATH_MAX];
     enum vkd3d_application_engine_class engine_class;
     HMODULE ntdll;
     DWORD size;
 
-    *major = *minor = *patch = 0;
-    GetModuleFileNameW(NULL, exe_path, VKD3D_PATH_MAX);
-    engine_class = get_engine_version_from_exe(exe_path, major, minor, patch);
-    PathCchRemoveFileSpec(exe_path, ARRAY_SIZE(exe_path));
+    size = GetModuleFileNameW(NULL, exe_path, (DWORD)cch);
+    if (!size || size >= cch)
+        return VKD3D_APPLICATION_ENGINE_CLASS_UNKNOWN;
+    /* The version resource of the executable itself is the first and best answer. Every probe
+     * below starts from a new engine_class, so a match here must return now, or the
+     * CrashReportClient.exe probe overwrites it. */
+    if ((engine_class = get_engine_version_from_exe(exe_path, major, minor, patch)))
+        return engine_class;
+    PathCchRemoveFileSpec(exe_path, cch);
 
-    if (FAILED(PathCchCombineEx(path, ARRAY_SIZE(path), exe_path,
-            L"..\\..\\..\\Engine\\Binaries\\Win64\\CrashReportClient.exe", PATHCCH_NONE)))
+    if (FAILED(PathCchCombineEx(path, cch, exe_path,
+            L"..\\..\\..\\Engine\\Binaries\\Win64\\CrashReportClient.exe", PATHCCH_ALLOW_LONG_PATHS)))
         return VKD3D_APPLICATION_ENGINE_CLASS_UNKNOWN;
     if ((engine_class = get_engine_version_from_exe(path, major, minor, patch)))
         return engine_class;
 
-    if (FAILED(PathCchCombineEx(path, ARRAY_SIZE(path), exe_path,
-            L"..\\..\\..\\Engine\\Binaries\\Win64\\UnrealCEFSubProcess.exe", PATHCCH_NONE)))
+    if (FAILED(PathCchCombineEx(path, cch, exe_path,
+            L"..\\..\\..\\Engine\\Binaries\\Win64\\UnrealCEFSubProcess.exe", PATHCCH_ALLOW_LONG_PATHS)))
         return VKD3D_APPLICATION_ENGINE_CLASS_UNKNOWN;
     if ((engine_class = get_engine_version_from_exe(path, major, minor, patch)))
         return engine_class;
@@ -306,7 +329,7 @@ enum vkd3d_application_engine_class vkd3d_get_engine_version(uint32_t *major, ui
             !pfn_NtQueryInformationProcess(GetCurrentProcess(), ProcessBasicInformation, &pbi, sizeof(pbi), NULL) &&
            (parent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pbi.InheritedFromUniqueProcessId)))
         {
-            size = ARRAY_SIZE(path);
+            size = (DWORD)cch;
             if (QueryFullProcessImageNameW(parent, 0, path, &size))
                 engine_class = get_engine_version_from_exe(path, major, minor, patch);
             CloseHandle(parent);
@@ -320,8 +343,8 @@ enum vkd3d_application_engine_class vkd3d_get_engine_version(uint32_t *major, ui
     /* This file specifically seems to exist as top-level asset file.
      * An earlier attempt was made to check for CAPCOM CompanyName,
      * but some games do not have that. This check seems more robust overall. */
-    if (FAILED(PathCchCombineEx(path, ARRAY_SIZE(path), exe_path,
-            L"re_chunk_000.pak", PATHCCH_NONE)))
+    if (FAILED(PathCchCombineEx(path, cch, exe_path,
+            L"re_chunk_000.pak", PATHCCH_ALLOW_LONG_PATHS)))
         return engine_class;
 
     if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
@@ -330,13 +353,27 @@ enum vkd3d_application_engine_class vkd3d_get_engine_version(uint32_t *major, ui
     /* Some games override their metadata to not mention UnrealEngine at all.
      * As a last ditch effort, try to see if Content/Paks folder exists.
      * This one seems to be rather universal. */
-    if (FAILED(PathCchCombineEx(path, ARRAY_SIZE(path), exe_path,
-            L"..\\..\\Content\\Paks", PATHCCH_NONE)))
+    if (FAILED(PathCchCombineEx(path, cch, exe_path,
+            L"..\\..\\Content\\Paks", PATHCCH_ALLOW_LONG_PATHS)))
         return VKD3D_APPLICATION_ENGINE_CLASS_UNKNOWN;
 
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES
                ? VKD3D_APPLICATION_ENGINE_CLASS_UNREAL_ENGINE
                : VKD3D_APPLICATION_ENGINE_CLASS_UNKNOWN;
+}
+
+enum vkd3d_application_engine_class vkd3d_get_engine_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
+{
+    enum vkd3d_application_engine_class engine_class;
+    WCHAR *buffers;
+
+    *major = *minor = *patch = 0;
+    if (!(buffers = malloc(2 * VKD3D_WIN32_PATH_MAX * sizeof(WCHAR))))
+        return VKD3D_APPLICATION_ENGINE_CLASS_UNKNOWN;
+    engine_class = vkd3d_get_engine_version_paths(buffers, buffers + VKD3D_WIN32_PATH_MAX, VKD3D_WIN32_PATH_MAX,
+            major, minor, patch);
+    free(buffers);
+    return engine_class;
 }
 
 #else

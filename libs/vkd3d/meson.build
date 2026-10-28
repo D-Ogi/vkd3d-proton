@@ -95,6 +95,7 @@ vkd3d_src = [
   'state_object_common.c',
   'acceleration_structure.c',
   'opacity_micromap.c',
+  'profile_file.c',
   'swapchain.c',
   'queue_timeline.c',
   'address_binding_tracker.c',

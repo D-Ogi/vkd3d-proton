@@ -601,6 +601,12 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
 #undef VKD3D_DECL_CONFIG_PLAIN
 };
 
+const struct vkd3d_debug_option *vkd3d_config_get_options(unsigned int *count)
+{
+    *count = ARRAY_SIZE(vkd3d_config_options);
+    return vkd3d_config_options;
+}
+
 /* Config defaults of the module that embeds libvkd3d, in VKD3D_CONFIG syntax, added to VKD3D_CONFIG before the
  * environment is deduced. d3d12core.dll never sets them; amdgpu_wddm_vkd3d.dll (libs/ddi) sets them once,
  * before its first vkd3d_create_instance. Setting them after the flags were initialized changes nothing. */

@@ -38,5 +38,13 @@ bool vkd3d_file_rename_overwrite(const char *from_path, const char *to_path);
 bool vkd3d_file_rename_no_replace(const char *from_path, const char *to_path);
 bool vkd3d_file_delete(const char *path);
 FILE *vkd3d_file_open_exclusive_write(const char *path);
+/* fopen for a UTF-8 path (_wfopen on Windows). */
+FILE *vkd3d_file_open(const char *path, const char *mode);
+
+#ifdef _WIN32
+#include <wchar.h>
+/* The UTF-8 path in UTF-16 (a path that is not UTF-8 in the process code page), or NULL. The caller frees it. */
+wchar_t *vkd3d_file_wide_path(const char *path);
+#endif
 
 #endif
