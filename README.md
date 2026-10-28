@@ -1,3 +1,7 @@
+> **amdgpu-wddm fork.** This branch, `amdgpu-wddm/main`, is the vkd3d-proton source of the Direct3D 12 engine `amdgpu_wddm_vkd3d.dll` (x64 and x86) in the amdgpu-wddm tester release 0.7.216.105-tester.33: commit [`d0f1fab2`](https://github.com/D-Ogi/vkd3d-proton/commit/d0f1fab2d7d2d5827f6b13db1f522e76b2aa80e6), plus this note. The driver project is https://github.com/D-Ogi/amdgpu-wddm. The other `amdgpu-wddm/*` branches hold work in progress and older release lines. The upstream project is https://github.com/HansKristian-Work/vkd3d-proton; its README follows unchanged.
+
+---
+
 # vkd3d-proton
 
 vkd3d-proton is a fork of VKD3D, which aims to implement the full Direct3D 12 API on top of Vulkan.
