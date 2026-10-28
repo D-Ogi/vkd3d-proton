@@ -157,6 +157,7 @@ struct vkd3d_dxil_remap_info
     unsigned int num_root_descriptors;
     unsigned int descriptor_table_offset_words;
     unsigned int min_ssbo_alignment;
+    unsigned int ssbo_robustness_size_alignment;
     vkd3d_shader_quirks_t quirks;
     bool skip_heap_lowering;
     bool local_root_signature;
@@ -187,10 +188,19 @@ static dxil_spv_bool dxil_remap_inner(
 
             if (vkd3d_shader_binding_is_root_descriptor(binding))
             {
+                /* A root SSBO is mapped to a push address and has no range.
+                 * dxil-spirv bounds a 16-bit structured access with OpArrayLength
+                 * when the stride is not a multiple of the robustness size alignment,
+                 * and a push address cannot give that length. A root descriptor
+                 * has no bounds in D3D12, so use BDA for these strides. */
+                bool unbounded_ssbo_risk = !remap->local_root_signature &&
+                        d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_STRUCTURED_BUFFER &&
+                        d3d_binding->alignment < remap->ssbo_robustness_size_alignment;
+
                 if ((remap->shader_interface_flags & VKD3D_SHADER_INTERFACE_HEAP_LOWERING) &&
                     (descriptor_type == VKD3D_SHADER_DESCRIPTOR_TYPE_CBV ||
                         d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE ||
-                        remap->min_ssbo_alignment <= d3d_binding->alignment))
+                        (remap->min_ssbo_alignment <= d3d_binding->alignment && !unbounded_ssbo_risk)))
                 {
                     if (d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE)
                         vk_binding->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_IDENTITY;
@@ -308,6 +318,7 @@ static dxil_spv_bool dxil_remap(const struct vkd3d_dxil_remap_userdata *remap,
     remap_info.num_root_descriptors = remap->num_root_descriptors;
     remap_info.shader_interface_flags = shader_interface_info->flags;
     remap_info.min_ssbo_alignment = shader_interface_info->min_ssbo_alignment;
+    remap_info.ssbo_robustness_size_alignment = shader_interface_info->ssbo_robustness_size_alignment;
     remap_info.quirks = remap->quirks;
     remap_info.skip_heap_lowering = remap->skip_heap_lowering ||
             (shader_interface_info->ssbo_exact_size_metadata_offset &&

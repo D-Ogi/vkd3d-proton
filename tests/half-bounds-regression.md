@@ -63,3 +63,27 @@ integer GetDimensions markers. Its reference run currently fails an SRV
 dimension marker and several OOB reads. Keep these results as failures while
 the independent dimension-only control is investigated. Do not change the
 expected count to match that device's result.
+
+## Root descriptor case
+
+The bound above uses OpArrayLength. A root SRV or UAV has no range in D3D12.
+On the descriptor-heap path, a root SSBO is a push address, and Mesa cannot
+lower OpArrayLength on a push address. RADV then fails in
+`radv_nir_lower_descriptors` with a null set layout. The remap therefore gives
+a root structured buffer a buffer device address when its alignment is less
+than the robustness range alignment.
+
+`half-bounds-root-remap.c` compiles the `sm69_long_vector_load_store` DXIL
+through `vkd3d_shader_compile_dxbc` with the root signature of
+`test_sm69_long_vector_load_store_root_desc`: t0-t5 and u0-u5 as root
+descriptors, minimum SSBO alignment 1 and robustness range alignment 4. Link it
+against the static vkd3d-shader, vkd3d-common and dxil-spirv libraries of an
+engine build. The optional second argument `noheap` selects the interface
+without heap lowering. Exit code 0 means no OpArrayLength and at least one
+PhysicalStorageBuffer pointer type. Without the remap change, the heap
+translation has four OpArrayLength instructions and no physical pointer.
+Both interfaces pass with the change.
+
+The physical pointer path must keep the vector index. A root structured
+buffer of `vector<half, 5>` or `vector<half, 7>` previously used an index in
+half units with a vector pointer type. Element i went to element 5i or 7i.
