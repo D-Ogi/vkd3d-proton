@@ -7323,7 +7323,10 @@ static HRESULT d3d12_pipeline_state_prepare_component_stream_output(struct d3d12
     HRESULT hr;
 
     if (FAILED(hr = d3d12_partial_so_capture_desc(desc, &signature, entries, &capture, strides)))
+    {
+        WARN("Stream output: the canonical capture declaration failed, hr %#x.\n", hr);
         goto done;
+    }
     if (!(canonical = vkd3d_shader_transform_feedback_info_dup(&capture)) ||
             !(table = vkd3d_malloc(sizeof(*table))))
     {
@@ -7332,9 +7335,15 @@ static HRESULT d3d12_pipeline_state_prepare_component_stream_output(struct d3d12
     }
     if (FAILED(hr = d3d12_partial_so_build_table(&desc->stream_output, canonical,
             !!desc->gs.BytecodeLength, table)))
+    {
+        WARN("Stream output: the declaration table failed, hr %#x.\n", hr);
         goto done;
+    }
     if (FAILED(hr = d3d12_partial_so_build_raster_table(desc, canonical, table)))
+    {
+        WARN("Stream output: the rasterized stream mapping failed, hr %#x.\n", hr);
         goto done;
+    }
 
     vkd3d_shader_transform_feedback_info_free(cached->xfb_info);
     cached->xfb_info = canonical;
@@ -8243,6 +8252,12 @@ HRESULT d3d12_partial_graphics_pipeline_create(struct d3d12_device *device,
             VkGraphicsPipelineLibraryFlagsEXT subset = stage == VK_SHADER_STAGE_FRAGMENT_BIT ?
                     VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT :
                     VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+            /* Stream output without a rasterized stream removes the fragment stage from the final description
+             * (vkd3d_pipeline_state_desc_get_shader_stages). The fragment library stays in the link; the stream
+             * output table makes the link discard rasterization, so its shader never runs. */
+            if (stage == VK_SHADER_STAGE_FRAGMENT_BIT && desc->stream_output.NumEntries &&
+                    desc->stream_output.RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM)
+                continue;
             if ((parts[j]->subsets & subset) && !(state->graphics.stage_flags & stage))
             {
                 hr = E_INVALIDARG;
