@@ -131,7 +131,12 @@ static void test_files(void)
     if (file)
         fclose(file);
     CHECK(vkd3d_file_rename_no_replace(a, b));
-    CHECK(!vkd3d_file_rename_no_replace(b, b));
+    /* A target that exists is refused, and the source stays. */
+    CHECK((file = vkd3d_file_open(a, "wb")) != NULL);
+    if (file)
+        fclose(file);
+    CHECK(!vkd3d_file_rename_no_replace(a, b));
+    CHECK(vkd3d_file_delete(a));
     memset(&mapped, 0, sizeof(mapped));
     CHECK(vkd3d_file_map_read_only(b, &mapped) && mapped.mapped_size == 7 && !memcmp(mapped.mapped, "archive", 7));
     /* The read archive goes while it is mapped (FILE_SHARE_DELETE), as a cache CLEAR needs. */
