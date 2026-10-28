@@ -2757,6 +2757,11 @@ struct vkd3d_pipeline_library_disk_cache
     size_t driver_log_capacity;
     uint64_t driver_log_begin_ns;
     uint64_t driver_log_pending_ns;
+    /* amdgpu-wddm fork: ID3D12Device9::ShaderCacheControl of the implicit driver-managed cache
+     * (vkd3d_pipeline_library_disk_cache_control). disabled: no lookup and no store until ENABLE. cleared: the files
+     * are gone, and the process neither looks up nor stores for the rest of its life. Atomics. */
+    uint32_t control_disabled;
+    uint32_t control_cleared;
 };
 
 struct d3d12_pipeline_library
@@ -2849,6 +2854,12 @@ HRESULT vkd3d_pipeline_library_init_disk_cache(struct vkd3d_pipeline_library_dis
         struct d3d12_device *device);
 /* Called on device destroy. */
 void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_cache *cache);
+/* amdgpu-wddm fork: whether a device of this process gets a disk cache (a directory is set and VKD3D_CONFIG does not
+ * restrict it to application caches). The answer of D3D12_FEATURE_SHADER_CACHE, which needs no device. */
+bool vkd3d_pipeline_library_disk_cache_configured(void);
+/* amdgpu-wddm fork: D3D12_SHADER_CACHE_CONTROL_FLAGS on the device's disk cache. */
+HRESULT vkd3d_pipeline_library_disk_cache_control(struct vkd3d_pipeline_library_disk_cache *cache,
+        D3D12_SHADER_CACHE_CONTROL_FLAGS control);
 /* amdgpu-wddm fork: the VkPipelineCache pipelines are created with when the PSO has none of its own. */
 static inline VkPipelineCache vkd3d_pipeline_library_driver_cache(const struct vkd3d_pipeline_library_disk_cache *cache,
         VkPipelineCache vk_cache)

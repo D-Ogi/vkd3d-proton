@@ -23,6 +23,13 @@ amdgpu_wddm_vkd3d_test = executable('amdgpu_wddm_vkd3d_engine_test', 'engine_tes
                           vkd3d_compiler.find_library('bcrypt') ],
   install             : false)
 
+# The disk cache decisions (ddi_cache_policy.h) and libvkd3d's file calls on a non-ANSI path; no GPU.
+amdgpu_wddm_vkd3d_cache_test = executable('amdgpu_wddm_vkd3d_cache_policy_test', 'cache_policy_test.c',
+  include_directories : vkd3d_private_includes,
+  dependencies        : [ vkd3d_common_dep ],
+  install             : false)
+test('ddi-cache-policy', amdgpu_wddm_vkd3d_cache_test, timeout : 30)
+
 # Shader translation has no Vulkan/device dependency and runs in both driver flavours.
 amdgpu_wddm_vkd3d_shader_test = executable('amdgpu_wddm_vkd3d_shader_test', 'engine_test_shader.c',
   include_directories : vkd3d_private_includes,
