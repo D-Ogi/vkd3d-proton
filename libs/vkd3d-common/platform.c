@@ -174,36 +174,37 @@ const char *vkd3d_dlerror(void)
  * cut path, whose last component is not the file name. */
 #define VKD3D_WIN32_PATH_MAX 32768
 
+/* amdgpu-wddm fork: the name is UTF-8, from the wide module path. The ANSI path has '?' for a character outside the
+ * process code page, and a '?' in the disk cache file name makes every file call fail. For an ASCII name, the only
+ * kind the application profiles hold, the result is the same as before. */
 bool vkd3d_get_program_name(char program_name[VKD3D_PATH_MAX])
 {
-    char *exe_path, *name;
+    WCHAR *exe_path, *name, *slash;
     DWORD length;
 
     program_name[0] = '\0';
-    if (!(exe_path = malloc(VKD3D_WIN32_PATH_MAX)))
+    if (!(exe_path = malloc(VKD3D_WIN32_PATH_MAX * sizeof(*exe_path))))
         return false;
-    length = GetModuleFileNameA(NULL, exe_path, VKD3D_WIN32_PATH_MAX);
+    length = GetModuleFileNameW(NULL, exe_path, VKD3D_WIN32_PATH_MAX);
     if (!length || length >= VKD3D_WIN32_PATH_MAX)
     {
         free(exe_path);
         return false;
     }
 
-    if ((name = strrchr(exe_path, '/')))
-    {
-        ++name;
-    }
-    else if ((name = strrchr(exe_path, '\\')))
-    {
-        ++name;
-    }
-    else
-    {
-        name = exe_path;
-    }
+    name = exe_path;
+    if ((slash = wcsrchr(name, L'/')))
+        name = slash + 1;
+    if ((slash = wcsrchr(name, L'\\')))
+        name = slash + 1;
 
-    strncpy(program_name, name, VKD3D_PATH_MAX);
-    program_name[VKD3D_PATH_MAX - 1] = '\0';
+    if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, program_name, VKD3D_PATH_MAX, NULL, NULL))
+    {
+        /* Longer than VKD3D_PATH_MAX bytes in UTF-8. */
+        program_name[0] = '\0';
+        free(exe_path);
+        return false;
+    }
     free(exe_path);
     return true;
 }

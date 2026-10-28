@@ -3026,7 +3026,7 @@ static void vkd3d_pipeline_library_disk_cache_merge(struct vkd3d_pipeline_librar
     if (vkd3d_file_rename_no_replace(read_path, merge_path))
     {
         INFO("Merging disk caches.\n");
-        merge_file = fopen(merge_path, "rb+");
+        merge_file = vkd3d_file_open(merge_path, "rb+");
 
         /* Shouldn't happen, but can happen if another process races us and deletes the merge file
          * in the interim. */
@@ -3345,7 +3345,7 @@ static size_t vkd3d_driver_cache_file_size(const char *path, const struct vkd3d_
     size_t size = 0;
     FILE *file;
 
-    if ((file = fopen(path, "rb")))
+    if ((file = vkd3d_file_open(path, "rb")))
     {
         if (vkd3d_driver_cache_read_header(file, expected, &header))
             size = header.data_size;
@@ -3362,7 +3362,7 @@ static void *vkd3d_driver_cache_read(const char *path, struct d3d12_device *devi
     void *data = NULL;
     FILE *file;
 
-    if (!(file = fopen(path, "rb")))
+    if (!(file = vkd3d_file_open(path, "rb")))
         return NULL;
 
     vkd3d_driver_cache_fill_header(&expected, device, 0, 0);
@@ -3478,7 +3478,7 @@ static void vkd3d_driver_cache_run_save(struct vkd3d_driver_cache_job *job, char
     }
     job->header.checksum = vkd3d_driver_cache_checksum(job->data, size);
     snprintf(tmp_path, sizeof(tmp_path), "%s.%lu.%u.tmp", job->path, vkd3d_driver_cache_pid(), job->sequence);
-    if ((file = fopen(tmp_path, "wb")))
+    if ((file = vkd3d_file_open(tmp_path, "wb")))
     {
         ok = fwrite(&job->header, sizeof(job->header), 1, file) == 1 && fwrite(job->data, 1, size, file) == size;
         ok = !fclose(file) && ok;
@@ -3504,7 +3504,7 @@ static void vkd3d_driver_cache_run_job(struct vkd3d_driver_cache_job *job)
                 job->caller_ms, 1e-6 * (double)(end_ns - begin_ns));
         vkd3d_atomic_uint32_decrement(&vkd3d_driver_cache_jobs.pending_saves, vkd3d_memory_order_release);
     }
-    if ((!job->log_size && !job->log_save) || !(log = fopen(job->log_path, "a")))
+    if ((!job->log_size && !job->log_save) || !(log = vkd3d_file_open(job->log_path, "a")))
         return;
     if (job->log_size)
         fwrite(job->log_text, 1, job->log_size, log);
