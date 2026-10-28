@@ -15,6 +15,7 @@
 #include "vkd3d_shader.h"
 
 #include "bc250_vkd3d_engine.h"
+#include "ddi_cache_policy.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,34 +36,179 @@ void vkd3d_set_embedder_shader_cache_path(const char *path, bool driver_without_
  * CreateDevice, and the thread that creates a pipeline appends it to the write archive (libs/vkd3d/cache.c).
  * The text of V6 and V7 in bc250_vkd3d_engine.h (no files, the disk cache refused in INLINE) predates this; the
  * header keeps its pinned revision until the next one.
- * The cache keeps full SPIR-V. With shader module identifiers it would keep only the names of pipelines in the
- * driver's own cache, and hosted RADV has no disk cache on Windows (Mesa does not build one there), so a new
- * process would find none of them; SPIR-V at least saves the DXIL and DXBC translation on every later start.
- * For the driver's compilation, the device creates every pipeline with one VkPipelineCache and persists it next to
- * the archive (vkd3d-proton.<program>.cache.driver): loaded at CreateDevice, saved by a pipeline-creating thread at
- * most every 2 s after 64 new pipelines, by a submitting thread once no pipeline was created for 2 s, and at the
- * device's final Release. Those engine callers' threads only take the data (vkGetPipelineCacheData); a work item
- * of the process thread pool writes the file, and the opt-in pipeline log, holding a reference to this module
- * until it is done, so no caller, final Release or FreeLibrary waits for the disk, and the device still starts no
- * thread of its own. A new driver build discards the file; a new engine build starts the archive over but keeps
- * this file.
- * Returns FALSE when no directory could be prepared. */
+ * Two routes, chosen per process by bc250_driver_has_disk_cache:
+ * - Shader module identifiers, when hosted RADV keeps its own disk cache in this process (Mesa builds it on
+ *   Windows since its commit "meson: Allow the shader cache on Windows": %LOCALAPPDATA%\mesa_shader_cache, for a
+ *   user account only). The archive keeps the names of the pipelines in that cache and their descriptions, not
+ *   SPIR-V, and the binaries live once, in the driver's cache. A pipeline whose binary the driver no longer has is
+ *   translated again and compiled.
+ * - Full SPIR-V and a driver cache file, when RADV has none (LocalSystem and other service accounts, no
+ *   %LOCALAPPDATA%, MESA_SHADER_CACHE_DISABLE): SPIR-V saves the DXIL and DXBC translation on every later start, and
+ *   the device creates every pipeline with one VkPipelineCache and persists it next to the archive
+ *   (vkd3d-proton.<program>.cache.driver): loaded at CreateDevice, saved by a pipeline-creating thread at most every
+ *   2 s after 64 new pipelines, by a submitting thread once no pipeline was created for 2 s, and at the device's
+ *   final Release. Those engine callers' threads only take the data (vkGetPipelineCacheData); a work item of the
+ *   process thread pool writes the file, and the opt-in pipeline log, holding a reference to this module until it
+ *   is done, so no caller, final Release or FreeLibrary waits for the disk, and the device still starts no thread of
+ *   its own. A new driver build discards the file; a new engine build starts the archive over but keeps this file.
+ * The directory has a budget (BC250_CACHE_BUDGET_BYTES, bc250_trim_cache_directory). The path is read and created
+ * with the wide calls and given to libvkd3d in UTF-8, whose file calls are wide too, so any user name works. */
+
+/* Whether hosted RADV keeps a disk cache in this process: Mesa's rules (src/util/disk_cache_os.c
+ * disk_cache_generate_cache_dir and src/util/disk_cache.c disk_cache_enabled) for the release flavour, where only
+ * %LOCALAPPDATA% of a user account names the directory. A lab variable that names another directory
+ * (MESA_SHADER_CACHE_DIR) is not seen here: such a process takes the SPIR-V route, which works either way. */
+static bool bc250_driver_has_disk_cache(void)
+{
+    union
+    {
+        TOKEN_USER user;
+        BYTE data[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+    } token;
+    HANDLE process_token;
+    WCHAR value[16];
+    bool user;
+    DWORD size;
+
+    /* GetCurrentProcessToken needs _WIN32_WINNT 0x0602, which libvkd3d does not set. */
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &process_token))
+        return false;
+    user = GetTokenInformation(process_token, TokenUser, &token, sizeof(token), &size) &&
+            bc250_sid_has_driver_cache((const SID *)token.user.User.Sid);
+    CloseHandle(process_token);
+    if (!user)
+        return false;
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", NULL, 0))
+        return false;
+    size = GetEnvironmentVariableW(L"MESA_SHADER_CACHE_DISABLE", value, ARRAYSIZE(value));
+    if (!size)
+        size = GetEnvironmentVariableW(L"MESA_GLSL_CACHE_DISABLE", value, ARRAYSIZE(value));
+    return !(size && size < ARRAYSIZE(value) && bc250_option_is_true(value));
+}
+
+struct bc250_cache_file
+{
+    WCHAR name[MAX_PATH];
+    size_t group;
+};
+
+/* Keeps the directory within BC250_CACHE_BUDGET_BYTES before the first device of the process opens a file in it:
+ * deletes whole program groups (archive, write archive, driver cache file, leftovers), the least recently written
+ * first. A file that another process holds open stays; the next start tries again. */
+static void bc250_trim_cache_directory(const WCHAR *directory)
+{
+    const size_t prefix_length = wcslen(L"vkd3d-proton.");
+    struct { size_t file, key_length; } *first = NULL;
+    struct bc250_cache_group *groups = NULL;
+    struct bc250_cache_file *files = NULL;
+    WCHAR pattern[MAX_PATH], path[MAX_PATH];
+    size_t file_count = 0, group_count = 0, key_length, i, j;
+    WCHAR exe_path[MAX_PATH], *program;
+    WIN32_FIND_DATAW data;
+    ULARGE_INTEGER stamp;
+    uint64_t remaining;
+    DWORD length;
+    HANDLE find;
+
+    if (swprintf(pattern, ARRAYSIZE(pattern), L"%ls\\vkd3d-proton.*", directory) < 0)
+        return;
+    /* The group of this process: vkd3d-proton.<program>.cache (libvkd3d cache.c names it so). */
+    length = GetModuleFileNameW(NULL, exe_path, ARRAYSIZE(exe_path));
+    program = NULL;
+    if (length && length < ARRAYSIZE(exe_path))
+    {
+        program = wcsrchr(exe_path, L'\\');
+        program = program ? program + 1 : exe_path;
+    }
+    if (!(files = calloc(BC250_CACHE_MAX_FILES, sizeof(*files))) ||
+            !(groups = calloc(BC250_CACHE_MAX_FILES, sizeof(*groups))) ||
+            !(first = calloc(BC250_CACHE_MAX_FILES, sizeof(*first))))
+        goto out;
+    if ((find = FindFirstFileExW(pattern, FindExInfoBasic, &data, FindExSearchNameMatch, NULL,
+            FIND_FIRST_EX_LARGE_FETCH)) == INVALID_HANDLE_VALUE)
+        goto out;
+    do
+    {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                !(key_length = bc250_cache_group_key_length(data.cFileName)))
+            continue;
+        if (file_count == BC250_CACHE_MAX_FILES)
+            break;
+        for (j = 0; j < group_count; ++j)
+        {
+            if (first[j].key_length == key_length && !_wcsnicmp(files[first[j].file].name, data.cFileName, key_length))
+                break;
+        }
+        if (j == group_count)
+        {
+            first[j].file = file_count;
+            first[j].key_length = key_length;
+            groups[j].current = program && key_length == prefix_length + wcslen(program) + wcslen(L".cache") &&
+                    !_wcsnicmp(data.cFileName + prefix_length, program, wcslen(program));
+            ++group_count;
+        }
+        wcscpy_s(files[file_count].name, ARRAYSIZE(files[file_count].name), data.cFileName);
+        files[file_count].group = j;
+        groups[j].size += ((uint64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+        stamp.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        stamp.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        if (stamp.QuadPart > groups[j].last_write)
+            groups[j].last_write = stamp.QuadPart;
+        ++file_count;
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+
+    remaining = bc250_cache_plan_trim(groups, group_count, BC250_CACHE_BUDGET_BYTES);
+    for (i = 0; i < file_count; ++i)
+    {
+        if (!groups[files[i].group].drop ||
+                swprintf(path, ARRAYSIZE(path), L"%ls\\%ls", directory, files[i].name) < 0)
+            continue;
+        DeleteFileW(path);
+    }
+    for (j = 0; j < group_count; ++j)
+    {
+        if (groups[j].drop)
+            INFO("Disk cache over its budget: dropped a program group of %llu bytes; %llu bytes stay.\n",
+                    (unsigned long long)groups[j].size, (unsigned long long)remaining);
+    }
+
+out:
+    free(first);
+    free(files);
+    free(groups);
+}
+
+/* Returns FALSE when no directory could be prepared. */
 static BOOL bc250_prepare_cache_directory(void)
 {
-    char path[MAX_PATH];
-    DWORD length = GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path));
-    static const char suffix[] = "\\amdgpu-wddm";
-    static const char leaf[] = "\\vkd3d";
+    static const WCHAR suffix[] = L"\\amdgpu-wddm";
+    static const WCHAR leaf[] = L"\\vkd3d";
+    char utf8_path[MAX_PATH];
+    WCHAR path[MAX_PATH];
+    bool driver_cache;
+    DWORD length;
+    int utf8_length;
 
-    if (!length || length + sizeof(suffix) + sizeof(leaf) > sizeof(path))
+    length = GetEnvironmentVariableW(L"LOCALAPPDATA", path, ARRAYSIZE(path));
+    if (!length || length + ARRAYSIZE(suffix) + ARRAYSIZE(leaf) > ARRAYSIZE(path))
         return FALSE;
-    strcat(path, suffix);
-    if (!CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+    wcscat_s(path, ARRAYSIZE(path), suffix);
+    if (!CreateDirectoryW(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
         return FALSE;
-    strcat(path, leaf);
-    if (!CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+    wcscat_s(path, ARRAYSIZE(path), leaf);
+    if (!CreateDirectoryW(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
         return FALSE;
-    vkd3d_set_embedder_shader_cache_path(path, true);
+    /* libvkd3d's paths hold MAX_PATH bytes; leave room for \vkd3d-proton.<program>.cache.driver.<pid>.<n>.tmp. */
+    utf8_length = WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8_path, sizeof(utf8_path), NULL, NULL);
+    if (!utf8_length || utf8_length > MAX_PATH - 96)
+        return FALSE;
+
+    bc250_trim_cache_directory(path);
+    driver_cache = bc250_driver_has_disk_cache();
+    INFO("Disk cache %s, %s.\n", utf8_path, driver_cache ? "shader module identifiers (the driver keeps the binaries)" :
+            "full SPIR-V and a driver cache file (the driver keeps no disk cache in this process)");
+    vkd3d_set_embedder_shader_cache_path(utf8_path, !driver_cache);
     return TRUE;
 }
 

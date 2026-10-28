@@ -5126,11 +5126,14 @@ static HRESULT d3d12_device_check_feature_support(struct d3d12_device *device,
 
             /* We cannot query shader cache features from the Vulkan driver,
              * but all relevant drivers have their own disk cache, so we'll
-             * advertize support for the AUTOMATIC_*_CACHE feature bits. */
+             * advertize support for the AUTOMATIC_*_CACHE feature bits.
+             * amdgpu-wddm fork: AUTOMATIC_DISK_CACHE only when this process gets the engine's disk cache, which
+             * is what the D3D12 driver reports as its driver-managed cache. */
             data->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO |
                     D3D12_SHADER_CACHE_SUPPORT_LIBRARY |
-                    D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE |
-                    D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE;
+                    D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_INPROC_CACHE;
+            if (vkd3d_pipeline_library_disk_cache_configured())
+                data->SupportFlags |= D3D12_SHADER_CACHE_SUPPORT_AUTOMATIC_DISK_CACHE;
 
             TRACE("Shader cache support flags %#x.\n", data->SupportFlags);
             return S_OK;
@@ -8760,9 +8763,18 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateShaderCacheSession(d3d12_dev
 static HRESULT STDMETHODCALLTYPE d3d12_device_ShaderCacheControl(d3d12_device_iface *iface,
         D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS control)
 {
-    FIXME("iface %p, kinds %#x, control %#x stub!\n", iface, kinds, control);
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, kinds %#x, control %#x.\n", iface, kinds, control);
+
+    /* amdgpu-wddm fork: the implicit driver-managed cache is the device's disk cache, which the D3D12 driver's
+     * pfnImplicitShaderCacheControl controls through this call. The other kinds belong to the D3D12 runtime. */
+    if (kinds != D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED)
+    {
+        FIXME("Shader cache kinds %#x are not implemented.\n", kinds);
+        return E_NOTIMPL;
+    }
+    return vkd3d_pipeline_library_disk_cache_control(&device->disk_cache, control);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue1(d3d12_device_iface *iface,

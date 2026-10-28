@@ -2867,12 +2867,22 @@ static HRESULT vkd3d_pipeline_library_disk_cache_save_pipeline_state(struct vkd3
     return S_OK;
 }
 
+/* amdgpu-wddm fork: ShaderCacheControl turned the disk cache off (disabled) or cleared it for this process. */
+static bool vkd3d_pipeline_library_disk_cache_blocked(struct vkd3d_pipeline_library_disk_cache *cache)
+{
+    return vkd3d_atomic_uint32_load_explicit(&cache->control_disabled, vkd3d_memory_order_relaxed) ||
+            vkd3d_atomic_uint32_load_explicit(&cache->control_cleared, vkd3d_memory_order_relaxed);
+}
+
 HRESULT vkd3d_pipeline_library_store_pipeline_to_disk_cache(
         struct vkd3d_pipeline_library_disk_cache *cache,
         struct d3d12_pipeline_state *state)
 {
     struct vkd3d_pipeline_library_disk_cache_item item;
     HRESULT hr;
+
+    if (vkd3d_pipeline_library_disk_cache_blocked(cache))
+        return S_OK;
 
     /* amdgpu-wddm fork: without a disk thread, the creating thread serializes the pipeline while it still holds
      * the only reference, so no other thread can run its destructor. Serializing makes no Vulkan call: the disk
@@ -2918,6 +2928,9 @@ HRESULT vkd3d_pipeline_library_find_cached_blob_from_disk_cache(struct vkd3d_pip
     const struct vkd3d_cached_pipeline_entry *e;
     struct vkd3d_cached_pipeline_key key;
     int rc;
+
+    if (vkd3d_pipeline_library_disk_cache_blocked(cache))
+        return E_INVALIDARG;
 
     if ((rc = rwlock_lock_read(&library->mutex)))
     {
@@ -3644,6 +3657,8 @@ static bool vkd3d_driver_cache_save(struct vkd3d_pipeline_library_disk_cache *ca
     uint64_t begin_ns;
     VkResult vr;
 
+    if (vkd3d_pipeline_library_disk_cache_blocked(cache))
+        return false;
     begin_ns = vkd3d_get_current_time_ns();
     if ((vr = VK_CALL(vkGetPipelineCacheData(device->vk_device, cache->vk_pipeline_cache, &size, NULL))) ||
             size <= max(cache->driver_saved_size, sizeof(VkPipelineCacheHeaderVersionOne)))
@@ -4548,6 +4563,81 @@ void vkd3d_pipeline_library_flush_disk_cache(struct vkd3d_pipeline_library_disk_
     }
 
     vkd3d_file_unmap(&cache->mapped_file);
+
+    /* amdgpu-wddm fork: a file that a CLEAR could not delete while it was open (the write archive of the disk
+     * thread, a read archive that another process held) goes now. */
+    if (vkd3d_atomic_uint32_load_explicit(&cache->control_cleared, vkd3d_memory_order_relaxed))
+    {
+        vkd3d_file_delete(cache->write_path);
+        vkd3d_file_delete(cache->read_path);
+    }
+}
+
+bool vkd3d_pipeline_library_disk_cache_configured(void)
+{
+    return !VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_APP_CACHE_ONLY);
+}
+
+/* amdgpu-wddm fork: ID3D12Device9::ShaderCacheControl for D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED, which
+ * the shell's pfnImplicitShaderCacheControl forwards (developer mode only; the runtime gives the flags as hints).
+ * The cache it controls is this device's stream archive (read_path, write_path) and, when the device persists one,
+ * the driver cache file (driver_path). The Vulkan driver's own disk cache (hosted RADV: %LOCALAPPDATA%\
+ * mesa_shader_cache, shared by all processes and keyed by the whole pipeline) is outside the reach of the engine:
+ * after DISABLE or CLEAR a pipeline is translated again and created from SPIR-V, and the driver may still find its
+ * binary there.
+ * DISABLE: no lookup and no store until ENABLE. Pipelines that the device already holds stay valid.
+ * CLEAR: the files are deleted now where the system lets them go, the rest at the device's final Release, and the
+ * process neither looks up nor stores for the rest of its life, so that the next process starts from nothing. */
+HRESULT vkd3d_pipeline_library_disk_cache_control(struct vkd3d_pipeline_library_disk_cache *cache,
+        D3D12_SHADER_CACHE_CONTROL_FLAGS control)
+{
+    struct vkd3d_driver_cache_job *job;
+
+    if ((control & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) && (control & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE))
+        return E_INVALIDARG;
+    if (control & ~(D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE | D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE |
+            D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR))
+        return E_INVALIDARG;
+    /* No disk cache: nothing to control. */
+    if (!cache->library)
+        return S_OK;
+
+    if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+        vkd3d_atomic_uint32_store_explicit(&cache->control_disabled, 1, vkd3d_memory_order_relaxed);
+    if (control & D3D12_SHADER_CACHE_CONTROL_FLAG_ENABLE)
+        vkd3d_atomic_uint32_store_explicit(&cache->control_disabled, 0, vkd3d_memory_order_relaxed);
+    INFO("Shader cache control %#x: lookups and stores %s.\n", control,
+            (control & D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR) ||
+            vkd3d_atomic_uint32_load_explicit(&cache->control_disabled, vkd3d_memory_order_relaxed) ? "off" : "on");
+
+    if (!(control & D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR))
+        return S_OK;
+
+    vkd3d_atomic_uint32_store_explicit(&cache->control_cleared, 1, vkd3d_memory_order_relaxed);
+    if (cache->threadless)
+    {
+        /* Pipeline creation appends under this lock; the next append finds control_cleared and writes nothing. */
+        pthread_mutex_lock(&cache->lock);
+        cache->stream_archive_attempted_write = true;
+        if (cache->stream_archive_write_file)
+        {
+            fclose(cache->stream_archive_write_file);
+            cache->stream_archive_write_file = NULL;
+        }
+        vkd3d_file_delete(cache->write_path);
+        pthread_mutex_unlock(&cache->lock);
+    }
+    /* The read archive is mapped with FILE_SHARE_DELETE, so it goes while this process still reads it. */
+    vkd3d_file_delete(cache->read_path);
+
+    /* The driver cache file goes through the job queue, after any save queued before it. */
+    if (cache->vk_pipeline_cache && (job = vkd3d_calloc(1, sizeof(*job))))
+    {
+        vkd3d_strlcpy(job->path, sizeof(job->path), cache->driver_path);
+        job->drop = true;
+        vkd3d_driver_cache_queue_job(job);
+    }
+    return S_OK;
 }
 
 void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_library_disk_cache *disk_cache,
@@ -4564,6 +4654,14 @@ void vkd3d_pipeline_library_disk_cache_notify_blob_insert(struct vkd3d_pipeline_
 
     if (disk_cache->threadless)
         pthread_mutex_lock(&disk_cache->lock);
+
+    /* amdgpu-wddm fork: a cleared cache takes nothing more (the disk thread may still hold queued pipelines). */
+    if (vkd3d_atomic_uint32_load_explicit(&disk_cache->control_cleared, vkd3d_memory_order_relaxed))
+    {
+        if (disk_cache->threadless)
+            pthread_mutex_unlock(&disk_cache->lock);
+        return;
+    }
 
     /* On first write (new blob), create a new file. */
     if (!disk_cache->stream_archive_attempted_write)
