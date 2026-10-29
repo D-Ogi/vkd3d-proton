@@ -353,6 +353,35 @@ bool shader_is_dxil(const void *dxbc, size_t dxbc_length)
     return dxil;
 }
 
+struct dxil_part
+{
+    const char *data;
+    DWORD size;
+};
+
+static int dxil_part_handler(const char *data, DWORD data_size, DWORD tag, void *context)
+{
+    struct dxil_part *part = context;
+
+    if (tag == TAG_DXIL && !part->data)
+    {
+        part->data = data;
+        part->size = data_size;
+    }
+    return VKD3D_OK;
+}
+
+bool shader_find_dxil_part(const void *dxbc, size_t dxbc_length, struct vkd3d_shader_code *part)
+{
+    struct dxil_part found = {NULL, 0};
+
+    if (parse_dxbc(dxbc, dxbc_length, dxil_part_handler, &found) < 0 || !found.data)
+        return false;
+    part->code = found.data;
+    part->size = found.size;
+    return true;
+}
+
 /* root signatures */
 #define VKD3D_ROOT_SIGNATURE_1_0_ROOT_DESCRIPTOR_FLAGS VKD3D_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE
 

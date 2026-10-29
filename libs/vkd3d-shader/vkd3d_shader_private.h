@@ -57,6 +57,8 @@
 #include <string.h>
 
 bool shader_is_dxil(const void *dxbc, size_t dxbc_length);
+/* amdgpu-wddm fork: the payload of the first DXIL part, without its part header. */
+bool shader_find_dxil_part(const void *dxbc, size_t dxbc_length, struct vkd3d_shader_code *part);
 
 int shader_parse_input_signature(const void *dxbc, size_t dxbc_length,
         struct vkd3d_shader_signature *signature);

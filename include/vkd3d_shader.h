@@ -1267,6 +1267,14 @@ vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
         const struct vkd3d_shader_compile_arguments *args,
         vkd3d_shader_hash_t hash, const char *entry);
 
+/* amdgpu-wddm fork: the built-in quirks of every application, keyed by vkd3d_shader_hash() of the DXIL part of the
+ * container (vkd3d_shader_main.c, vkd3d_shader_fsr4_post_barrier_hashes). shader_hash is only logged. */
+vkd3d_shader_quirks_t vkd3d_shader_select_builtin_quirks(const struct vkd3d_shader_code *dxbc,
+        vkd3d_shader_hash_t shader_hash);
+vkd3d_shader_quirks_t vkd3d_shader_builtin_quirks_for_dxil_part(vkd3d_shader_hash_t dxil_part_hash);
+/* vkd3d_shader_hash() of the payload of the first DXIL part; false for a container without one. */
+bool vkd3d_shader_hash_dxil_part(const struct vkd3d_shader_code *dxbc, vkd3d_shader_hash_t *hash);
+
 /* Also returns global shader quirks which are added through config files. */
 uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks);
 

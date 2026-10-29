@@ -405,6 +405,60 @@ struct vkd3d_shader_quirk_entry
 static struct vkd3d_shader_quirk_entry *vkd3d_shader_quirk_entries;
 size_t vkd3d_shader_quirk_entry_count;
 
+/* amdgpu-wddm fork: built-in per-shader quirks for every application. Any game can load the library that these
+ * shaders come from, so the table is keyed by shader hash only, not by executable name.
+ *
+ * AMD FSR 4.1.2, RDNA 2 model of the upscaler DLL. Each conv pass (the prepass and pass1 to pass12) is followed by
+ * a _post pass that zeroes the border of the same tensor in the same scratch buffer. The DLL records no UAV barrier
+ * between the two dispatches; it records one only after each _post pass. In the shader set with 4K maximum tensor
+ * sizes, the conv threads exit only past the compiled maximum, not past the actual size. At 1920-wide outputs
+ * taller than 1080, the spare threads of the quarter and eighth resolution passes store into the border columns
+ * that the _post pass zeroes. The two writes are not ordered, so the padding that the next conv pass reads changes
+ * from run to run and gives a band at the right edge of the image. A barrier after each conv pass orders the
+ * writes. Both compiled shader sets are listed: the 1080p set does not overlap today, but has the same missing
+ * barrier.
+ *
+ * The key is vkd3d_shader_hash() of the DXIL part alone (its payload, without the part header), not of the whole
+ * container. On the installed D3D12 route the DDI gives the driver only the DXIL part, and the D3D12 shell writes a
+ * new container around it (engine-ddi shader-container, BuildContainer): other parts, another checksum, so another
+ * vkd3d_shader_hash() of the container. The DXIL part is the same bytes in the DLL's container and in the rebuilt
+ * one, so this key matches on both routes. The DXIL part hashes of these 26 passes select no other shader of the
+ * DLL. */
+static const struct vkd3d_shader_builtin_quirk
+{
+    vkd3d_shader_hash_t dxil_part_hash;
+    vkd3d_shader_quirks_t quirks;
+} vkd3d_shader_fsr4_post_barrier_hashes[] = {
+    /* Shader set with 4K maximum tensor sizes. */
+    { 0x0a2cf36e9a267dbcull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* prepass */
+    { 0xf6a627fe621f2ecaull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass1 */
+    { 0xb80be06cbf660f5full, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass2 */
+    { 0xac8621a7509d92f5ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass3 */
+    { 0x539bdf3943318ae1ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass4 */
+    { 0x38e117464cb90a26ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass5 */
+    { 0x856803dfb52462b8ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass6 */
+    { 0xc98e37733b65770dull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass7 */
+    { 0xf6b6ff1f520da32cull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass8 */
+    { 0xe08e83c7aa16ff62ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass9 */
+    { 0x3e8dab2e67c83f6bull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass10 */
+    { 0xa650d84f380d5435ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass11 */
+    { 0x46f48307cce37f93ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass12 */
+    /* Shader set with 1080p maximum tensor sizes. */
+    { 0xb41306fbe32af591ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* prepass */
+    { 0xf583f1bcc34310d1ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass1 */
+    { 0xc0532fda75f90acfull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass2 */
+    { 0xd26bdd22c83fa6e1ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass3 */
+    { 0xd5582283674bec12ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass4 */
+    { 0x2a1c8509970fcadfull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass5 */
+    { 0xeeceb55864a63a69ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass6 */
+    { 0x7b25e192737f244bull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass7 */
+    { 0x3c5c88452c25177cull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass8 */
+    { 0x9ffa7a11946b6f2dull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass9 */
+    { 0x22e436abd5bbb8e4ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass10 */
+    { 0xbaa8999b14c1d737ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass11 */
+    { 0xc1c54a540edcfbd0ull, VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER }, /* pass12 */
+};
+
 #define ENTRY(x) { #x, VKD3D_SHADER_QUIRK_ ## x }
 static const struct vkd3d_shader_quirk_mapping
 {
@@ -547,6 +601,46 @@ vkd3d_shader_quirks_t vkd3d_shader_compile_arguments_select_quirks(
         return quirks;
 }
 
+vkd3d_shader_quirks_t vkd3d_shader_builtin_quirks_for_dxil_part(vkd3d_shader_hash_t dxil_part_hash)
+{
+    vkd3d_shader_quirks_t quirks = 0;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(vkd3d_shader_fsr4_post_barrier_hashes); i++)
+    {
+        if (vkd3d_shader_fsr4_post_barrier_hashes[i].dxil_part_hash == dxil_part_hash)
+            quirks |= vkd3d_shader_fsr4_post_barrier_hashes[i].quirks;
+    }
+    return quirks;
+}
+
+bool vkd3d_shader_hash_dxil_part(const struct vkd3d_shader_code *dxbc, vkd3d_shader_hash_t *hash)
+{
+    struct vkd3d_shader_code part;
+
+    memset(&part, 0, sizeof(part));
+    if (!shader_find_dxil_part(dxbc->code, dxbc->size, &part))
+        return false;
+    *hash = vkd3d_shader_hash(&part);
+    return true;
+}
+
+vkd3d_shader_quirks_t vkd3d_shader_select_builtin_quirks(const struct vkd3d_shader_code *dxbc,
+        vkd3d_shader_hash_t shader_hash)
+{
+    vkd3d_shader_hash_t part_hash;
+    vkd3d_shader_quirks_t quirks;
+
+    if (!vkd3d_shader_hash_dxil_part(dxbc, &part_hash))
+        return 0;
+    if ((quirks = vkd3d_shader_builtin_quirks_for_dxil_part(part_hash)))
+    {
+        INFO("Adding built-in shader quirks #%"PRIx64" for hash %016"PRIx64", DXIL part %016"PRIx64".\n",
+                quirks, shader_hash, part_hash);
+    }
+    return quirks;
+}
+
 uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks)
 {
     vkd3d_shader_quirks_t quirks = 0;
@@ -555,9 +649,18 @@ uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks)
 
     pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
 
+    /* amdgpu-wddm fork: the built-in table changes the shader metadata, so it is part of the revision (and of the
+     * shader interface key that holds it). Its quirks stay out of aux_quirks, which lists the quirks of the
+     * VKD3D_SHADER_QUIRKS file only. */
+    quirk_hash = hash_fnv1_init();
+    for (i = 0; i < ARRAY_SIZE(vkd3d_shader_fsr4_post_barrier_hashes); i++)
+    {
+        quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_fsr4_post_barrier_hashes[i].dxil_part_hash);
+        quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_fsr4_post_barrier_hashes[i].quirks);
+    }
+
     if (vkd3d_shader_quirk_entry_count)
     {
-        quirk_hash = hash_fnv1_init();
         for (i = 0; i < vkd3d_shader_quirk_entry_count; i++)
         {
             quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].lo);

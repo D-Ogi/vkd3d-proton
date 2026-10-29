@@ -1632,6 +1632,8 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     }
 
     quirks = vkd3d_shader_compile_arguments_select_quirks(compiler_args, hash, quirk_entry);
+    /* amdgpu-wddm fork: keyed by the DXIL part, which the D3D12 shell's rebuilt container keeps unchanged. */
+    quirks |= vkd3d_shader_select_builtin_quirks(dxbc, hash);
     if (quirks & VKD3D_SHADER_QUIRK_FORCE_COMPUTE_BARRIER)
         spirv->meta.flags |= VKD3D_SHADER_META_FLAG_FORCE_COMPUTE_BARRIER_AFTER_DISPATCH;
     if (quirks & VKD3D_SHADER_QUIRK_FORCE_PRE_COMPUTE_BARRIER)
