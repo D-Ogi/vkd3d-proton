@@ -35,6 +35,7 @@
 #include "vkd3d_shader.h"
 #include "vkd3d_pgp_view.h"
 #include "vkd3d_pgp_so.h"
+#include "vkd3d_compile_admission.h"
 #include "vkd3d_threads.h"
 #include "vkd3d_platform.h"
 #include "vkd3d_swapchain_factory.h"
@@ -2929,18 +2930,26 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
  * creations (until BD-226 it needed a free slot of the fixed bound, and a pool compile that held a slot for
  * hundreds of milliseconds made the draw a frame-long stall). A failed reading counts
  * as cool. In the lab flavour AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0 turns the band off; the release flavour always
- * keeps it. The constants are in cache.c. */
+ * keeps it. The constants are in cache.c.
+ *
+ * Urgent creations (BD-226). A pool compile that the frame waits for is no longer a precompile: the D3D12 driver
+ * marks the thread that makes it (V14 of libs/ddi/bc250_vkd3d_engine.h, through SetPrivateData of the device), and
+ * the limiter admits that creation at once, past the bound and the band, as it admits a draw-time variant. The mark
+ * lasts to the end of the creation on that thread (vkd3d_compile_scope_end, or the end of an unscoped slot). The
+ * rules are in vkd3d_compile_admission.h.
+ *
+ * Time split. The limiter also sums, per device, the time of the DXIL to SPIR-V conversions, of the driver calls
+ * answered from a cache, of the driver compiles and of the waits for a slot, and writes them on a periodic line
+ * (VKD3D_COMPILE_LIMITER_PERIOD_NS, written by the first counted event after the period) and at the device's end, so that a session that is
+ * killed still says where its compile time went and how many driver calls the caches answered. */
 struct vkd3d_pipeline_compile_limiter
 {
     pthread_mutex_t lock;
     pthread_cond_t cond;
-    uint32_t slots;
-    uint32_t in_flight;
-    /* Tickets: next_ticket is the next caller's, next_admit the oldest caller's not yet admitted. */
-    uint64_t next_ticket;
-    uint64_t next_admit;
-    /* Callers exempt from the band (draw-time variants) waiting for a slot outside the ticket order. */
-    uint32_t exempt_waiting;
+    /* Slots, tickets and urgent threads (vkd3d_compile_admission.h). */
+    struct vkd3d_compile_admission admission;
+    /* A hint, read without the lock: marks that may be set, so that a creation's end takes the lock only then. */
+    uint32_t urgent_hint;
     bool active;
     /* Counters, under lock and always kept; logged at the device's end, and every
      * VKD3D_COMPILE_LIMITER_LOG_WAITS waits when the PSO log is on (AMDGPU_WDDM_VKD3D_PSO_LOG). */
@@ -2956,6 +2965,22 @@ struct vkd3d_pipeline_compile_limiter
     /* Driver calls answered from a cache without a slot, and those that compiled. */
     uint64_t cache_hits;
     uint64_t compiles;
+    /* Urgent creations: marks received, admissions of a marked thread, and those while every slot was held. */
+    uint64_t urgent_marks;
+    uint64_t urgent_admitted;
+    uint64_t urgent_over_bound;
+    /* The time split: DXIL to SPIR-V conversions, driver calls answered from a cache, driver compiles. */
+    uint64_t conversions;
+    uint64_t conversion_ns;
+    uint64_t cache_hit_ns;
+    uint64_t compile_ns;
+    /* The caller's own probes (an application's shader identifier, the identifier route of the disk cache): the
+     * driver found the pipeline in its cache, or did not and the caller compiles the stages; the time of both. */
+    uint64_t identifier_hits;
+    uint64_t identifier_misses;
+    uint64_t identifier_ns;
+    /* When the last periodic line was written. */
+    uint64_t period_begin_ns;
 
     /* Thermal band, under lock. */
     bool thermal;
@@ -3008,6 +3033,12 @@ void vkd3d_compile_scope_need(void);
  * and without a slot, and again under a slot only if the driver must compile. flags2 is as given on return. */
 VkResult vkd3d_compile_pipeline(struct d3d12_device *device, VkPipelineCreateFlags2CreateInfo *flags2, bool exempt,
         VkResult (*call)(void *ctx), void *ctx);
+/* V14 (libs/ddi/bc250_vkd3d_engine.h): marks the creation that thread_id makes now or begins next as urgent, or
+ * clears the mark. A thread's mark ends with its creation. */
+void vkd3d_compile_limiter_mark_urgent(struct vkd3d_pipeline_compile_limiter *limiter, uint32_t thread_id,
+        bool urgent);
+/* One DXIL or DXBC to SPIR-V conversion took ns (the time split of the periodic line). */
+void vkd3d_compile_limiter_note_conversion(struct vkd3d_pipeline_compile_limiter *limiter, uint64_t ns);
 /* The die temperature in millidegrees from the BC-250 KMD (d3dkmt.c); false when it cannot be read. */
 bool vkd3d_kmd_read_temperature(LUID adapter_luid, int32_t *temperature_mc);
 

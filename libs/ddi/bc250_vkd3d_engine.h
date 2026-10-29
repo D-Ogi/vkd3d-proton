@@ -5,7 +5,8 @@
  * amdgpu_wddm_vkd3d.dll, vkd3d-proton fork branch amdgpu-wddm/ddi-engine). The DLL was bc250vkd3d.dll before
  * its file names took the project's amdgpu_wddm prefix; code identifiers keep their BC250 names.
  *
- * Revision r6-draft, ABI 1.4: NOT FROZEN. r6 appends partial graphics library functions.
+ * Revision r7-draft, ABI 1.10: NOT FROZEN. r7 adds urgent creations (V14), private data of the engine device with
+ * no new function, structure field or minor. r6 appends partial graphics library functions.
  * r5 adds 1.3, linear images (V13), and changes nothing of 1.2.
  * r4 adds the instance mode (V12) to 1.2; the minor stays 1.2 because 1.2
  * is a draft, so an r3 engine does not know the field (V12 says how the shell tells). r3 adds 1.2 (imported memory
@@ -309,6 +310,23 @@
  *         requirements, MemoryTypeBits its memory types. None of them is the size of the shell's allocation.
  *       - Layout. The image is used in VK_IMAGE_LAYOUT_GENERAL, as every image of vkd3d-proton whose tiling is
  *         linear. InitialState and the clear value are those of CreatePlacedResource.
+ *   V14 Urgent creations (r7-draft, no minor). The shell creates pipeline states ahead of use on threads of its own
+ *       and sometimes has to wait for one that is not ready yet: the frame stops until it is. vkd3d-proton's compile
+ *       limiter admits pool compiles a few at a time in arrival order, so the waited creation could stand behind
+ *       other pool compiles for hundreds of milliseconds (BD-226). The shell therefore names the thread that makes
+ *       the waited creation: ID3D12Device::SetPrivateData(&guid, sizeof(BC250_VKD3D_COMPILE_URGENCY), &urgency) of
+ *       the engine device, with guid BC250_VKD3D_COMPILE_URGENCY_GUID_INIT.
+ *       - Effect. A creation of thread ThreadId that is urgent goes past the limiter's bound and thermal band at
+ *         once, as a variant compiled at draw time does. A creation that already waits goes when the mark arrives.
+ *         Urgent = 0 clears the mark. The mark ends with the end of the thread's current creation, or of its next
+ *         one when no creation is running at the mark; a creation that the waited one makes after it (a second
+ *         library) is not urgent.
+ *       - Data. The engine does not store it: GetPrivateData of the GUID finds nothing. E_INVALIDARG for a NULL
+ *         pointer, a size below the structure, a Size field below the structure or above the size, or ThreadId
+ *         0. A larger Size is accepted and its added fields are ignored. Any thread may set the mark of any
+ *         thread, at any time; the mark costs one lock of the limiter.
+ *       - Older engines. An engine before r7 stores the data as ordinary private data and gives no urgency;
+ *         SetPrivateData returns S_OK. The shell pins the engine build; it does not probe for V14.
  */
 #ifndef BC250_VKD3D_ENGINE_H
 #define BC250_VKD3D_ENGINE_H
@@ -462,6 +480,18 @@ typedef struct BC250_VKD3D_LINEAR_IMAGE_INFO
     UINT64 MemorySize;                             /* VkMemoryRequirements::size */
     UINT64 MemoryAlignment;                        /* VkMemoryRequirements::alignment */
 } BC250_VKD3D_LINEAR_IMAGE_INFO;
+
+/* V14, r7. The private data GUID of an urgent creation, as an initializer of a GUID. */
+#define BC250_VKD3D_COMPILE_URGENCY_GUID_INIT \
+        {0xdcbd70e7, 0x16da, 0x474e, {0x8f, 0xe9, 0x3a, 0x60, 0xc0, 0xcf, 0x2b, 0x71}}
+
+/* V14, r7. The private data of BC250_VKD3D_COMPILE_URGENCY_GUID_INIT. */
+typedef struct BC250_VKD3D_COMPILE_URGENCY
+{
+    UINT32 Size;                                   /* sizeof(BC250_VKD3D_COMPILE_URGENCY) */
+    UINT32 ThreadId;                               /* GetCurrentThreadId of the thread that makes the creation */
+    UINT32 Urgent;                                 /* 1: urgent; 0: clear the mark */
+} BC250_VKD3D_COMPILE_URGENCY;
 
 /* The D3D12 structures of 1.2 and 1.3 by their struct tags (see C and C++ above). */
 struct D3D12_HEAP_DESC;

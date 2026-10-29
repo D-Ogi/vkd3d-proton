@@ -3457,6 +3457,7 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
     struct vkd3d_shader_compile_arguments compile_args;
     vkd3d_shader_hash_t recovered_hash = 0;
     vkd3d_shader_hash_t compiled_hash = 0;
+    uint64_t begin_ns;
     int ret;
 
     if (spirv_code->code && VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_SANITIZE_SPIRV))
@@ -3479,8 +3480,12 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
                 device->descriptor_qa_global_info, dxbc.code, dxbc.size);
         d3d12_pipeline_state_init_compile_arguments(state, device, stage, &compile_args);
 
-        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug,
-                0, &shader_interface, &compile_args)) < 0)
+        /* amdgpu-wddm fork: the conversion's time goes into the limiter's time split (BD-226); the wait for the slot
+         * is not in it. */
+        begin_ns = vkd3d_get_current_time_ns();
+        ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug, 0, &shader_interface, &compile_args);
+        vkd3d_compile_limiter_note_conversion(&device->compile_limiter, vkd3d_get_current_time_ns() - begin_ns);
+        if (ret < 0)
         {
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
             WARN("Failed to compile shader: stage %#x, bytecode bytes %zu, bytecode fnv1a64 %016"PRIx64

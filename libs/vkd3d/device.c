@@ -4196,10 +4196,23 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_GetPrivateData(d3d12_device_iface 
 static HRESULT STDMETHODCALLTYPE d3d12_device_SetPrivateData(d3d12_device_iface *iface,
         REFGUID guid, UINT data_size, const void *data)
 {
+    static const GUID compile_urgency_guid = VKD3D_COMPILE_URGENCY_GUID_INIT;
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    uint32_t thread_id;
+    bool urgent;
 
     TRACE("iface %p, guid %s, data_size %u, data %p.\n",
             iface, debugstr_guid(guid), data_size, data);
+
+    /* amdgpu-wddm fork, V14 of libs/ddi/bc250_vkd3d_engine.h: the D3D12 driver marks a creation that the frame waits
+     * for (BD-226). The data is a request to the compile limiter; it is not stored. */
+    if (IsEqualGUID(guid, &compile_urgency_guid))
+    {
+        if (!vkd3d_compile_urgency_decode(data, data_size, &thread_id, &urgent))
+            return E_INVALIDARG;
+        vkd3d_compile_limiter_mark_urgent(&device->compile_limiter, thread_id, urgent);
+        return S_OK;
+    }
 
     return vkd3d_set_private_data(&device->private_store, guid, data_size, data,
             (vkd3d_set_name_callback) d3d12_device_set_name, device);

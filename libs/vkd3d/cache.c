@@ -4000,11 +4000,15 @@ void vkd3d_driver_cache_probe_end(struct vkd3d_pipeline_library_disk_cache *cach
 }
 
 /* amdgpu-wddm fork: the bound on concurrent pipeline compiles. See struct
- * vkd3d_pipeline_compile_limiter in vkd3d_private.h for why it exists. */
+ * vkd3d_pipeline_compile_limiter in vkd3d_private.h for why it exists, and vkd3d_compile_admission.h for the
+ * admission rules. */
 
 #define VKD3D_COMPILE_LIMITER_DEFAULT_SLOTS 2
 /* One line per this many waits, so a burst leaves a trace without a line per pipeline. */
 #define VKD3D_COMPILE_LIMITER_LOG_WAITS 256
+/* The periodic time-split line: at most one per this period, and only when a counter moved since the last one. A
+ * game that is killed (every lab trial and most player sessions) never reaches the line of the device's end. */
+#define VKD3D_COMPILE_LIMITER_PERIOD_NS (30ull * 1000000000ull)
 
 /* The thermal band, in millidegrees C of the KMD's die reading (the lab runner stops a game at 87 C): from
  * ONE_SLOT one slot, below it all slots. */
@@ -4043,7 +4047,7 @@ void vkd3d_pipeline_compile_limiter_init(struct vkd3d_pipeline_compile_limiter *
         pthread_mutex_destroy(&limiter->lock);
         return;
     }
-    limiter->slots = slots;
+    vkd3d_compile_admission_init(&limiter->admission, slots);
     limiter->log = device->disk_cache.driver_log;
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
     limiter->thermal = !!vkd3d_env_var_as_uint("AMDGPU_WDDM_VKD3D_COMPILE_THERMAL", 1);
@@ -4052,18 +4056,67 @@ void vkd3d_pipeline_compile_limiter_init(struct vkd3d_pipeline_compile_limiter *
 #endif
     limiter->adapter_luid = device->adapter_luid;
     limiter->thermal_max_mc = INT32_MIN;
+    limiter->period_begin_ns = vkd3d_get_current_time_ns();
     limiter->active = true;
 #ifdef AMDGPU_WDDM_LAB_FLAVOUR
-    INFO("Pipeline compile limiter: %u concurrent compiles, cache hits without a slot, thermal band %s.\n", slots,
+    INFO("Pipeline compile limiter: %u concurrent compiles, cache hits without a slot, thermal band %s, "
+            "urgent creations at once.\n", slots,
             limiter->thermal ? "on" : "off (AMDGPU_WDDM_VKD3D_COMPILE_THERMAL=0)");
 #else
-    INFO("Pipeline compile limiter: %u concurrent compiles, cache hits without a slot, thermal band on.\n", slots);
+    INFO("Pipeline compile limiter: %u concurrent compiles, cache hits without a slot, thermal band on, "
+            "urgent creations at once.\n", slots);
 #endif
+}
+
+/* Under the lock. The time split and the urgent creations, for the periodic line and the line of the device's end. */
+static void vkd3d_compile_limiter_format_time(const struct vkd3d_pipeline_compile_limiter *limiter, char *text,
+        size_t size)
+{
+    snprintf(text, size, "identifier probes %"PRIu64" hits, %"PRIu64" misses in %"PRIu64" ms; driver calls %"PRIu64
+            " answered from a cache in %"PRIu64" ms, %"PRIu64" compiles in %"PRIu64" ms; %"PRIu64" conversions to "
+            "SPIR-V in %"PRIu64" ms; %"PRIu64" waits for a slot in %"PRIu64" ms; %"PRIu64" admitted (%"PRIu64
+            " draw-time, %"PRIu64" urgent, %"PRIu64" urgent past the bound), %"PRIu64" urgent marks",
+            limiter->identifier_hits, limiter->identifier_misses, limiter->identifier_ns / 1000000,
+            limiter->cache_hits, limiter->cache_hit_ns / 1000000, limiter->compiles, limiter->compile_ns / 1000000,
+            limiter->conversions, limiter->conversion_ns / 1000000, limiter->waits, limiter->wait_ns / 1000000,
+            limiter->admitted, limiter->exempt_admitted, limiter->urgent_admitted, limiter->urgent_over_bound,
+            limiter->urgent_marks);
+}
+
+/* Under the lock, after a counted event. Formats the periodic line into text when one is due, and returns whether it
+ * did; the caller writes it after it drops the lock. A quiet period writes no line. */
+static bool vkd3d_compile_limiter_tick_locked(struct vkd3d_pipeline_compile_limiter *limiter, char *text,
+        size_t size)
+{
+    uint64_t now_ns = vkd3d_get_current_time_ns();
+
+    if (now_ns - limiter->period_begin_ns < VKD3D_COMPILE_LIMITER_PERIOD_NS)
+        return false;
+    limiter->period_begin_ns = now_ns;
+    vkd3d_compile_limiter_format_time(limiter, text, size);
+    return true;
+}
+
+/* Adds one driver call to a time counter and writes the periodic line when it is due. */
+static void vkd3d_compile_limiter_count(struct vkd3d_pipeline_compile_limiter *limiter, uint64_t *count,
+        uint64_t *total_ns, uint64_t ns)
+{
+    char text[512];
+    bool due;
+
+    pthread_mutex_lock(&limiter->lock);
+    ++*count;
+    *total_ns += ns;
+    due = vkd3d_compile_limiter_tick_locked(limiter, text, sizeof(text));
+    pthread_mutex_unlock(&limiter->lock);
+    if (due)
+        INFO("Pipeline compile limiter time (periodic): %s.\n", text);
 }
 
 void vkd3d_pipeline_compile_limiter_cleanup(struct vkd3d_pipeline_compile_limiter *limiter)
 {
     uint64_t band_ns;
+    char text[512];
 
     if (!limiter->active)
         return;
@@ -4072,6 +4125,8 @@ void vkd3d_pipeline_compile_limiter_cleanup(struct vkd3d_pipeline_compile_limite
             "slot, %"PRIu64" compiles.\n",
             limiter->admitted, limiter->exempt_admitted, limiter->exempt_over_bound, limiter->waits,
             limiter->wait_ns / 1000000, limiter->max_waiting, limiter->cache_hits, limiter->compiles);
+    vkd3d_compile_limiter_format_time(limiter, text, sizeof(text));
+    INFO("Pipeline compile limiter time (the device's end): %s.\n", text);
     if (limiter->thermal)
     {
         band_ns = limiter->thermal_band_ns;
@@ -4095,7 +4150,7 @@ static uint32_t vkd3d_compile_limiter_thermal_slots(struct vkd3d_pipeline_compil
     int32_t mc = 0;
 
     if (!limiter->thermal)
-        return limiter->slots;
+        return limiter->admission.slots;
     if (!limiter->read_ns || now_ns - limiter->read_ns >= VKD3D_COMPILE_THERMAL_READ_MS * 1000000ull)
     {
         limiter->read_ns = now_ns;
@@ -4121,33 +4176,32 @@ static uint32_t vkd3d_compile_limiter_thermal_slots(struct vkd3d_pipeline_compil
         {
             limiter->thermal_band_ns += now_ns - limiter->one_slot_begin_ns;
             if (limiter->log)
-                INFO("Pipeline compile limiter: thermal band %u slots after %"PRIu64" ms (%s).\n", limiter->slots,
-                        (now_ns - limiter->one_slot_begin_ns) / 1000000,
+                INFO("Pipeline compile limiter: thermal band %u slots after %"PRIu64" ms (%s).\n",
+                        limiter->admission.slots, (now_ns - limiter->one_slot_begin_ns) / 1000000,
                         limiter->temperature_valid ? "cooler" : "reading failed");
         }
         limiter->one_slot = one_slot;
     }
-    return limiter->one_slot ? 1 : limiter->slots;
+    return limiter->one_slot ? 1 : limiter->admission.slots;
 }
 
-/* Under the lock: may this caller go now? An exempt caller goes at once, past the fixed bound: it compiles a
- * variant inside a draw of the thread that records the frame, and a slot that a pool compile holds for hundreds
- * of milliseconds would make that draw a frame-long stall (Clair Obscur: Expedition 33 drew 65 to 81 ms inside
- * DrawIndexedInstanced with both slots taken, BD-226). Otherwise only the oldest ticket can go, within the fixed
- * bound and the thermal band. */
-static bool vkd3d_compile_limiter_may_admit(struct vkd3d_pipeline_compile_limiter *limiter, bool exempt,
-        uint64_t ticket, bool *thermal_delayed)
+static uint32_t vkd3d_compile_limiter_thermal_now(void *ctx)
 {
-    if (exempt)
-        return true;
-    if (limiter->in_flight >= limiter->slots)
-        return false;
-    if (ticket != limiter->next_admit)
-        return false;
-    if (limiter->in_flight < vkd3d_compile_limiter_thermal_slots(limiter, vkd3d_get_current_time_ns()))
-        return true;
-    *thermal_delayed = true;
-    return false;
+    return vkd3d_compile_limiter_thermal_slots(ctx, vkd3d_get_current_time_ns());
+}
+
+/* Under the lock: may this caller go now? An exempt caller (a variant inside a draw of the thread that records the
+ * frame) and an urgent one (a creation the frame waits for, V14) go at once, past the fixed bound: a slot that a
+ * pool compile holds for hundreds of milliseconds would make the draw or the frame wait that long (Clair Obscur:
+ * Expedition 33 drew 65 to 81 ms inside DrawIndexedInstanced with both slots taken, and its render thread waited up
+ * to 831 ms for one pool compile, BD-226). Otherwise only the oldest ticket can go, within the fixed bound and the
+ * thermal band. */
+static enum vkd3d_compile_decision vkd3d_compile_limiter_decide(struct vkd3d_pipeline_compile_limiter *limiter,
+        bool exempt, uint32_t thread_id, bool has_ticket, uint64_t ticket)
+{
+    return vkd3d_compile_admission_decide(&limiter->admission, exempt,
+            vkd3d_compile_admission_is_urgent(&limiter->admission, thread_id), has_ticket, ticket,
+            vkd3d_compile_limiter_thermal_now, limiter);
 }
 
 static void vkd3d_compile_limiter_wait(struct vkd3d_pipeline_compile_limiter *limiter)
@@ -4177,7 +4231,10 @@ static void vkd3d_compile_limiter_acquire(struct vkd3d_compile_slot *slot,
         struct vkd3d_pipeline_compile_limiter *limiter, bool exempt)
 {
     uint64_t begin_ns, ticket = 0, waits = 0, wait_ns = 0;
+    const uint32_t thread_id = vkd3d_get_current_thread_id();
+    enum vkd3d_compile_decision decision;
     bool thermal_delayed = false;
+    bool has_ticket = false;
     uint32_t waiting;
 
     slot->limiter = limiter;
@@ -4188,21 +4245,26 @@ static void vkd3d_compile_limiter_acquire(struct vkd3d_compile_slot *slot,
 
     begin_ns = vkd3d_get_current_time_ns();
     pthread_mutex_lock(&limiter->lock);
-    /* Tickets admit the callers in the order they came: a thread that waits is never passed by a later one. */
-    if (!exempt)
-        ticket = limiter->next_ticket++;
-    if (!vkd3d_compile_limiter_may_admit(limiter, exempt, ticket, &thermal_delayed))
+    /* Tickets admit the ordinary callers in the order they came: a thread that waits is never passed by a later
+     * one, only by a draw-time variant or an urgent creation. */
+    if (!exempt && !vkd3d_compile_admission_is_urgent(&limiter->admission, thread_id))
     {
-        if (exempt)
-            limiter->exempt_waiting++;
-        waiting = (uint32_t)(limiter->next_ticket - limiter->next_admit) + limiter->exempt_waiting;
+        ticket = vkd3d_compile_admission_take_ticket(&limiter->admission);
+        has_ticket = true;
+    }
+    decision = vkd3d_compile_limiter_decide(limiter, exempt, thread_id, has_ticket, ticket);
+    if (!vkd3d_compile_decision_admits(decision))
+    {
+        waiting = (uint32_t)(limiter->admission.next_ticket - limiter->admission.next_admit);
         if (waiting > limiter->max_waiting)
             limiter->max_waiting = waiting;
         do
+        {
+            if (decision == VKD3D_COMPILE_WAIT_THERMAL)
+                thermal_delayed = true;
             vkd3d_compile_limiter_wait(limiter);
-        while (!vkd3d_compile_limiter_may_admit(limiter, exempt, ticket, &thermal_delayed));
-        if (exempt)
-            limiter->exempt_waiting--;
+            decision = vkd3d_compile_limiter_decide(limiter, exempt, thread_id, has_ticket, ticket);
+        } while (!vkd3d_compile_decision_admits(decision));
         limiter->waits++;
         limiter->wait_ns += vkd3d_get_current_time_ns() - begin_ns;
         if (limiter->log && limiter->waits - limiter->logged_waits >= VKD3D_COMPILE_LIMITER_LOG_WAITS)
@@ -4214,18 +4276,22 @@ static void vkd3d_compile_limiter_acquire(struct vkd3d_compile_slot *slot,
     }
     if (thermal_delayed)
         limiter->thermal_waits++;
-    if (exempt)
+    if (decision == VKD3D_COMPILE_ADMIT_EXEMPT)
     {
         limiter->exempt_admitted++;
-        if (limiter->in_flight >= limiter->slots)
+        if (limiter->admission.in_flight >= limiter->admission.slots)
             limiter->exempt_over_bound++;
     }
-    else
-        limiter->next_admit++;
-    limiter->in_flight++;
+    else if (decision == VKD3D_COMPILE_ADMIT_URGENT)
+    {
+        limiter->urgent_admitted++;
+        if (limiter->admission.in_flight >= limiter->admission.slots)
+            limiter->urgent_over_bound++;
+    }
+    vkd3d_compile_admission_admit(&limiter->admission, decision, has_ticket, ticket);
     limiter->admitted++;
     /* The next ticket may now be admitted too, if a slot is free. */
-    if (limiter->next_ticket != limiter->next_admit)
+    if (vkd3d_compile_admission_has_waiters(&limiter->admission))
         pthread_cond_broadcast(&limiter->cond);
     pthread_mutex_unlock(&limiter->lock);
     slot->held = true;
@@ -4242,11 +4308,45 @@ static void vkd3d_compile_limiter_release(struct vkd3d_compile_slot *slot)
         return;
     slot->held = false;
     pthread_mutex_lock(&limiter->lock);
-    limiter->in_flight--;
-    /* Every waiter checks whether it may go; only the oldest ticket, or an exempt caller, can. */
-    if (limiter->next_ticket != limiter->next_admit || limiter->exempt_waiting)
+    vkd3d_compile_admission_release(&limiter->admission);
+    /* Every waiter checks whether it may go; only the oldest ticket can. */
+    if (vkd3d_compile_admission_has_waiters(&limiter->admission))
         pthread_cond_broadcast(&limiter->cond);
     pthread_mutex_unlock(&limiter->lock);
+}
+
+void vkd3d_compile_limiter_mark_urgent(struct vkd3d_pipeline_compile_limiter *limiter, uint32_t thread_id,
+        bool urgent)
+{
+    bool changed;
+
+    if (!limiter->active)
+        return;
+    pthread_mutex_lock(&limiter->lock);
+    changed = vkd3d_compile_admission_mark(&limiter->admission, thread_id, urgent);
+    if (changed && urgent)
+        limiter->urgent_marks++;
+    vkd3d_atomic_uint32_store_explicit(&limiter->urgent_hint, limiter->admission.urgent_count,
+            vkd3d_memory_order_relaxed);
+    /* A marked thread that already waits looks again now. */
+    if (changed && urgent)
+        pthread_cond_broadcast(&limiter->cond);
+    pthread_mutex_unlock(&limiter->lock);
+}
+
+/* A creation on this thread ended: its urgent mark, if any, ends with it. The hint keeps the lock out of the
+ * thousands of creations that nobody marked. */
+static void vkd3d_compile_limiter_end_creation(struct vkd3d_pipeline_compile_limiter *limiter)
+{
+    if (!limiter->active || !vkd3d_atomic_uint32_load_explicit(&limiter->urgent_hint, vkd3d_memory_order_relaxed))
+        return;
+    vkd3d_compile_limiter_mark_urgent(limiter, vkd3d_get_current_thread_id(), false);
+}
+
+void vkd3d_compile_limiter_note_conversion(struct vkd3d_pipeline_compile_limiter *limiter, uint64_t ns)
+{
+    if (limiter->active)
+        vkd3d_compile_limiter_count(limiter, &limiter->conversions, &limiter->conversion_ns, ns);
 }
 
 void vkd3d_compile_slot_begin(struct vkd3d_compile_slot *slot, struct d3d12_device *device, bool exempt)
@@ -4269,6 +4369,9 @@ void vkd3d_compile_slot_begin(struct vkd3d_compile_slot *slot, struct d3d12_devi
 void vkd3d_compile_slot_end(struct vkd3d_compile_slot *slot)
 {
     vkd3d_compile_limiter_release(slot);
+    /* Outside a scope the slot is the whole creation (a draw-time variant, a ray tracing pipeline). */
+    if (!vkd3d_compile_scope_thread && slot->limiter)
+        vkd3d_compile_limiter_end_creation(slot->limiter);
 }
 
 void vkd3d_compile_scope_begin(struct vkd3d_compile_scope *scope, struct d3d12_device *device)
@@ -4290,6 +4393,7 @@ void vkd3d_compile_scope_end(struct vkd3d_compile_scope *scope)
     vkd3d_compile_scope_thread = NULL;
     scope->active = false;
     vkd3d_compile_limiter_release(&scope->slot);
+    vkd3d_compile_limiter_end_creation(&scope->device->compile_limiter);
 }
 
 void vkd3d_compile_scope_need(void)
@@ -4305,13 +4409,27 @@ VkResult vkd3d_compile_pipeline(struct d3d12_device *device, VkPipelineCreateFla
 {
     struct vkd3d_pipeline_compile_limiter *limiter = &device->compile_limiter;
     struct vkd3d_compile_slot slot;
+    uint64_t begin_ns, end_ns;
     VkResult vr;
 
-    /* The caller probes itself (an application's shader identifier): one call, no slot. */
-    if (flags2->flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
-        return call(ctx);
     if (!limiter->active)
         return call(ctx);
+
+    begin_ns = vkd3d_get_current_time_ns();
+    /* The caller probes itself (an application's shader identifier, or the identifier route of the disk cache): one
+     * call, no slot. A miss is not an error: the caller then compiles the stages and calls again. */
+    if (flags2->flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
+    {
+        vr = call(ctx);
+        end_ns = vkd3d_get_current_time_ns();
+        if (vr == VK_SUCCESS)
+            vkd3d_compile_limiter_count(limiter, &limiter->identifier_hits, &limiter->identifier_ns,
+                    end_ns - begin_ns);
+        else if (vr == VK_PIPELINE_COMPILE_REQUIRED)
+            vkd3d_compile_limiter_count(limiter, &limiter->identifier_misses, &limiter->identifier_ns,
+                    end_ns - begin_ns);
+        return vr;
+    }
 
     /* A cache lookup first, without a slot. */
     flags2->flags |= VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
@@ -4320,20 +4438,18 @@ VkResult vkd3d_compile_pipeline(struct d3d12_device *device, VkPipelineCreateFla
     if (vr != VK_PIPELINE_COMPILE_REQUIRED)
     {
         if (vr == VK_SUCCESS)
-        {
-            pthread_mutex_lock(&limiter->lock);
-            limiter->cache_hits++;
-            pthread_mutex_unlock(&limiter->lock);
-        }
+            vkd3d_compile_limiter_count(limiter, &limiter->cache_hits, &limiter->cache_hit_ns,
+                    vkd3d_get_current_time_ns() - begin_ns);
         return vr;
     }
 
     vkd3d_compile_slot_begin(&slot, device, exempt);
+    /* The compile alone: the wait for the slot is in wait_ns. */
+    begin_ns = vkd3d_get_current_time_ns();
     vr = call(ctx);
+    end_ns = vkd3d_get_current_time_ns();
     vkd3d_compile_slot_end(&slot);
-    pthread_mutex_lock(&limiter->lock);
-    limiter->compiles++;
-    pthread_mutex_unlock(&limiter->lock);
+    vkd3d_compile_limiter_count(limiter, &limiter->compiles, &limiter->compile_ns, end_ns - begin_ns);
     return vr;
 }
 

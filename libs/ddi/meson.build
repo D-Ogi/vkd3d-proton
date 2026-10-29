@@ -30,6 +30,12 @@ amdgpu_wddm_vkd3d_cache_test = executable('amdgpu_wddm_vkd3d_cache_policy_test',
   install             : false)
 test('ddi-cache-policy', amdgpu_wddm_vkd3d_cache_test, timeout : 30)
 
+# The admission rules of the pipeline compile limiter and the V14 private data (BD-226); no GPU, no device.
+amdgpu_wddm_vkd3d_admission_test = executable('amdgpu_wddm_vkd3d_compile_admission_test', 'compile_admission_test.c',
+  include_directories : vkd3d_private_includes,
+  install             : false)
+test('ddi-compile-admission', amdgpu_wddm_vkd3d_admission_test, timeout : 30)
+
 # Shader translation has no Vulkan/device dependency and runs in both driver flavours.
 amdgpu_wddm_vkd3d_shader_test = executable('amdgpu_wddm_vkd3d_shader_test', 'engine_test_shader.c',
   include_directories : vkd3d_private_includes,
