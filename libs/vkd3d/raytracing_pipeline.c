@@ -479,6 +479,12 @@ struct d3d12_rt_state_object_pipeline_data
     size_t deferred_collections_size;
     size_t deferred_collections_count;
     bool has_deep_duplication;
+
+    /* amdgpu-wddm fork (BD-231): a COLLECTION with ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS compiles
+     * every export it can and defers only the entry points whose DXIL conversion fails, as native drivers do
+     * (DXR spec, GetShaderIdentifier: only a shader with unresolved references answers nullptr). */
+    bool defer_failed_entries;
+    size_t deferred_entries_count;
 };
 
 static void d3d12_state_object_pipeline_data_cleanup_modules(struct d3d12_rt_state_object_pipeline_data *data,
@@ -745,8 +751,54 @@ static HRESULT d3d12_state_object_add_collection_library(
     return S_OK;
 }
 
+static bool vkd3d_stage_is_global_group(VkShaderStageFlagBits stage);
+
+/* amdgpu-wddm fork (BD-231): whether a partially compiled COLLECTION has a compiled export of this name. */
+static bool d3d12_state_object_has_compiled_export(struct d3d12_rt_state_object *compiled, const WCHAR *name)
+{
+    const WCHAR *subtype = NULL;
+
+    return compiled && name && d3d12_state_object_get_export_index(compiled, name, &subtype) != UINT32_MAX && !subtype;
+}
+
+/* amdgpu-wddm fork (BD-231): whether an entry point of a partially compiled COLLECTION has to be compiled from source
+ * by the containing object. A ray generation, miss or callable shader has to when the collection did not compile it.
+ * A hit group stage has to when a hit group that the collection did not compile imports it. */
+static bool d3d12_state_object_deferred_entry_is_needed(struct d3d12_rt_state_object *compiled,
+        const struct d3d12_rt_state_object_pipeline_data *deferred,
+        const struct vkd3d_shader_library_entry_point *entry)
+{
+    const D3D12_HIT_GROUP_DESC *hit_group;
+    size_t i;
+
+    if (!compiled)
+        return true;
+
+    if (vkd3d_stage_is_global_group(entry->stage))
+    {
+        return !d3d12_state_object_has_compiled_export(compiled, entry->plain_entry_point) &&
+                !d3d12_state_object_has_compiled_export(compiled, entry->mangled_entry_point);
+    }
+
+    for (i = 0; i < deferred->hit_groups_count; i++)
+    {
+        hit_group = deferred->hit_groups[i];
+        if (d3d12_state_object_has_compiled_export(compiled, hit_group->HitGroupExport))
+            continue;
+        if (vkd3d_export_equal(hit_group->ClosestHitShaderImport, entry) ||
+                vkd3d_export_equal(hit_group->AnyHitShaderImport, entry) ||
+                vkd3d_export_equal(hit_group->IntersectionShaderImport, entry))
+            return true;
+    }
+
+    return false;
+}
+
+/* compiled: NULL when the whole COLLECTION was deferred. Otherwise the collection itself, whose compiled exports
+ * the caller links as a library (d3d12_state_object_add_collection); only what it did not compile is taken here. */
 static HRESULT d3d12_state_object_add_collection_deferred(
         struct d3d12_rt_state_object_pipeline_data *deferred,
+        struct d3d12_rt_state_object *compiled,
         struct d3d12_rt_state_object_pipeline_data *data,
         const D3D12_EXPORT_DESC *exports, unsigned int num_exports)
 {
@@ -763,6 +815,9 @@ static HRESULT d3d12_state_object_add_collection_deferred(
         struct vkd3d_shader_library_entry_point *dup_entry;
         const D3D12_EXPORT_DESC *export_desc = NULL;
         bool accept_entry_point = false;
+
+        if (!d3d12_state_object_deferred_entry_is_needed(compiled, deferred, entry))
+            continue;
 
         if (!num_exports)
         {
@@ -833,6 +888,9 @@ static HRESULT d3d12_state_object_add_collection_deferred(
     for (i = 0; i < deferred->hit_groups_count; i++)
     {
         bool accept_hit_group = false;
+
+        if (d3d12_state_object_has_compiled_export(compiled, deferred->hit_groups[i]->HitGroupExport))
+            continue;
 
         if (!num_exports)
         {
@@ -960,7 +1018,21 @@ static HRESULT d3d12_state_object_add_collection(
             return E_OUTOFMEMORY;
         d3d12_state_object_inc_ref(collection);
         data->deferred_collections[data->deferred_collections_count++] = collection;
-        return d3d12_state_object_add_collection_deferred(collection->deferred_data, data, exports, num_exports);
+
+        /* amdgpu-wddm fork (BD-231): a partially compiled COLLECTION. Its compiled exports come from its pipeline
+         * library, so their shader identifiers stay the same as in the collection (pipelineLibraryGroupHandles).
+         * Only the deferred entry points and hit groups are compiled from source. */
+        if (collection->exports_count)
+        {
+            HRESULT hr;
+
+            if (FAILED(hr = d3d12_state_object_add_collection_library(collection, data, exports, num_exports)))
+                return hr;
+            return d3d12_state_object_add_collection_deferred(collection->deferred_data, collection,
+                    data, exports, num_exports);
+        }
+
+        return d3d12_state_object_add_collection_deferred(collection->deferred_data, NULL, data, exports, num_exports);
     }
     else
         return d3d12_state_object_add_collection_library(collection, data, exports, num_exports);
@@ -2285,9 +2357,35 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
                 &spirv, NULL,
                 &shader_interface_info, &shader_interface_local_info, &compile_args)) != VKD3D_OK)
         {
+            vkd3d_free(local_bindings);
+
+            /* amdgpu-wddm fork (BD-231): in a COLLECTION that allows local dependencies on external definitions,
+             * an export that does not convert (usually a binding that only the containing pipeline provides) is
+             * left out of this collection's pipeline and compiled from source at the link. Every other export
+             * keeps its compiled group and its shader identifier. A hit group that imports this entry point is
+             * left out too (its stage index is VK_SHADER_UNUSED_KHR below). */
+            if (data->defer_failed_entries && compile_ret != VKD3D_ERROR_OUT_OF_MEMORY)
+            {
+                WARN("Deferring DXIL export %s (%s) of COLLECTION to the containing state object.\n",
+                        entry->real_entry_point, entry->debug_entry_point);
+                if (vkd3d_stage_is_global_group(entry->stage))
+                {
+                    /* Take back the group and the export that were added for this entry point above. */
+                    data->exports_count--;
+                    vkd3d_free(data->exports[data->exports_count].mangled_export);
+                    vkd3d_free(data->exports[data->exports_count].plain_export);
+                    data->exports[data->exports_count].mangled_export = NULL;
+                    data->exports[data->exports_count].plain_export = NULL;
+                    data->groups_count--;
+                }
+                entry->pipeline_variant_index = UINT32_MAX;
+                entry->stage_index = UINT32_MAX;
+                data->deferred_entries_count++;
+                continue;
+            }
+
             ERR("Failed to convert DXIL export: %s (%s)\n",
                     entry->real_entry_point, entry->debug_entry_point);
-            vkd3d_free(local_bindings);
             /* Deviation from upstream, which answers E_OUTOFMEMORY for every conversion failure: only an
              * allocation failure is E_OUTOFMEMORY. A binding that no root signature of the object meets
              * (an unresolved local dependency) fails the conversion too, and d3d12_state_object_init defers
@@ -2840,6 +2938,15 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
             &object->shader_config, &object->pipeline_config)))
         goto fail;
 
+    /* amdgpu-wddm fork (BD-231): partial compilation needs the group handles of a COLLECTION
+     * (pipelineLibraryGroupHandles; without it the COLLECTION was promoted above). It is not used when the
+     * collection also exports its functions to the containing object (ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS):
+     * that object takes the entry point list below, which the deferred source also needs. */
+    data.defer_failed_entries = object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION &&
+            (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS) &&
+            !(object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_EXTERNAL_DEPENDENCIES_ON_LOCAL_DEFINITIONS) &&
+            device->device_info.pipeline_library_group_handles_features.pipelineLibraryGroupHandles;
+
     /* Figure out how many variants we need. We'll need one pipeline variant
      * for every unique global root signature. */
     d3d12_state_object_collect_variants(object, &data);
@@ -2911,7 +3018,23 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
     if (FAILED(hr = vkd3d_private_store_init(&object->private_store)))
         goto fail;
 
-    d3d12_state_object_pipeline_data_cleanup(&data, object->device);
+    if (data.deferred_entries_count)
+    {
+        /* amdgpu-wddm fork (BD-231): some exports were deferred. Keep the parsed source for the containing
+         * state object, which links the compiled exports from this collection's pipeline library and compiles
+         * only the deferred ones (d3d12_state_object_add_collection). */
+        WARN("COLLECTION compiled %zu exports and deferred %zu entry points to the containing state object.\n",
+                object->exports_count, data.deferred_entries_count);
+        if (!(object->deferred_data = d3d12_state_object_pipeline_data_defer(&data, object->device)))
+        {
+            vkd3d_private_store_destroy(&object->private_store);
+            d3d12_state_object_pipeline_data_cleanup(&data, object->device);
+            d3d12_state_object_cleanup(object);
+            return E_OUTOFMEMORY;
+        }
+    }
+    else
+        d3d12_state_object_pipeline_data_cleanup(&data, object->device);
     d3d_destruction_notifier_init(&object->destruction_notifier, (IUnknown*)&object->ID3D12StateObject_iface);
     d3d12_device_add_ref(object->device);
     return S_OK;
