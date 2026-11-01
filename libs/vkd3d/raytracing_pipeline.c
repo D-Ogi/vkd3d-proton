@@ -1991,6 +1991,7 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
     bool creating_library;
     bool rtpso_has_omm;
     size_t i, j;
+    int compile_ret;
     VkResult vr;
     HRESULT hr;
 
@@ -2280,14 +2281,19 @@ static HRESULT d3d12_state_object_compile_pipeline_variant(struct d3d12_rt_state
                 object->device->descriptor_qa_global_info,
                 dxil.code, dxil.size);
 
-        if (vkd3d_shader_compile_dxil_export(&dxil, entry->real_entry_point, entry->debug_entry_point,
+        if ((compile_ret = vkd3d_shader_compile_dxil_export(&dxil, entry->real_entry_point, entry->debug_entry_point,
                 &spirv, NULL,
-                &shader_interface_info, &shader_interface_local_info, &compile_args) != VKD3D_OK)
+                &shader_interface_info, &shader_interface_local_info, &compile_args)) != VKD3D_OK)
         {
             ERR("Failed to convert DXIL export: %s (%s)\n",
                     entry->real_entry_point, entry->debug_entry_point);
             vkd3d_free(local_bindings);
-            return E_OUTOFMEMORY;
+            /* Deviation from upstream, which answers E_OUTOFMEMORY for every conversion failure: only an
+             * allocation failure is E_OUTOFMEMORY. A binding that no root signature of the object meets
+             * (an unresolved local dependency) fails the conversion too, and d3d12_state_object_init defers
+             * a COLLECTION with ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS for every failure except
+             * E_OUTOFMEMORY (BD-231). */
+            return compile_ret == VKD3D_ERROR_OUT_OF_MEMORY ? E_OUTOFMEMORY : E_INVALIDARG;
         }
 
         if ((spirv.meta.flags & VKD3D_SHADER_META_FLAG_REPLACED) && data->spec_info_buffer)
