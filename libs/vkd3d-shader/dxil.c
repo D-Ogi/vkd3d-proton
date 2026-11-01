@@ -2191,38 +2191,40 @@ void vkd3d_shader_dxil_free_library_entry_points(struct vkd3d_shader_library_ent
     vkd3d_free(entry_points);
 }
 
-void vkd3d_shader_dxil_free_library_subobjects(struct vkd3d_shader_library_subobject *subobjects, size_t count)
+static void vkd3d_shader_dxil_free_library_subobject(struct vkd3d_shader_library_subobject *subobject)
 {
-    size_t i, j;
-
-    for (i = 0; i < count; i++)
+    size_t j;
+    if (!subobject->borrowed_payloads)
     {
-        if (!subobjects[i].borrowed_payloads)
+        if (subobject->kind == VKD3D_SHADER_SUBOBJECT_KIND_SUBOBJECT_TO_EXPORTS_ASSOCIATION)
         {
-            if (subobjects[i].kind == VKD3D_SHADER_SUBOBJECT_KIND_SUBOBJECT_TO_EXPORTS_ASSOCIATION)
-            {
-                for (j = 0; j < subobjects[i].data.association.NumExports; j++)
-                    vkd3d_free((void *) subobjects[i].data.association.pExports[j]);
-                vkd3d_free((void *) subobjects[i].data.association.pExports);
-                vkd3d_free((void *) subobjects[i].data.association.SubobjectToAssociate);
-            }
-            else if (subobjects[i].kind == VKD3D_SHADER_SUBOBJECT_KIND_HIT_GROUP)
-            {
-                vkd3d_free((void *) subobjects[i].data.hit_group.HitGroupExport);
-                vkd3d_free((void *) subobjects[i].data.hit_group.AnyHitShaderImport);
-                vkd3d_free((void *) subobjects[i].data.hit_group.ClosestHitShaderImport);
-                vkd3d_free((void *) subobjects[i].data.hit_group.IntersectionShaderImport);
-            }
-            else if (subobjects[i].kind == VKD3D_SHADER_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE ||
-                    subobjects[i].kind == VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE)
-            {
-                vkd3d_free(subobjects[i].data.payload.data);
-            }
+            for (j = 0; j < subobject->data.association.NumExports; j++)
+                vkd3d_free((void *) subobject->data.association.pExports[j]);
+            vkd3d_free((void *) subobject->data.association.pExports);
+            vkd3d_free((void *) subobject->data.association.SubobjectToAssociate);
         }
-
-        vkd3d_free(subobjects[i].name);
+        else if (subobject->kind == VKD3D_SHADER_SUBOBJECT_KIND_HIT_GROUP)
+        {
+            vkd3d_free((void *) subobject->data.hit_group.HitGroupExport);
+            vkd3d_free((void *) subobject->data.hit_group.AnyHitShaderImport);
+            vkd3d_free((void *) subobject->data.hit_group.ClosestHitShaderImport);
+            vkd3d_free((void *) subobject->data.hit_group.IntersectionShaderImport);
+        }
+        else if (subobject->kind == VKD3D_SHADER_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE ||
+                subobject->kind == VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE)
+        {
+            vkd3d_free(subobject->data.payload.data);
+        }
     }
 
+    vkd3d_free(subobject->name);
+}
+
+void vkd3d_shader_dxil_free_library_subobjects(struct vkd3d_shader_library_subobject *subobjects, size_t count)
+{
+    size_t i;
+    for (i = 0; i < count; i++)
+        vkd3d_shader_dxil_free_library_subobject(&subobjects[i]);
     vkd3d_free(subobjects);
 }
 
@@ -2326,23 +2328,31 @@ static bool vkd3d_dxil_build_entry(struct vkd3d_shader_library_entry_point *entr
     return true;
 }
 
-static void vkd3d_shader_dxil_copy_subobject(unsigned int identifier,
+static bool vkd3d_shader_dxil_copy_subobject(unsigned int identifier,
         struct vkd3d_shader_library_subobject *subobject,
         const dxil_spv_rdat_subobject *dxil_subobject)
 {
     unsigned int i;
 
+    memset(subobject, 0, sizeof(*subobject));
+
     /* Reuse same enums as DXIL. */
     subobject->kind = (enum vkd3d_shader_subobject_kind)dxil_subobject->kind;
     subobject->name = vkd3d_dup_entry_point(dxil_subobject->subobject_name);
+    if (!subobject->name)
+        goto fail;
     subobject->borrowed_payloads = false;
 
     switch (dxil_subobject->kind)
     {
         case DXIL_SPV_RDAT_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE:
         case DXIL_SPV_RDAT_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE:
-            subobject->data.payload.data = vkd3d_malloc(dxil_subobject->payload_size);
-            memcpy(subobject->data.payload.data, dxil_subobject->payload, dxil_subobject->payload_size);
+            if (dxil_subobject->payload_size)
+            {
+                if (!(subobject->data.payload.data = vkd3d_malloc(dxil_subobject->payload_size)))
+                    goto fail;
+                memcpy(subobject->data.payload.data, dxil_subobject->payload, dxil_subobject->payload_size);
+            }
             subobject->data.payload.size = dxil_subobject->payload_size;
             break;
 
@@ -2376,6 +2386,11 @@ static void vkd3d_shader_dxil_copy_subobject(unsigned int identifier,
                     vkd3d_dup_entry_point(dxil_subobject->exports[1]) : NULL;
             subobject->data.hit_group.IntersectionShaderImport = dxil_subobject->exports[2] && *dxil_subobject->exports[2] != '\0' ?
                     vkd3d_dup_entry_point(dxil_subobject->exports[2]) : NULL;
+            if (!subobject->data.hit_group.HitGroupExport ||
+                    (dxil_subobject->exports[0] && *dxil_subobject->exports[0] && !subobject->data.hit_group.AnyHitShaderImport) ||
+                    (dxil_subobject->exports[1] && *dxil_subobject->exports[1] && !subobject->data.hit_group.ClosestHitShaderImport) ||
+                    (dxil_subobject->exports[2] && *dxil_subobject->exports[2] && !subobject->data.hit_group.IntersectionShaderImport))
+                goto fail;
             break;
 
         case DXIL_SPV_RDAT_SUBOBJECT_KIND_STATE_OBJECT_CONFIG:
@@ -2385,16 +2400,27 @@ static void vkd3d_shader_dxil_copy_subobject(unsigned int identifier,
         case DXIL_SPV_RDAT_SUBOBJECT_KIND_SUBOBJECT_TO_EXPORTS_ASSOCIATION:
             assert(dxil_subobject->num_exports >= 1);
             subobject->data.association.SubobjectToAssociate = vkd3d_dup_entry_point(dxil_subobject->exports[0]);
-            subobject->data.association.pExports = vkd3d_malloc((dxil_subobject->num_exports - 1) * sizeof(LPCWSTR));
+            if (!subobject->data.association.SubobjectToAssociate)
+                goto fail;
+            if (dxil_subobject->num_exports > 1 && !(subobject->data.association.pExports =
+                    vkd3d_calloc(dxil_subobject->num_exports - 1, sizeof(LPCWSTR))))
+                goto fail;
             subobject->data.association.NumExports = dxil_subobject->num_exports - 1;
             for (i = 1; i < dxil_subobject->num_exports; i++)
-                subobject->data.association.pExports[i - 1] = vkd3d_dup_entry_point(dxil_subobject->exports[i]);
+                if (!(subobject->data.association.pExports[i - 1] = vkd3d_dup_entry_point(dxil_subobject->exports[i])))
+                    goto fail;
             break;
 
         default:
             FIXME("Unrecognized RDAT subobject type: %u.\n", dxil_subobject->kind);
             break;
     }
+    return true;
+
+fail:
+    vkd3d_shader_dxil_free_library_subobject(subobject);
+    memset(subobject, 0, sizeof(*subobject));
+    return false;
 }
 
 int vkd3d_shader_dxil_find_global_root_signature_subobject(const void *dxbc, size_t size,
@@ -2517,10 +2543,18 @@ int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(
 
             if (j < rdat_count)
             {
-                vkd3d_array_reserve((void**)subobjects, subobjects_size,
-                        *subobjects_count + 1, sizeof(**subobjects));
+                if (!vkd3d_array_reserve((void**)subobjects, subobjects_size,
+                        *subobjects_count + 1, sizeof(**subobjects)))
+                {
+                    ret = VKD3D_ERROR_OUT_OF_MEMORY;
+                    goto end;
+                }
                 subobject = &(*subobjects)[*subobjects_count];
-                vkd3d_shader_dxil_copy_subobject(identifier, subobject, &sub);
+                if (!vkd3d_shader_dxil_copy_subobject(identifier, subobject, &sub))
+                {
+                    ret = VKD3D_ERROR_OUT_OF_MEMORY;
+                    goto end;
+                }
                 *subobjects_count += 1;
                 vkd3d_free(ascii_entry);
                 ascii_entry = NULL;
@@ -2631,14 +2665,22 @@ int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(
         if (rdat_count)
         {
             /* All subobjects are also exported. */
-            vkd3d_array_reserve((void**)subobjects, subobjects_size,
-                    *subobjects_count + rdat_count, sizeof(**subobjects));
+            if (!vkd3d_array_reserve((void**)subobjects, subobjects_size,
+                    *subobjects_count + rdat_count, sizeof(**subobjects)))
+            {
+                ret = VKD3D_ERROR_OUT_OF_MEMORY;
+                goto end;
+            }
 
             for (i = 0; i < rdat_count; i++)
             {
                 dxil_spv_parsed_blob_get_rdat_subobject(blob, i, &sub);
                 subobject = &(*subobjects)[*subobjects_count];
-                vkd3d_shader_dxil_copy_subobject(identifier, subobject, &sub);
+                if (!vkd3d_shader_dxil_copy_subobject(identifier, subobject, &sub))
+                {
+                    ret = VKD3D_ERROR_OUT_OF_MEMORY;
+                    goto end;
+                }
                 *subobjects_count += 1;
             }
         }

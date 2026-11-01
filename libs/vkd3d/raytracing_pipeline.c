@@ -472,6 +472,12 @@ struct d3d12_rt_state_object_pipeline_data
     size_t vk_libraries_count;
 
     struct vkd3d_shader_spec_info *spec_info_buffer;
+
+    /* Imported deferred payloads can survive another deferral. Keep their
+     * collection owners until the final data cleanup, not just compilation. */
+    struct d3d12_rt_state_object **deferred_collections;
+    size_t deferred_collections_size;
+    size_t deferred_collections_count;
     bool has_deep_duplication;
 };
 
@@ -580,6 +586,11 @@ static void d3d12_state_object_pipeline_data_cleanup(struct d3d12_rt_state_objec
     vkd3d_free(data->associations);
 
     d3d12_state_object_pipeline_data_cleanup_compile_temporaries(data, device);
+    for (i = 0; i < data->deferred_collections_count; i++)
+        d3d12_state_object_dec_ref(data->deferred_collections[i]);
+    vkd3d_free(data->deferred_collections);
+    data->deferred_collections = NULL;
+    data->deferred_collections_size = data->deferred_collections_count = 0;
 }
 
 static void *dup_memory(const void *data, size_t size)
@@ -597,49 +608,97 @@ static struct d3d12_rt_state_object_pipeline_data *d3d12_state_object_pipeline_d
         struct d3d12_device *device)
 {
     struct d3d12_rt_state_object_pipeline_data *data;
+    const D3D12_HIT_GROUP_DESC **hit_groups;
+    const D3D12_DXIL_LIBRARY_DESC **dxil_libraries;
+    struct d3d12_state_object_association *associations;
     unsigned int i;
 
-    /* hit_groups and dxil_libraries need deep copies since they currently only reference app-provided memory. */
-    data = dup_memory(old_data, sizeof(*old_data));
+    /* Build only owned copies until every allocation succeeds. The old arrays
+     * remain intact on failure, so the caller can use its normal cleanup. */
+    assert(!old_data->has_deep_duplication);
+    if (!(data = vkd3d_calloc(1, sizeof(*data))))
+        return NULL;
     data->has_deep_duplication = true;
+    if (old_data->hit_groups_count && !(data->hit_groups = vkd3d_calloc(
+            old_data->hit_groups_count, sizeof(*data->hit_groups))))
+        goto fail;
+    if (old_data->dxil_libraries_count && !(data->dxil_libraries = vkd3d_calloc(
+            old_data->dxil_libraries_count, sizeof(*data->dxil_libraries))))
+        goto fail;
+    if (old_data->associations_count && !(data->associations = vkd3d_calloc(
+            old_data->associations_count, sizeof(*data->associations))))
+        goto fail;
 
-    for (i = 0; i < data->hit_groups_count; i++)
+    for (i = 0; i < old_data->hit_groups_count; i++)
     {
-        D3D12_HIT_GROUP_DESC *desc;
-        data->hit_groups[i] = dup_memory(data->hit_groups[i], sizeof(*data->hit_groups[i]));
-        desc = (D3D12_HIT_GROUP_DESC *)data->hit_groups[i];
-        if (desc->HitGroupExport)
-            desc->HitGroupExport = vkd3d_wstrdup(desc->HitGroupExport);
-        if (desc->AnyHitShaderImport)
-            desc->AnyHitShaderImport = vkd3d_wstrdup(desc->AnyHitShaderImport);
-        if (desc->ClosestHitShaderImport)
-            desc->ClosestHitShaderImport = vkd3d_wstrdup(desc->ClosestHitShaderImport);
-        if (desc->IntersectionShaderImport)
-            desc->IntersectionShaderImport = vkd3d_wstrdup(desc->IntersectionShaderImport);
+        const D3D12_HIT_GROUP_DESC *src = old_data->hit_groups[i];
+        D3D12_HIT_GROUP_DESC *dst;
+        if (!(dst = vkd3d_calloc(1, sizeof(*dst))))
+            goto fail;
+        data->hit_groups[data->hit_groups_count++] = dst;
+        dst->Type = src->Type;
+        if (src->HitGroupExport && !(dst->HitGroupExport = vkd3d_wstrdup(src->HitGroupExport)))
+            goto fail;
+        if (src->AnyHitShaderImport && !(dst->AnyHitShaderImport = vkd3d_wstrdup(src->AnyHitShaderImport)))
+            goto fail;
+        if (src->ClosestHitShaderImport && !(dst->ClosestHitShaderImport = vkd3d_wstrdup(src->ClosestHitShaderImport)))
+            goto fail;
+        if (src->IntersectionShaderImport && !(dst->IntersectionShaderImport = vkd3d_wstrdup(src->IntersectionShaderImport)))
+            goto fail;
+    }
+    for (i = 0; i < old_data->dxil_libraries_count; i++)
+    {
+        const D3D12_DXIL_LIBRARY_DESC *src = old_data->dxil_libraries[i];
+        D3D12_DXIL_LIBRARY_DESC *dst;
+        if (!(dst = vkd3d_calloc(1, sizeof(*dst))))
+            goto fail;
+        data->dxil_libraries[data->dxil_libraries_count++] = dst;
+        dst->DXILLibrary.BytecodeLength = src->DXILLibrary.BytecodeLength;
+        if (src->DXILLibrary.BytecodeLength && !(dst->DXILLibrary.pShaderBytecode =
+                dup_memory(src->DXILLibrary.pShaderBytecode, src->DXILLibrary.BytecodeLength)))
+            goto fail;
+        /* Entry points and RDAT subobjects have already been parsed. */
+    }
+    for (i = 0; i < old_data->associations_count; i++)
+    {
+        struct d3d12_state_object_association *dst = &data->associations[i];
+        *dst = old_data->associations[i];
+        dst->export = NULL;
+        if (dst->kind == VKD3D_SHADER_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE ||
+                dst->kind == VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE)
+            dst->root_signature = NULL; /* reference transfers only on success */
+        ++data->associations_count;
+        if (old_data->associations[i].export && !(dst->export = vkd3d_wstrdup(old_data->associations[i].export)))
+            goto fail;
     }
 
-    for (i = 0; i < data->dxil_libraries_count; i++)
-    {
-        D3D12_DXIL_LIBRARY_DESC *desc;
-        data->dxil_libraries[i] = dup_memory(data->dxil_libraries[i], sizeof(*data->dxil_libraries[i]));
-        desc = (D3D12_DXIL_LIBRARY_DESC *)data->dxil_libraries[i];
-
-        desc->DXILLibrary.pShaderBytecode = dup_memory(desc->DXILLibrary.pShaderBytecode, desc->DXILLibrary.BytecodeLength);
-        /* We have already parsed the module entry points and subobjects.
-         * Only thing we need to do is to keep the raw DXIL alive for later. */
-        desc->NumExports = 0;
-        desc->pExports = NULL;
-    }
-
-    for (i = 0; i < data->associations_count; i++)
-        if (data->associations[i].export)
-            data->associations[i].export = vkd3d_wstrdup(data->associations[i].export);
-
-    /* Some data structures are not needed after we have parsed the RTPSO.
-     * Clean them up early, so we're not wasting memory. */
+    /* Commit: transfer all other allocations and root references exactly once. */
+    hit_groups = data->hit_groups;
+    dxil_libraries = data->dxil_libraries;
+    associations = data->associations;
+    for (i = 0; i < old_data->associations_count; i++)
+        if (associations[i].kind == VKD3D_SHADER_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE ||
+                associations[i].kind == VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE)
+            associations[i].root_signature = old_data->associations[i].root_signature;
+    *data = *old_data;
+    vkd3d_free(data->hit_groups);
+    vkd3d_free(data->dxil_libraries);
+    vkd3d_free(data->associations);
+    data->hit_groups = hit_groups;
+    data->hit_groups_size = data->hit_groups_count;
+    data->dxil_libraries = dxil_libraries;
+    data->dxil_libraries_size = data->dxil_libraries_count;
+    data->associations = associations;
+    data->associations_size = data->associations_count;
+    data->has_deep_duplication = true;
+    memset(old_data, 0, sizeof(*old_data));
     d3d12_state_object_pipeline_data_cleanup_compile_temporaries(data, device);
-
     return data;
+
+fail:
+    d3d12_state_object_pipeline_data_cleanup(data, device);
+    vkd3d_free(data);
+    return NULL;
 }
 
 static HRESULT d3d12_state_object_add_collection_library(
@@ -712,12 +771,12 @@ static HRESULT d3d12_state_object_add_collection_deferred(
         else
         {
             for (j = 0; j < num_exports; j++)
-                if (vkd3d_export_equal(exports[i].ExportToRename ? exports[i].ExportToRename : exports[i].Name, entry))
+                if (vkd3d_export_equal(exports[j].ExportToRename ? exports[j].ExportToRename : exports[j].Name, entry))
                     break;
 
             if (j < num_exports)
             {
-                export_desc = &exports[i];
+                export_desc = &exports[j];
                 accept_entry_point = true;
             }
         }
@@ -743,27 +802,31 @@ static HRESULT d3d12_state_object_add_collection_deferred(
             dup_entry->pipeline_variant_index = UINT32_MAX;
             dup_entry->stage_index = UINT32_MAX;
 
-            if (dup_entry->real_entry_point)
-                dup_entry->real_entry_point = vkd3d_strdup(dup_entry->real_entry_point);
-            if (dup_entry->debug_entry_point)
-                dup_entry->debug_entry_point = vkd3d_strdup(dup_entry->debug_entry_point);
+            /* Publish only owned strings, including on partial failure. The
+             * caller releases the data and its retained source collection. */
+            dup_entry->real_entry_point = NULL;
+            dup_entry->debug_entry_point = NULL;
+            dup_entry->plain_entry_point = NULL;
+            dup_entry->mangled_entry_point = NULL;
+            data->dxil_libraries_count++;
+            data->entry_points_count++;
+            if (entry->real_entry_point && !(dup_entry->real_entry_point = vkd3d_strdup(entry->real_entry_point)))
+                return E_OUTOFMEMORY;
+            if (entry->debug_entry_point && !(dup_entry->debug_entry_point = vkd3d_strdup(entry->debug_entry_point)))
+                return E_OUTOFMEMORY;
 
             if (export_desc)
             {
-                dup_entry->mangled_entry_point = NULL;
-                dup_entry->plain_entry_point = vkd3d_wstrdup(export_desc->Name);
+                if (!(dup_entry->plain_entry_point = vkd3d_wstrdup(export_desc->Name)))
+                    return E_OUTOFMEMORY;
             }
             else
             {
-                /* Forward the names directly if we exported everything. */
-                if (dup_entry->plain_entry_point)
-                    dup_entry->plain_entry_point = vkd3d_wstrdup(dup_entry->plain_entry_point);
-                if (dup_entry->mangled_entry_point)
-                    dup_entry->mangled_entry_point = vkd3d_wstrdup(dup_entry->mangled_entry_point);
+                if (entry->plain_entry_point && !(dup_entry->plain_entry_point = vkd3d_wstrdup(entry->plain_entry_point)))
+                    return E_OUTOFMEMORY;
+                if (entry->mangled_entry_point && !(dup_entry->mangled_entry_point = vkd3d_wstrdup(entry->mangled_entry_point)))
+                    return E_OUTOFMEMORY;
             }
-
-            data->dxil_libraries_count++;
-            data->entry_points_count++;
         }
     }
 
@@ -779,11 +842,11 @@ static HRESULT d3d12_state_object_add_collection_deferred(
         {
             for (j = 0; j < num_exports; j++)
             {
-                if (exports[i].ExportToRename)
+                if (exports[j].ExportToRename)
                     FIXME("Cannot rename deferred COLLECTION hit group export name.\n");
 
                 if (vkd3d_export_strequal(
-                        exports[i].ExportToRename ? exports[i].ExportToRename : exports[i].Name,
+                        exports[j].ExportToRename ? exports[j].ExportToRename : exports[j].Name,
                         deferred->hit_groups[i]->HitGroupExport))
                 {
                     break;
@@ -800,7 +863,7 @@ static HRESULT d3d12_state_object_add_collection_deferred(
                     data->hit_groups_count + 1, sizeof(*data->hit_groups)))
                 return E_OUTOFMEMORY;
 
-            /* If exports[i].ExportToRename is used, we need a way to partially dup hit group desc.
+            /* If exports[j].ExportToRename is used, we need a way to partially dup hit group desc.
              * This is esoteric enough that we'll defer until needed. */
             data->hit_groups[data->hit_groups_count++] = deferred->hit_groups[i];
         }
@@ -819,11 +882,11 @@ static HRESULT d3d12_state_object_add_collection_deferred(
         {
             for (j = 0; j < num_exports; j++)
             {
-                if (exports[i].ExportToRename)
+                if (exports[j].ExportToRename)
                     FIXME("Cannot rename deferred COLLECTION subobject export name.\n");
 
                 if (vkd3d_export_strequal(
-                        exports[i].ExportToRename ? exports[i].ExportToRename : exports[i].Name,
+                        exports[j].ExportToRename ? exports[j].ExportToRename : exports[j].Name,
                         deferred->subobjects[i].name))
                 {
                     break;
@@ -833,7 +896,7 @@ static HRESULT d3d12_state_object_add_collection_deferred(
             if (j < num_exports)
             {
                 accept_subobject = true;
-                export_desc = &exports[i];
+                export_desc = &exports[j];
             }
         }
 
@@ -844,10 +907,12 @@ static HRESULT d3d12_state_object_add_collection_deferred(
                     data->subobjects_count + 1, sizeof(*data->subobjects)))
                 return E_OUTOFMEMORY;
 
-            dup = &data->subobjects[data->subobjects_count++];
+            dup = &data->subobjects[data->subobjects_count];
             *dup = deferred->subobjects[i];
-            dup->name = vkd3d_wstrdup(export_desc ? export_desc->Name : dup->name);
+            if (!(dup->name = vkd3d_wstrdup(export_desc ? export_desc->Name : dup->name)))
+                return E_OUTOFMEMORY;
             dup->borrowed_payloads = true;
+            data->subobjects_count++;
         }
     }
 
@@ -878,7 +943,8 @@ static HRESULT d3d12_state_object_add_collection_deferred(
             dup->priority = VKD3D_ASSOCIATION_PRIORITY_INHERITED_COLLECTION;
     }
 
-    /* Do not need to hold reference to the original collection since we effectively dup all data we need. */
+    /* The caller retains the source collection for borrowed subobject payloads
+     * and library descriptors, including when this data is deferred again. */
     return S_OK;
 }
 
@@ -888,7 +954,14 @@ static HRESULT d3d12_state_object_add_collection(
         const D3D12_EXPORT_DESC *exports, unsigned int num_exports)
 {
     if (collection->deferred_data)
+    {
+        if (!vkd3d_array_reserve((void **)&data->deferred_collections, &data->deferred_collections_size,
+                data->deferred_collections_count + 1, sizeof(*data->deferred_collections)))
+            return E_OUTOFMEMORY;
+        d3d12_state_object_inc_ref(collection);
+        data->deferred_collections[data->deferred_collections_count++] = collection;
         return d3d12_state_object_add_collection_deferred(collection->deferred_data, data, exports, num_exports);
+    }
     else
         return d3d12_state_object_add_collection_library(collection, data, exports, num_exports);
 }
@@ -1045,8 +1118,9 @@ static HRESULT d3d12_state_object_parse_subobject(struct d3d12_rt_state_object *
                 ERR("Failed to parse DXIL library.\n");
                 return E_OUTOFMEMORY;
             }
-            vkd3d_array_reserve((void**)&data->dxil_libraries, &data->dxil_libraries_size,
-                    data->dxil_libraries_count + 1, sizeof(*data->dxil_libraries));
+            if (!vkd3d_array_reserve((void**)&data->dxil_libraries, &data->dxil_libraries_size,
+                    data->dxil_libraries_count + 1, sizeof(*data->dxil_libraries)))
+                return E_OUTOFMEMORY;
             data->dxil_libraries[data->dxil_libraries_count++] = lib;
 
             RT_TRACE("Adding DXIL library:\n");
@@ -2837,7 +2911,8 @@ static HRESULT d3d12_state_object_init(struct d3d12_rt_state_object *object,
     return S_OK;
 
 fail:
-    if (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS)
+    if (hr != E_OUTOFMEMORY &&
+            (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS))
     {
         /* If we allow local dependencies on external definitions, it's very plausible we'll fail
          * a compilation. Defer this compilation. Need to keep alive what we parsed,
@@ -2848,6 +2923,11 @@ fail:
         WARN("Deferring compilation of COLLECTION due to ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS.\n");
         d3d12_state_object_cleanup(object);
         object->deferred_data = d3d12_state_object_pipeline_data_defer(&data, object->device);
+        if (!object->deferred_data)
+        {
+            d3d12_state_object_pipeline_data_cleanup(&data, object->device);
+            return E_OUTOFMEMORY;
+        }
         if (FAILED(hr = vkd3d_private_store_init(&object->private_store)))
             d3d12_state_object_cleanup(object);
         else
