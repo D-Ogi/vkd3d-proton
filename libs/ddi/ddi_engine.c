@@ -264,8 +264,11 @@ bool vkd3d_debug_control_mute_message_id(const char *vuid)
     return false;
 }
 
+/* *enumerate_result and *count_out say what vkEnumeratePhysicalDevices answered, so that a caller can tell an
+ * enumeration that failed or listed nothing from a list without this LUID (BD-331). */
 static VkPhysicalDevice bc250_find_physical_device(struct vkd3d_instance *instance,
-        PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr, const LUID *luid)
+        PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr, const LUID *luid, VkResult *enumerate_result,
+        uint32_t *count_out)
 {
     PFN_vkGetPhysicalDeviceProperties2 pfn_vkGetPhysicalDeviceProperties2;
     PFN_vkEnumeratePhysicalDevices pfn_vkEnumeratePhysicalDevices;
@@ -284,12 +287,17 @@ static VkPhysicalDevice bc250_find_physical_device(struct vkd3d_instance *instan
     if (!pfn_vkEnumeratePhysicalDevices || !pfn_vkGetPhysicalDeviceProperties2)
         return VK_NULL_HANDLE;
 
-    if (pfn_vkEnumeratePhysicalDevices(vk_instance, &count, NULL) < 0 || !count)
+    count = 0;
+    *enumerate_result = pfn_vkEnumeratePhysicalDevices(vk_instance, &count, NULL);
+    *count_out = count;
+    if (*enumerate_result < 0 || !count)
         return VK_NULL_HANDLE;
     if (!(vk_physical_devices = calloc(count, sizeof(*vk_physical_devices))))
         return VK_NULL_HANDLE;
 
-    if (pfn_vkEnumeratePhysicalDevices(vk_instance, &count, vk_physical_devices) >= 0)
+    *enumerate_result = pfn_vkEnumeratePhysicalDevices(vk_instance, &count, vk_physical_devices);
+    *count_out = count;
+    if (*enumerate_result >= 0)
     {
         for (i = 0; i < count; ++i)
         {
@@ -373,6 +381,8 @@ static HRESULT bc250_prepare_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, 
     const BC250_VKD3D_SHELL_SERVICES *services = NULL;
     UINT32 queue_mode = BC250_VKD3D_QUEUE_MODE_THREADED;
     VkPhysicalDevice vk_physical_device;
+    VkResult enumerate_result = VK_ERROR_INITIALIZATION_FAILED;
+    uint32_t physical_device_count = 0;
     HRESULT hr;
 
     memset(request, 0, sizeof(*request));
@@ -454,10 +464,13 @@ static HRESULT bc250_prepare_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, 
     }
 
     if (!(vk_physical_device = bc250_find_physical_device(request->instance, info->GetInstanceProcAddr,
-            &info->AdapterLuid)))
+            &info->AdapterLuid, &enumerate_result, &physical_device_count)))
     {
-        WARN("No Vulkan physical device has LUID %08lx:%08lx.\n",
-                (unsigned long)info->AdapterLuid.HighPart, (unsigned long)info->AdapterLuid.LowPart);
+        /* ERR: the release log keeps it. Without this line an adapter that the Vulkan driver does not list
+         * shows only as E_INVALIDARG from every GetCaps (BD-331). */
+        ERR("No Vulkan physical device has LUID %08lx:%08lx (vkEnumeratePhysicalDevices %d, %u devices).\n",
+                (unsigned long)info->AdapterLuid.HighPart, (unsigned long)info->AdapterLuid.LowPart,
+                (int)enumerate_result, physical_device_count);
         bc250_release_request(request);
         return E_INVALIDARG;
     }
