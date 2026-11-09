@@ -36,6 +36,12 @@ amdgpu_wddm_vkd3d_admission_test = executable('amdgpu_wddm_vkd3d_compile_admissi
   install             : false)
 test('ddi-compile-admission', amdgpu_wddm_vkd3d_admission_test, timeout : 30)
 
+# The LUID search of ddi_physical_device.h and the step its miss report names (BD-331); no GPU, no driver.
+amdgpu_wddm_vkd3d_physical_device_test = executable('amdgpu_wddm_vkd3d_physical_device_test', 'physical_device_test.c',
+  include_directories : vkd3d_private_includes,
+  install             : false)
+test('ddi-physical-device', amdgpu_wddm_vkd3d_physical_device_test, timeout : 30)
+
 # Shader translation has no Vulkan/device dependency and runs in both driver flavours.
 amdgpu_wddm_vkd3d_shader_test = executable('amdgpu_wddm_vkd3d_shader_test', 'engine_test_shader.c',
   include_directories : vkd3d_private_includes,

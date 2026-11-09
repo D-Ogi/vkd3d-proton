@@ -16,6 +16,7 @@
 
 #include "bc250_vkd3d_engine.h"
 #include "ddi_cache_policy.h"
+#include "ddi_physical_device.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -264,70 +265,21 @@ bool vkd3d_debug_control_mute_message_id(const char *vuid)
     return false;
 }
 
-/* *enumerate_result and *count_out say what vkEnumeratePhysicalDevices answered, so that a caller can tell an
- * enumeration that failed or listed nothing from a list without this LUID (BD-331). */
+/* The device of the adapter's LUID (ddi_physical_device.h). The search report goes into the log: the warnings for
+ * a LUID match below the minimum version and for a second match here, the reason of a miss at the caller. */
 static VkPhysicalDevice bc250_find_physical_device(struct vkd3d_instance *instance,
-        PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr, const LUID *luid, VkResult *enumerate_result,
-        uint32_t *count_out)
+        PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr, const LUID *luid, struct bc250_luid_search *search)
 {
-    PFN_vkGetPhysicalDeviceProperties2 pfn_vkGetPhysicalDeviceProperties2;
-    PFN_vkEnumeratePhysicalDevices pfn_vkEnumeratePhysicalDevices;
-    VkPhysicalDevice vk_physical_device = VK_NULL_HANDLE;
-    VkPhysicalDeviceIDProperties id_properties;
-    VkPhysicalDeviceProperties2 properties2;
-    VkPhysicalDevice *vk_physical_devices;
-    VkInstance vk_instance;
-    uint32_t count, i;
+    VkPhysicalDevice vk_physical_device = bc250_find_physical_device_by_luid(vkd3d_instance_get_vk_instance(instance),
+            pfn_vkGetInstanceProcAddr, luid, VKD3D_MIN_API_VERSION, search);
 
-    vk_instance = vkd3d_instance_get_vk_instance(instance);
-    pfn_vkEnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)pfn_vkGetInstanceProcAddr(
-            vk_instance, "vkEnumeratePhysicalDevices");
-    pfn_vkGetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)pfn_vkGetInstanceProcAddr(
-            vk_instance, "vkGetPhysicalDeviceProperties2");
-    if (!pfn_vkEnumeratePhysicalDevices || !pfn_vkGetPhysicalDeviceProperties2)
-        return VK_NULL_HANDLE;
-
-    count = 0;
-    *enumerate_result = pfn_vkEnumeratePhysicalDevices(vk_instance, &count, NULL);
-    *count_out = count;
-    if (*enumerate_result < 0 || !count)
-        return VK_NULL_HANDLE;
-    if (!(vk_physical_devices = calloc(count, sizeof(*vk_physical_devices))))
-        return VK_NULL_HANDLE;
-
-    *enumerate_result = pfn_vkEnumeratePhysicalDevices(vk_instance, &count, vk_physical_devices);
-    *count_out = count;
-    if (*enumerate_result >= 0)
-    {
-        for (i = 0; i < count; ++i)
-        {
-            memset(&id_properties, 0, sizeof(id_properties));
-            id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-            memset(&properties2, 0, sizeof(properties2));
-            properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-            properties2.pNext = &id_properties;
-            pfn_vkGetPhysicalDeviceProperties2(vk_physical_devices[i], &properties2);
-
-            /* V2: the LUID alone decides. A second match would be a driver bug; take the first and say so. */
-            if (!id_properties.deviceLUIDValid || memcmp(id_properties.deviceLUID, luid, VK_LUID_SIZE))
-                continue;
-            if (properties2.properties.apiVersion < VKD3D_MIN_API_VERSION)
-            {
-                WARN("Adapter %s matches the LUID but is below Vulkan %u.%u.\n", properties2.properties.deviceName,
-                        VK_API_VERSION_MAJOR(VKD3D_MIN_API_VERSION), VK_API_VERSION_MINOR(VKD3D_MIN_API_VERSION));
-                continue;
-            }
-            if (vk_physical_device)
-            {
-                WARN("More than one physical device has LUID %08lx:%08lx; using the first.\n",
-                        (unsigned long)luid->HighPart, (unsigned long)luid->LowPart);
-                break;
-            }
-            vk_physical_device = vk_physical_devices[i];
-        }
-    }
-
-    free(vk_physical_devices);
+    if (search->below_api)
+        WARN("Adapter %s and %u more match the LUID but are below Vulkan %u.%u.\n", search->below_api_name,
+                search->below_api - 1, VK_API_VERSION_MAJOR(VKD3D_MIN_API_VERSION),
+                VK_API_VERSION_MINOR(VKD3D_MIN_API_VERSION));
+    if (search->extra)
+        WARN("%u more physical device(s) have LUID %08lx:%08lx; using the first.\n", search->extra,
+                (unsigned long)luid->HighPart, (unsigned long)luid->LowPart);
     return vk_physical_device;
 }
 
@@ -381,8 +333,7 @@ static HRESULT bc250_prepare_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, 
     const BC250_VKD3D_SHELL_SERVICES *services = NULL;
     UINT32 queue_mode = BC250_VKD3D_QUEUE_MODE_THREADED;
     VkPhysicalDevice vk_physical_device;
-    VkResult enumerate_result = VK_ERROR_INITIALIZATION_FAILED;
-    uint32_t physical_device_count = 0;
+    struct bc250_luid_search luid_search;
     HRESULT hr;
 
     memset(request, 0, sizeof(*request));
@@ -464,13 +415,13 @@ static HRESULT bc250_prepare_device(const BC250_VKD3D_DEVICE_CREATE_INFO *info, 
     }
 
     if (!(vk_physical_device = bc250_find_physical_device(request->instance, info->GetInstanceProcAddr,
-            &info->AdapterLuid, &enumerate_result, &physical_device_count)))
+            &info->AdapterLuid, &luid_search)))
     {
         /* ERR: the release log keeps it. Without this line an adapter that the Vulkan driver does not list
          * shows only as E_INVALIDARG from every GetCaps (BD-331). */
-        ERR("No Vulkan physical device has LUID %08lx:%08lx (vkEnumeratePhysicalDevices %d, %u devices).\n",
+        ERR("No Vulkan physical device has LUID %08lx:%08lx (%s %d, %u devices).\n",
                 (unsigned long)info->AdapterLuid.HighPart, (unsigned long)info->AdapterLuid.LowPart,
-                (int)enumerate_result, physical_device_count);
+                luid_search.step, (int)luid_search.result, luid_search.count);
         bc250_release_request(request);
         return E_INVALIDARG;
     }
