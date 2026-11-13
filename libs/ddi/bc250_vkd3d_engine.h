@@ -5,7 +5,8 @@
  * amdgpu_wddm_vkd3d.dll, vkd3d-proton fork branch amdgpu-wddm/ddi-engine). The DLL was bc250vkd3d.dll before
  * its file names took the project's amdgpu_wddm prefix; code identifiers keep their BC250 names.
  *
- * Revision r7-draft, ABI 1.10: NOT FROZEN. r7 adds urgent creations (V14), private data of the engine device with
+ * Revision r8-draft, ABI 1.11: NOT FROZEN. r8 adds 1.11, linear mip chains and arrays (V15): two functions appended
+ * to the table, and changes nothing of 1.10. r7 adds urgent creations (V14), private data of the engine device with
  * no new function, structure field or minor. r6 appends partial graphics library functions.
  * r5 adds 1.3, linear images (V13), and changes nothing of 1.2.
  * r4 adds the instance mode (V12) to 1.2; the minor stays 1.2 because 1.2
@@ -28,6 +29,8 @@
  *        BC250_VKD3D_FEATURE_QUERY. r4-draft: the instance mode (V12), DEVICE_CREATE_INFO.InstanceMode.
  *   1.3  r5-draft: linear images (V13): ENGINE_FUNCS.QueryLinearImage and CreateLinearPlacedResource,
  *        BC250_VKD3D_LINEAR_IMAGE_INFO.
+ *   1.11 r8-draft: linear mip chains and arrays (V15): ENGINE_FUNCS.QueryLinearImageLayouts and
+ *        CreateLinearPlacedResource2, BC250_VKD3D_SUBRESOURCE_LAYOUT, BC250_VKD3D_LINEAR_IMAGE_CREATE.
  *
  * Sizes. Every structure starts with its Size, so a shell built against an older header passes a smaller one.
  * The engine reads a field only when Size covers it (fields of minor n also need AbiVersion 1.n or later). It
@@ -327,6 +330,26 @@
  *         thread, at any time; the mark costs one lock of the limiter.
  *       - Older engines. An engine before r7 stores the data as ordinary private data and gives no urgency;
  *         SetPrivateData returns S_OK. The shell pins the engine build; it does not probe for V14.
+ *   V15 Linear mip chains and arrays (1.11, r8-draft). QueryLinearImageLayouts and CreateLinearPlacedResource2 are
+ *       QueryLinearImage and CreateLinearPlacedResource of V13 for a wider shape, and they also give the layout of
+ *       every subresource. A shell that shares a texture between engines compares these layouts (the S26R record
+ *       of driver/contract hashes them); V13 gives subresource 0 only. The V13 functions do not change: they still
+ *       refuse more than one mip level or layer.
+ *       - Shape. A 2D colour image with MipLevels >= 1 mip levels (0, the whole chain, is E_INVALIDARG: the caller
+ *         counts the subresources) and DepthOrArraySize >= 1 layers, one sample, without depth-stencil use or
+ *         sampler feedback, on a heap without CPU access. A mip count above the chain of the extent is
+ *         E_INVALIDARG. A format that the device does not support with linear tiling, the usage the description
+ *         implies, this mip count or this layer count (vkGetPhysicalDeviceImageFormatProperties2) is E_NOTIMPL;
+ *         the engine never falls back to another tiling. V13's format check includes the same two limits.
+ *       - Layouts. layoutCount must be MipLevels * DepthOrArraySize, else E_INVALIDARG. layouts[layer * MipLevels
+ *         + mip] receives the VkSubresourceLayout of (mip, layer) of the colour aspect: layer-major, then mip, the
+ *         order of Bc250SharedResourceLayoutAdd. info is V13's structure: subresource (0, 0) and the image's
+ *         memory requirements. On failure info keeps its Size and is zero otherwise, and the layouts are zero.
+ *       - Create facts. create receives the VkFormat, the VkImageCreateFlags and the VkImageUsageFlags of the
+ *         VkImageCreateInfo of the image. A shell that opens a texture of another engine compares them with the
+ *         creator's record (S26R). On failure create keeps its Size and is zero otherwise.
+ *       - Order and layout as V13: the query is an unbound image, the create returns the bound image's answer,
+ *         and the shell compares the two. Every subresource is used in VK_IMAGE_LAYOUT_GENERAL.
  */
 #ifndef BC250_VKD3D_ENGINE_H
 #define BC250_VKD3D_ENGINE_H
@@ -354,7 +377,8 @@ extern "C" {
  * it does not translate the original shader again. The private hosted capture
  * capability is queried explicitly and absence fails closed. Table layouts and
  * the entrypoints requested by ABI 1.0 through 1.9 remain unchanged. */
-#define BC250_VKD3D_ENGINE_ABI_MINOR 10u
+/* 1.11 appends QueryLinearImageLayouts and CreateLinearPlacedResource2 (V15). */
+#define BC250_VKD3D_ENGINE_ABI_MINOR 11u
 #define BC250_VKD3D_ENGINE_ABI_VERSION ((BC250_VKD3D_ENGINE_ABI_MAJOR << 16) | BC250_VKD3D_ENGINE_ABI_MINOR)
 
 #define BC250_VKD3D_QUEUE_MODE_THREADED 0u         /* V3; also the mode when the 1.1 fields are absent */
@@ -481,6 +505,25 @@ typedef struct BC250_VKD3D_LINEAR_IMAGE_INFO
     UINT64 MemoryAlignment;                        /* VkMemoryRequirements::alignment */
 } BC250_VKD3D_LINEAR_IMAGE_INFO;
 
+/* 1.11, V15. The VkSubresourceLayout of one subresource of a linear image. */
+typedef struct BC250_VKD3D_SUBRESOURCE_LAYOUT
+{
+    UINT64 Offset;                                 /* VkSubresourceLayout::offset */
+    UINT64 Size;                                   /* VkSubresourceLayout::size */
+    UINT64 RowPitch;                               /* VkSubresourceLayout::rowPitch */
+    UINT64 ArrayPitch;                             /* VkSubresourceLayout::arrayPitch */
+    UINT64 DepthPitch;                             /* VkSubresourceLayout::depthPitch */
+} BC250_VKD3D_SUBRESOURCE_LAYOUT;
+
+/* 1.11, V15. The create facts of a linear image: its VkImageCreateInfo fields that a shared-resource record holds. */
+typedef struct BC250_VKD3D_LINEAR_IMAGE_CREATE
+{
+    UINT32 Size;                                   /* sizeof(BC250_VKD3D_LINEAR_IMAGE_CREATE), set by the caller */
+    UINT32 VkFormat;                               /* VkImageCreateInfo::format */
+    UINT32 CreateFlags;                            /* VkImageCreateInfo::flags */
+    UINT32 CreateUsage;                            /* VkImageCreateInfo::usage */
+} BC250_VKD3D_LINEAR_IMAGE_CREATE;
+
 /* V14, r7. The private data GUID of an urgent creation, as an initializer of a GUID. */
 #define BC250_VKD3D_COMPILE_URGENCY_GUID_INIT \
         {0xdcbd70e7, 0x16da, 0x474e, {0x8f, 0xe9, 0x3a, 0x60, 0xc0, 0xcf, 0x2b, 0x71}}
@@ -597,9 +640,28 @@ typedef struct BC250_VKD3D_ENGINE_FUNCS
     HRESULT (APIENTRY *CreateLinkedGraphicsPipeline)(void *device,
             const struct D3D12_PIPELINE_STATE_STREAM_DESC *desc, void *const *libraries,
             UINT32 count, BOOL optimize, REFIID riid, void **pipeline);
+
+    /* 1.11, V15. QueryLinearImage for V15's shape, with the layouts of the layoutCount subresources. E_INVALIDARG
+     * for a NULL pointer, an info->Size or create->Size below the structure's, a layoutCount that is not
+     * MipLevels * DepthOrArraySize or a description outside V15's shape; E_NOTIMPL when the device has no such
+     * image. device
+     * as for CreateCommandQueue, in either queue mode. */
+    HRESULT (APIENTRY *QueryLinearImageLayouts)(void *device, const struct D3D12_RESOURCE_DESC1 *desc,
+            BC250_VKD3D_LINEAR_IMAGE_INFO *info, BC250_VKD3D_LINEAR_IMAGE_CREATE *create, UINT32 layoutCount,
+            BC250_VKD3D_SUBRESOURCE_LAYOUT *layouts);
+
+    /* 1.11, V15. CreateLinearPlacedResource for V15's shape; info, create and layouts receive the bound image.
+     * Failures as QueryLinearImageLayouts and as CreatePlacedResource1; nothing is created on failure. */
+    HRESULT (APIENTRY *CreateLinearPlacedResource2)(void *device, void *heap, UINT64 heapOffset,
+            const struct D3D12_RESOURCE_DESC1 *desc, UINT32 initialState,
+            const struct D3D12_CLEAR_VALUE *optimizedClearValue, REFIID riid, void **resource,
+            BC250_VKD3D_LINEAR_IMAGE_INFO *info, BC250_VKD3D_LINEAR_IMAGE_CREATE *create, UINT32 layoutCount,
+            BC250_VKD3D_SUBRESOURCE_LAYOUT *layouts);
 } BC250_VKD3D_ENGINE_FUNCS;
 
 #define BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3 ((UINT32)offsetof(BC250_VKD3D_ENGINE_FUNCS, CreatePartialGraphicsLibrary))
+/* The 1.10 layout of the function table ends with CreateLinkedGraphicsPipeline; a 1.4 to 1.10 shell passes it. */
+#define BC250_VKD3D_ENGINE_FUNCS_SIZE_1_10 ((UINT32)offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryLinearImageLayouts))
 
 typedef struct BC250_VKD3D_ENGINE_FUNCS_1_0
 {
@@ -669,7 +731,18 @@ BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_3_order,
         && BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3
                 == offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateLinearPlacedResource) + sizeof(void *));
 BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_4_tail,
-        sizeof(BC250_VKD3D_ENGINE_FUNCS) == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3 + 4 * sizeof(void *));
+        BC250_VKD3D_ENGINE_FUNCS_SIZE_1_10 == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_3 + 4 * sizeof(void *));
+BC250_VKD3D_STATIC_ASSERT(engine_funcs_1_11_tail,
+        offsetof(BC250_VKD3D_ENGINE_FUNCS, CreateLinearPlacedResource2)
+                == offsetof(BC250_VKD3D_ENGINE_FUNCS, QueryLinearImageLayouts) + sizeof(void *)
+        && sizeof(BC250_VKD3D_ENGINE_FUNCS) == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_10 + 2 * sizeof(void *));
+BC250_VKD3D_STATIC_ASSERT(subresource_layout,
+        sizeof(BC250_VKD3D_SUBRESOURCE_LAYOUT) == 40 && offsetof(BC250_VKD3D_SUBRESOURCE_LAYOUT, Size) == 8
+        && offsetof(BC250_VKD3D_SUBRESOURCE_LAYOUT, RowPitch) == 16
+        && offsetof(BC250_VKD3D_SUBRESOURCE_LAYOUT, ArrayPitch) == 24
+        && offsetof(BC250_VKD3D_SUBRESOURCE_LAYOUT, DepthPitch) == 32
+        && sizeof(BC250_VKD3D_LINEAR_IMAGE_CREATE) == 16
+        && offsetof(BC250_VKD3D_LINEAR_IMAGE_CREATE, CreateUsage) == 12);
 BC250_VKD3D_STATIC_ASSERT(partial_signature_size,
         sizeof(BC250_VKD3D_SIGNATURE_ELEMENT) == (sizeof(void *) == 8 ? 40 : 32));
 BC250_VKD3D_STATIC_ASSERT(partial_desc_size,

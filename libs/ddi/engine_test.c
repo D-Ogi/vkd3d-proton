@@ -30,7 +30,13 @@
  *     memory the test allocates on the engine's VkDevice (CreateHeapFromMemory); a placed UPLOAD buffer at 64 KiB
  *     filled through MapHeap at the address its Map returns; a placed buffer and a placed texture round trip,
  *     word-exact through MapHeap of the READBACK heap; MapHeap on a heap of ID3D12Device::CreateHeap; the safe
- *     order before vkFreeMemory (fence wait, final Releases returning 0, vkFreeMemory).
+ *     order before vkFreeMemory (fence wait, final Releases returning 0, vkFreeMemory);
+ *   - linear images (1.3, V13) and linear mip chains and arrays (1.11, V15): the refusals, then for 7 mips, 4
+ *     layers, 7 mips x 4 layers and 100x60 with 7 mips, the layout of every subresource (printed), the bound image
+ *     against the query, and every texel of every subresource through a copy back and a compute shader load. An
+ *     adapter without such linear images SKIPS a shape with a "SKIP" line; the default run still passes then.
+ * --linear-layouts runs only the V15 case on a THREADED device and ends with "LINEAR-LAYOUTS PASS|SKIP|FAIL":
+ *   exit code 0 PASS, 4 SKIP (an adapter without the linear shape, so nothing was proven), 1 FAIL.
  * Default run, ABI 1.0 and the THREADED queue mode (V3), as a 1.0 shell uses it:
  *   - CreateDevice with a 1.0-sized CreateInfo over a caller-supplied Vulkan entry point, adapter chosen by LUID
  *     (V1, V2), an unknown LUID refused, two calls giving two devices (independent);
@@ -78,7 +84,7 @@
  *   It waits about 10 s, and vkd3d-proton logs the timeout as an error.
  *
  * Usage: amdgpu_wddm_vkd3d_engine_test.exe <path to amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]
- *        [--fl <hex>] [--abi-only | --inline | --hang | --diagnostics-only <new log file>]
+ *        [--fl <hex>] [--abi-only | --inline | --hang | --linear-layouts | --diagnostics-only <new log file>]
  *   adapter substring  picks the DXGI adapter whose description contains it (default: first hardware adapter)
  *   --icd              loads that Vulkan driver DLL directly (entry vk_icdGetInstanceProcAddr), as the shell
  *                      loads hosted RADV, instead of the Vulkan loader (vulkan-1.dll)
@@ -87,6 +93,7 @@
  *   --hang             runs the GPU hang suite instead of the THREADED one
  *   --diagnostics-only checks WARN capture from the loaded lab DLL with an invalid queue mode; creates a new
  *                      log file, loads no Vulkan driver, enumerates no adapters and makes no GPU calls
+ *   --linear-layouts   runs only the V15 case (exit codes above)
  * Exit code 0 = all checks passed. "icd:" lines name every loaded Vulkan driver and its SHA-256.
  */
 
@@ -107,11 +114,13 @@
 
 #include "bc250_vkd3d_engine.h"
 #include "engine_test_cs.h"
+#include "engine_test_load_cs.h"
 
 #define ABI_1_0 0x00010000u
 #define ABI_1_1 0x00010001u
 #define ABI_1_2 0x00010002u
 #define ABI_1_3 0x00010003u
+#define ABI_1_11 0x0001000bu
 
 static unsigned int failures;
 
@@ -2101,6 +2110,529 @@ release:
     }
 }
 
+/* V15: linear mip chains and arrays. Refusals that need no device support, then for each shape below:
+ * QueryLinearImageLayouts before any memory exists, the layouts against the extents (rows held, no two
+ * subresources overlap, all inside the memory size, subresource 0 equal to info), a heap over memory of a type the
+ * answer names, CreateLinearPlacedResource2 on it, the bound image against the query, an upload of a pattern of
+ * (x, y, mip, layer) to every subresource by footprint, and two reads of every subresource: a copy to a READBACK
+ * buffer and a compute shader that loads every texel through a Texture2DArray SRV. A device that has no such image
+ * answers E_NOTIMPL (an adapter without linear mip chains or arrays): the case is then SKIPPED, with the reason on a
+ * line of its own, and never counted as passed. Returns the result. */
+enum linear_layouts_result
+{
+    LINEAR_LAYOUTS_PASS,
+    LINEAR_LAYOUTS_SKIP,
+    LINEAR_LAYOUTS_FAIL,
+};
+
+#define LINEAR_LAYOUTS_MAX 28u              /* 7 mip levels x 4 layers */
+#define LINEAR_LAYOUTS_MAX_TEXELS 32768u    /* 4 layers of a 64 x 64 chain, below 4 x 64 x 64 x 4 / 3 */
+
+struct linear_shape
+{
+    UINT width, height;
+    UINT16 mips, layers;
+};
+
+static UINT32 linear_texel(UINT x, UINT y, UINT mip, UINT layer)
+{
+    return (x & 0xffu) | ((y & 0xffu) << 8) | ((mip | (layer << 4)) << 16) | ((0xa5u ^ ((x + y) & 0xffu)) << 24);
+}
+
+/* The layouts of one image: every row of each subresource fits, the subresources do not overlap and the memory
+ * holds them. Prints every layout. */
+static BOOL linear_layouts_sane(const struct linear_shape *shape, const BC250_VKD3D_LINEAR_IMAGE_INFO *info,
+        const BC250_VKD3D_SUBRESOURCE_LAYOUT *layouts, const char *tag)
+{
+    UINT i, j, count = shape->mips * shape->layers;
+    BOOL ok = TRUE;
+
+    for (i = 0; i < count; ++i)
+    {
+        const BC250_VKD3D_SUBRESOURCE_LAYOUT *l = &layouts[i];
+        UINT mip = i % shape->mips, layer = i / shape->mips;
+        UINT w = max(1u, shape->width >> mip), h = max(1u, shape->height >> mip);
+
+        printf("%s%ux%u mips %u layers %u: subresource mip %u layer %u offset %llu size %llu row pitch %llu "
+                "array pitch %llu depth pitch %llu\n", tag, shape->width, shape->height, shape->mips, shape->layers,
+                mip, layer, (unsigned long long)l->Offset, (unsigned long long)l->Size,
+                (unsigned long long)l->RowPitch, (unsigned long long)l->ArrayPitch, (unsigned long long)l->DepthPitch);
+        ok &= l->RowPitch >= w * 4u && l->Size >= l->RowPitch * (h - 1) + w * 4u
+                && l->Offset + l->Size <= info->MemorySize;
+        for (j = 0; j < i; ++j)
+            ok &= l->Offset >= layouts[j].Offset + layouts[j].Size || layouts[j].Offset >= l->Offset + l->Size;
+    }
+    ok &= layouts[0].Offset == info->Offset && layouts[0].RowPitch == info->RowPitch
+            && layouts[0].Size == info->LayoutSize;
+    return ok;
+}
+
+static enum linear_layouts_result linear_layouts_shape(const BC250_VKD3D_ENGINE_FUNCS *funcs,
+        ID3D12Device *device, const struct import_ctx *ctx, ID3D12CommandQueue *queue, enum wait_mode mode,
+        const struct linear_shape *shape, const char *tag)
+{
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[LINEAR_LAYOUTS_MAX];
+    BC250_VKD3D_SUBRESOURCE_LAYOUT queried_layouts[LINEAR_LAYOUTS_MAX], bound_layouts[LINEAR_LAYOUTS_MAX];
+    ID3D12Resource *image = NULL, *upload = NULL, *back = NULL, *uav = NULL, *uav_back = NULL;
+    UINT rows[LINEAR_LAYOUTS_MAX], count = shape->mips * shape->layers, i, x, y;
+    UINT64 row_bytes[LINEAR_LAYOUTS_MAX], total = 0;
+    BC250_VKD3D_LINEAR_IMAGE_CREATE queried_create, bound_create;
+    BC250_VKD3D_LINEAR_IMAGE_INFO queried, bound;
+    D3D12_TEXTURE_COPY_LOCATION copy_dst, copy_src;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_start, cpu_uav;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_start;
+    ID3D12CommandAllocator *allocator = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC views_desc;
+    UINT copy_differ = 0, load_differ = 0;
+    ID3D12GraphicsCommandList *list = NULL;
+    ID3D12DescriptorHeap *views = NULL;
+    D3D12_RESOURCE_BARRIER barriers[2];
+    ID3D12PipelineState *pso = NULL;
+    ID3D12RootSignature *rs = NULL;
+    struct import_heap target;
+    struct import_ctx image_ctx;
+    D3D12_RESOURCE_DESC1 desc;
+    D3D12_RESOURCE_DESC rdesc;
+    UINT texels = 0, base;
+    BYTE *bytes = NULL;
+    D3D12_RANGE range;
+    BOOL done = FALSE;
+    char label[96];
+    HRESULT hr;
+
+    snprintf(label, sizeof(label), "%s%ux%u R8G8B8A8_UINT, %u mips, %u layers: ", tag, shape->width, shape->height,
+            shape->mips, shape->layers);
+    memset(&target, 0, sizeof(target));
+    memset(&desc, 0, sizeof(desc));
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = shape->width;
+    desc.Height = shape->height;
+    desc.DepthOrArraySize = shape->layers;
+    desc.MipLevels = shape->mips;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    memset(&queried, 0, sizeof(queried));
+    queried.Size = sizeof(queried);
+    memset(&queried_create, 0, sizeof(queried_create));
+    queried_create.Size = sizeof(queried_create);
+    hr = funcs->QueryLinearImageLayouts(device, &desc, &queried, &queried_create, count, queried_layouts);
+    if (hr == E_NOTIMPL)
+    {
+        printf("SKIP  %sQueryLinearImageLayouts E_NOTIMPL: this adapter has no linear image of this shape "
+                "(vkGetPhysicalDeviceImageFormatProperties2 limits; the engine log names them)\n", label);
+        return LINEAR_LAYOUTS_SKIP;
+    }
+    printf("%squery hr %08lx, memory size %llu, alignment %llu, type bits %#x, VkFormat %u, flags %#x, usage %#x\n",
+            label, (unsigned long)hr, (unsigned long long)queried.MemorySize,
+            (unsigned long long)queried.MemoryAlignment, (unsigned int)queried.MemoryTypeBits,
+            (unsigned int)queried_create.VkFormat, (unsigned int)queried_create.CreateFlags,
+            (unsigned int)queried_create.CreateUsage);
+    checkf(hr == S_OK && linear_layouts_sane(shape, &queried, queried_layouts, label),
+            "%sQueryLinearImageLayouts: every subresource holds its rows, none overlap, the memory holds them", label);
+    checkf(hr == S_OK && queried_create.Size == sizeof(queried_create)
+            && queried_create.VkFormat == VK_FORMAT_R8G8B8A8_UINT
+            && (queried_create.CreateUsage & VK_IMAGE_USAGE_SAMPLED_BIT)
+            && (queried_create.CreateUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+            "%sQueryLinearImageLayouts: the create facts name VK_FORMAT_R8G8B8A8_UINT, sampled and transfer use",
+            label);
+    if (hr != S_OK)
+        return LINEAR_LAYOUTS_FAIL;
+
+    image_ctx = *ctx;
+    image_ctx.allowed_types = queried.MemoryTypeBits;
+    if (!(queried.MemorySize <= IMPORT_HEAP_SIZE && import_heap_create(&image_ctx, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &target, "DEFAULT texture")))
+    {
+        checkf(FALSE, "%sa heap over imported memory for the linear image", label);
+        return LINEAR_LAYOUTS_FAIL;
+    }
+    memset(&bound, 0, sizeof(bound));
+    bound.Size = sizeof(bound);
+    memset(&bound_create, 0, sizeof(bound_create));
+    bound_create.Size = sizeof(bound_create);
+    checkf(funcs->CreateLinearPlacedResource2(device, target.heap, 0, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void **)&image, &bound, &bound_create, count - 1, bound_layouts) == E_INVALIDARG
+            && !image && !bound.MemorySize && !bound_create.VkFormat,
+            "%sCreateLinearPlacedResource2 with one layout too few -> E_INVALIDARG, nothing created", label);
+    hr = funcs->CreateLinearPlacedResource2(device, target.heap, 0, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+            &IID_ID3D12Resource, (void **)&image, &bound, &bound_create, count, bound_layouts);
+    checkf(hr == S_OK && image, "%sCreateLinearPlacedResource2 at offset 0 of the imported heap (hr %08lx)", label,
+            (unsigned long)hr);
+    if (hr != S_OK || !image)
+        goto release;
+    checkf(!memcmp(&bound, &queried, sizeof(bound)) && !memcmp(&bound_create, &queried_create, sizeof(bound_create))
+            && !memcmp(bound_layouts, queried_layouts, count * sizeof(*bound_layouts)),
+            "%sthe bound image has the layouts, the requirements and the create facts of the query", label);
+
+    ID3D12Resource_GetDesc(image, &rdesc);
+    ID3D12Device_GetCopyableFootprints(device, &rdesc, 0, count, 0, footprints, rows, row_bytes, &total);
+    for (i = 0; i < count; ++i)
+        texels += footprints[i].Footprint.Width * footprints[i].Footprint.Height;
+    upload = create_buffer(device, D3D12_HEAP_TYPE_UPLOAD, total, D3D12_RESOURCE_STATE_GENERIC_READ);
+    back = create_buffer(device, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST);
+    uav_back = create_buffer(device, D3D12_HEAP_TYPE_READBACK, texels * 4ull, D3D12_RESOURCE_STATE_COPY_DEST);
+    {
+        D3D12_HEAP_PROPERTIES heap_props;
+        D3D12_RESOURCE_DESC buffer_desc;
+
+        memset(&heap_props, 0, sizeof(heap_props));
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+        memset(&buffer_desc, 0, sizeof(buffer_desc));
+        buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer_desc.Width = texels * 4ull;
+        buffer_desc.Height = 1;
+        buffer_desc.DepthOrArraySize = 1;
+        buffer_desc.MipLevels = 1;
+        buffer_desc.SampleDesc.Count = 1;
+        buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        buffer_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(ID3D12Device_CreateCommittedResource(device, &heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&uav)))
+            uav = NULL;
+    }
+    memset(&views_desc, 0, sizeof(views_desc));
+    views_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    views_desc.NumDescriptors = 2;
+    views_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(device, &views_desc, &IID_ID3D12DescriptorHeap, (void **)&views)))
+        views = NULL;
+    if (FAILED(ID3D12Device_CreateRootSignature(device, 0, g_engine_test_load_cs, sizeof(g_engine_test_load_cs),
+            &IID_ID3D12RootSignature, (void **)&rs)))
+        rs = NULL;
+    memset(&pso_desc, 0, sizeof(pso_desc));
+    pso_desc.pRootSignature = rs;
+    pso_desc.CS.pShaderBytecode = g_engine_test_load_cs;
+    pso_desc.CS.BytecodeLength = sizeof(g_engine_test_load_cs);
+    if (!rs || FAILED(ID3D12Device_CreateComputePipelineState(device, &pso_desc, &IID_ID3D12PipelineState,
+            (void **)&pso)))
+        pso = NULL;
+    checkf(texels <= LINEAR_LAYOUTS_MAX_TEXELS && upload && back && uav && uav_back && views && rs && pso
+            && SUCCEEDED(ID3D12Device_CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &IID_ID3D12CommandAllocator, (void **)&allocator))
+            && SUCCEEDED(ID3D12Device_CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, pso,
+                    &IID_ID3D12GraphicsCommandList, (void **)&list)),
+            "%supload, readback and UAV buffers, views, the load shader (cs_6_0), allocator and command list", label);
+    if (texels > LINEAR_LAYOUTS_MAX_TEXELS || !upload || !back || !uav || !uav_back || !views || !rs || !pso
+            || !allocator || !list)
+        goto release;
+
+    /* The pattern, through the footprints of the image's own description. */
+    range.Begin = range.End = 0;
+    if (FAILED(ID3D12Resource_Map(upload, 0, &range, (void **)&bytes)))
+    {
+        checkf(FALSE, "%sMap the upload buffer", label);
+        goto release;
+    }
+    for (i = 0; i < count; ++i)
+        for (y = 0; y < footprints[i].Footprint.Height; ++y)
+            for (x = 0; x < footprints[i].Footprint.Width; ++x)
+                ((UINT32 *)(bytes + footprints[i].Offset + (UINT64)y * footprints[i].Footprint.RowPitch))[x]
+                        = linear_texel(x, y, i % shape->mips, i / shape->mips);
+    ID3D12Resource_Unmap(upload, 0, NULL);
+
+    ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(views, &cpu_start);
+    ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(views, &gpu_start);
+    memset(&srv_desc, 0, sizeof(srv_desc));
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2DArray.MipLevels = shape->mips;
+    srv_desc.Texture2DArray.ArraySize = shape->layers;
+    ID3D12Device_CreateShaderResourceView(device, image, &srv_desc, cpu_start);
+    memset(&uav_desc, 0, sizeof(uav_desc));
+    uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.NumElements = texels;
+    uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    cpu_uav.ptr = cpu_start.ptr + ID3D12Device_GetDescriptorHandleIncrementSize(device,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ID3D12Device_CreateUnorderedAccessView(device, uav, NULL, &uav_desc, cpu_uav);
+
+    for (i = 0; i < count; ++i)
+    {
+        memset(&copy_dst, 0, sizeof(copy_dst));
+        copy_dst.pResource = image;
+        copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        copy_dst.SubresourceIndex = i;
+        memset(&copy_src, 0, sizeof(copy_src));
+        copy_src.pResource = upload;
+        copy_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        copy_src.PlacedFootprint = footprints[i];
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &copy_dst, 0, 0, 0, &copy_src, NULL);
+    }
+    memset(barriers, 0, sizeof(barriers));
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = image;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, barriers);
+    for (i = 0; i < count; ++i)
+    {
+        memset(&copy_dst, 0, sizeof(copy_dst));
+        copy_dst.pResource = back;
+        copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        copy_dst.PlacedFootprint = footprints[i];
+        memset(&copy_src, 0, sizeof(copy_src));
+        copy_src.pResource = image;
+        copy_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        copy_src.SubresourceIndex = i;
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &copy_dst, 0, 0, 0, &copy_src, NULL);
+    }
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &views);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 0, gpu_start);
+    for (i = 0, base = 0; i < count; ++i)
+    {
+        UINT constants[5];
+
+        constants[0] = i % shape->mips;
+        constants[1] = i / shape->mips;
+        constants[2] = footprints[i].Footprint.Width;
+        constants[3] = footprints[i].Footprint.Height;
+        constants[4] = base;
+        ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 1, 5, constants, 0);
+        ID3D12GraphicsCommandList_Dispatch(list, (constants[2] + 7) / 8, (constants[3] + 7) / 8, 1);
+        base += constants[2] * constants[3];
+    }
+    barriers[0].Transition.pResource = uav;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, barriers);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, uav_back, 0, uav, 0, texels * 4ull);
+    checkf(SUCCEEDED(ID3D12GraphicsCommandList_Close(list)), "%srecord the uploads, the copies back and the loads of "
+            "%u subresources", label, count);
+    if (!(done = execute_and_wait(device, queue, list, mode, label)))
+        goto release;
+
+    range.Begin = 0;
+    range.End = (SIZE_T)total;
+    if (SUCCEEDED(ID3D12Resource_Map(back, 0, &range, (void **)&bytes)))
+    {
+        for (i = 0; i < count; ++i)
+            for (y = 0; y < footprints[i].Footprint.Height; ++y)
+                for (x = 0; x < footprints[i].Footprint.Width; ++x)
+                    copy_differ += ((const UINT32 *)(bytes + footprints[i].Offset
+                            + (UINT64)y * footprints[i].Footprint.RowPitch))[x]
+                            != linear_texel(x, y, i % shape->mips, i / shape->mips);
+        range.End = 0;
+        ID3D12Resource_Unmap(back, 0, &range);
+    }
+    else
+    {
+        copy_differ = ~0u;
+    }
+    range.End = (SIZE_T)(texels * 4ull);
+    if (SUCCEEDED(ID3D12Resource_Map(uav_back, 0, &range, (void **)&bytes)))
+    {
+        for (i = 0, base = 0; i < count; ++i)
+        {
+            for (y = 0; y < footprints[i].Footprint.Height; ++y)
+                for (x = 0; x < footprints[i].Footprint.Width; ++x)
+                    load_differ += ((const UINT32 *)bytes)[base + y * footprints[i].Footprint.Width + x]
+                            != linear_texel(x, y, i % shape->mips, i / shape->mips);
+            base += footprints[i].Footprint.Width * footprints[i].Footprint.Height;
+        }
+        range.End = 0;
+        ID3D12Resource_Unmap(uav_back, 0, &range);
+    }
+    else
+    {
+        load_differ = ~0u;
+    }
+    checkf(!copy_differ, "%severy subresource copies back as uploaded (%u of %u texels differ)", label, copy_differ,
+            texels);
+    checkf(!load_differ, "%sthe shader loads every texel of every subresource as uploaded (%u of %u differ)", label,
+            load_differ, texels);
+
+release:
+    if (list)
+        ID3D12GraphicsCommandList_Release(list);
+    if (allocator)
+        ID3D12CommandAllocator_Release(allocator);
+    if (pso)
+        ID3D12PipelineState_Release(pso);
+    if (rs)
+        ID3D12RootSignature_Release(rs);
+    if (views)
+        ID3D12DescriptorHeap_Release(views);
+    if (list && !done)
+    {
+        checkf(FALSE, "%sthe imported memory stays allocated: its work did not complete", label);
+        return LINEAR_LAYOUTS_FAIL;
+    }
+    if (upload)
+        ID3D12Resource_Release(upload);
+    if (back)
+        ID3D12Resource_Release(back);
+    if (uav)
+        ID3D12Resource_Release(uav);
+    if (uav_back)
+        ID3D12Resource_Release(uav_back);
+    {
+        unsigned int zero = 0, objects = 0;
+
+        objects += !!image;
+        if (image && !ID3D12Resource_Release(image))
+            ++zero;
+        objects += !!target.heap;
+        if (target.heap && !ID3D12Heap_Release(target.heap))
+            ++zero;
+        if (zero != objects)
+        {
+            checkf(FALSE, "%sthe imported memory stays allocated: %u of %u objects returned 0 from their final "
+                    "Release", label, zero, objects);
+            return LINEAR_LAYOUTS_FAIL;
+        }
+        if (target.memory)
+            ctx->free_memory(ctx->vk_device, target.memory, NULL);
+    }
+    return done && !copy_differ && !load_differ ? LINEAR_LAYOUTS_PASS : LINEAR_LAYOUTS_FAIL;
+}
+
+static enum linear_layouts_result linear_layouts(const BC250_VKD3D_ENGINE_FUNCS *funcs, ID3D12Device *device,
+        PFN_vkGetInstanceProcAddr gipa, ID3D12CommandQueue *given_queue, enum wait_mode mode, const char *tag)
+{
+    /* The first shape is V13's (one mip, one layer) through the V15 entries: an adapter that has no linear mips or
+     * arrays (NVIDIA) still runs the whole V15 path on it, so that a SKIP of the others is not the only result. */
+    static const struct linear_shape shapes[] =
+    {
+        {64, 64, 1, 1},
+        {64, 64, 7, 1},
+        {64, 64, 1, 4},
+        {64, 64, 7, 4},
+        {100, 60, 7, 1},
+    };
+    BC250_VKD3D_SUBRESOURCE_LAYOUT layouts[LINEAR_LAYOUTS_MAX];
+    PFN_vkGetPhysicalDeviceMemoryProperties get_memory_properties;
+    unsigned int failures_before = failures, i, skipped = 0;
+    BC250_VKD3D_LINEAR_IMAGE_CREATE create;
+    BC250_VKD3D_LINEAR_IMAGE_INFO info, v13;
+    D3D12_COMMAND_QUEUE_DESC queue_desc;
+    VkPhysicalDevice vk_physical_device;
+    ID3D12CommandQueue *queue = NULL;
+    D3D12_RESOURCE_DESC1 desc, bad;
+    PFN_vkGetDeviceProcAddr gdpa;
+    struct import_ctx ctx;
+    VkInstance vk_instance;
+    UINT32 family = ~0u;
+    BOOL zero;
+    HRESULT hr;
+
+    if (!funcs->QueryLinearImageLayouts || !funcs->CreateLinearPlacedResource2)
+    {
+        checkf(FALSE, "%sthe 1.11 entries are in the table", tag);
+        return LINEAR_LAYOUTS_FAIL;
+    }
+
+    /* Refusals that need no device support: the count, MipLevels 0, a chain longer than the extent's, the shape. */
+    memset(&desc, 0, sizeof(desc));
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.DepthOrArraySize = 4;
+    desc.MipLevels = 7;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    memset(&info, 0, sizeof(info));
+    info.Size = sizeof(info);
+    memset(&create, 0x5e, sizeof(create));
+    create.Size = sizeof(create);
+    memset(layouts, 0x5e, sizeof(layouts));
+    hr = funcs->QueryLinearImageLayouts(device, &desc, &info, &create, 27, layouts);
+    for (i = 0, zero = TRUE; i < 27; ++i)
+        zero &= !layouts[i].Offset && !layouts[i].Size && !layouts[i].RowPitch;
+    checkf(hr == E_INVALIDARG && zero && info.Size == sizeof(info) && !info.MemorySize
+            && create.Size == sizeof(create) && !create.VkFormat && !create.CreateFlags && !create.CreateUsage,
+            "%sQueryLinearImageLayouts with 27 layouts for 7 mips x 4 layers -> E_INVALIDARG, layouts, info and "
+            "create zero", tag);
+    checkf(funcs->QueryLinearImageLayouts(device, &desc, &info, &create, 28, NULL) == E_INVALIDARG
+            && funcs->QueryLinearImageLayouts(device, &desc, NULL, &create, 28, layouts) == E_INVALIDARG
+            && funcs->QueryLinearImageLayouts(device, &desc, &info, NULL, 28, layouts) == E_INVALIDARG
+            && funcs->QueryLinearImageLayouts(device, NULL, &info, &create, 28, layouts) == E_INVALIDARG
+            && funcs->QueryLinearImageLayouts(device, &desc, &info, &create, 0, layouts) == E_INVALIDARG,
+            "%sQueryLinearImageLayouts without layouts, info, create or description, or with no layout -> "
+            "E_INVALIDARG", tag);
+    create.Size = sizeof(create) - 4;
+    checkf(funcs->QueryLinearImageLayouts(device, &desc, &info, &create, 28, layouts) == E_INVALIDARG,
+            "%sQueryLinearImageLayouts with a create->Size below the structure -> E_INVALIDARG", tag);
+    create.Size = sizeof(create);
+    bad = desc;
+    bad.MipLevels = 0;
+    hr = funcs->QueryLinearImageLayouts(device, &bad, &info, &create, 4, layouts);
+    bad = desc;
+    bad.MipLevels = 8;
+    bad.DepthOrArraySize = 1;
+    checkf(hr == E_INVALIDARG
+            && funcs->QueryLinearImageLayouts(device, &bad, &info, &create, 8, layouts) == E_INVALIDARG,
+            "%sQueryLinearImageLayouts of MipLevels 0 or 8 mips on 64x64 -> E_INVALIDARG", tag);
+    bad = desc;
+    bad.SampleDesc.Count = 4;
+    bad.MipLevels = 1;
+    bad.DepthOrArraySize = 1;
+    hr = funcs->QueryLinearImageLayouts(device, &bad, &info, &create, 1, layouts);
+    bad = desc;
+    bad.Format = DXGI_FORMAT_D32_FLOAT;
+    bad.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    checkf(hr == E_INVALIDARG
+            && funcs->QueryLinearImageLayouts(device, &bad, &info, &create, 28, layouts) == E_INVALIDARG,
+            "%sQueryLinearImageLayouts of 4 samples or a depth image -> E_INVALIDARG", tag);
+    /* The additive rule: the V13 entries keep their shape. */
+    memset(&v13, 0, sizeof(v13));
+    v13.Size = sizeof(v13);
+    checkf(funcs->QueryLinearImage(device, &desc, &v13) == E_INVALIDARG,
+            "%sQueryLinearImage (V13) of 7 mips x 4 layers is still E_INVALIDARG", tag);
+
+    memset(&ctx, 0, sizeof(ctx));
+    hr = funcs->GetVulkanHandles(device, &vk_instance, &vk_physical_device, &ctx.vk_device, &family);
+    get_memory_properties = hr == S_OK ? (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(vk_instance,
+            "vkGetPhysicalDeviceMemoryProperties") : NULL;
+    gdpa = hr == S_OK ? (PFN_vkGetDeviceProcAddr)gipa(vk_instance, "vkGetDeviceProcAddr") : NULL;
+    if (!get_memory_properties || !gdpa)
+    {
+        checkf(FALSE, "%sGetVulkanHandles and the Vulkan entry points of the engine's instance (hr %08lx)", tag,
+                (unsigned long)hr);
+        return LINEAR_LAYOUTS_FAIL;
+    }
+    ctx.funcs = funcs;
+    ctx.device = device;
+    get_memory_properties(vk_physical_device, &ctx.memory_properties);
+    ctx.allocate_memory = (PFN_vkAllocateMemory)gdpa(ctx.vk_device, "vkAllocateMemory");
+    ctx.free_memory = (PFN_vkFreeMemory)gdpa(ctx.vk_device, "vkFreeMemory");
+    if (given_queue)
+    {
+        queue = given_queue;
+        ID3D12CommandQueue_AddRef(queue);
+    }
+    else
+    {
+        memset(&queue_desc, 0, sizeof(queue_desc));
+        queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12Device_CreateCommandQueue(device, &queue_desc, &IID_ID3D12CommandQueue, (void **)&queue);
+    }
+    if (!ctx.allocate_memory || !ctx.free_memory || !queue)
+    {
+        checkf(FALSE, "%svkAllocateMemory, vkFreeMemory and a DIRECT queue", tag);
+        if (queue)
+            ID3D12CommandQueue_Release(queue);
+        return LINEAR_LAYOUTS_FAIL;
+    }
+
+    for (i = 0; i < ARRAYSIZE(shapes); ++i)
+        skipped += linear_layouts_shape(funcs, device, &ctx, queue, mode, &shapes[i], tag) == LINEAR_LAYOUTS_SKIP;
+    ID3D12CommandQueue_Release(queue);
+
+    if (failures != failures_before)
+        return LINEAR_LAYOUTS_FAIL;
+    return skipped ? LINEAR_LAYOUTS_SKIP : LINEAR_LAYOUTS_PASS;
+}
+
 /* V11: QueryAdapterCaps against CheckFeatureSupport of a device made from the same CreateInfo. Every feature that
  * QueryAdapterCaps answers, with the inputs of each set: the SDK's up to OPTIONS21 and 56, 57, 61, and three that
  * vkd3d-proton's IDL has beyond the SDK (54, 64, 65, with its layouts). */
@@ -3273,6 +3805,7 @@ static void inline_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD3
     multiple_fence_waits(device);
     imported_memory(funcs, device, info.GetInstanceProcAddr, qa, WAIT_NULL_EVENT, "INLINE imported memory: ");
     linear_image(funcs, device, info.GetInstanceProcAddr, qa, WAIT_NULL_EVENT, "INLINE linear image: ");
+    linear_layouts(funcs, device, info.GetInstanceProcAddr, qa, WAIT_NULL_EVENT, "INLINE linear layouts: ");
 
     check(ID3D12CommandQueue_Release(qc) == 0 && !shell_queue_of(COOKIE(0xc0)), "queue C: final Release 0, unbound");
     check(ID3D12CommandQueue_Release(qb) == 0 && !shell_queue_of(COOKIE(0xb0)), "queue B: final Release 0, unbound");
@@ -3561,6 +4094,7 @@ static int threaded_suite(const BC250_VKD3D_ENGINE_FUNCS *funcs, const BC250_VKD
     compute_dispatch(device, NULL, WAIT_EVENT, "");
     imported_memory(funcs, device, info.GetInstanceProcAddr, NULL, WAIT_EVENT, "THREADED imported memory: ");
     linear_image(funcs, device, info.GetInstanceProcAddr, NULL, WAIT_EVENT, "THREADED linear image: ");
+    linear_layouts(funcs, device, info.GetInstanceProcAddr, NULL, WAIT_EVENT, "THREADED linear layouts: ");
 
     /* CreateCommandQueue is for INLINE devices only. */
     memset(&qdesc, 0, sizeof(qdesc));
@@ -3976,7 +4510,8 @@ int main(int argc, char **argv)
     ID3D12Device *device = NULL;
     UINT32 min_fl = 0xb000;
     HMODULE engine, driver;
-    BOOL inline_mode = FALSE, hang_mode = FALSE, abi_only = FALSE, tail_kept;
+    BOOL inline_mode = FALSE, hang_mode = FALSE, abi_only = FALSE, linear_mode = FALSE, tail_kept;
+    HRESULT hr;
     char full[MAX_PATH];
     unsigned int k;
     LUID luid;
@@ -3985,7 +4520,8 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         printf("usage: amdgpu_wddm_vkd3d_engine_test <amdgpu_wddm_vkd3d.dll> [adapter substring] [--icd <path>]"
-                " [--fl <hex>] [--abi-only | --inline | --hang | --diagnostics-only <new log file>]\n");
+                " [--fl <hex>] [--abi-only | --inline | --hang | --linear-layouts"
+                " | --diagnostics-only <new log file>]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -4002,6 +4538,8 @@ int main(int argc, char **argv)
             abi_only = TRUE;
         else if (!strcmp(argv[i], "--hang"))
             hang_mode = TRUE;
+        else if (!strcmp(argv[i], "--linear-layouts"))
+            linear_mode = TRUE;
         else if (!strcmp(argv[i], "--diagnostics-only") && i + 1 < argc)
             diagnostic_log = argv[++i];
         else if (argv[i][0] == '-')
@@ -4012,9 +4550,12 @@ int main(int argc, char **argv)
         else
             filter = argv[i];
     }
-    if ((inline_mode && hang_mode) || (abi_only && (inline_mode || hang_mode || diagnostic_log || icd || filter)))
+    if ((inline_mode + hang_mode + linear_mode > 1)
+            || (abi_only && (inline_mode || hang_mode || linear_mode || diagnostic_log || icd || filter))
+            || (linear_mode && diagnostic_log))
     {
-        printf("FAIL  --inline and --hang are separate runs; --abi-only cannot use GPU or diagnostic options\n");
+        printf("FAIL  --inline, --hang and --linear-layouts are separate runs; --abi-only cannot use GPU or "
+                "diagnostic options\n");
         return 2;
     }
     if (diagnostic_log)
@@ -4140,9 +4681,26 @@ int main(int argc, char **argv)
                 && funcs.CreateHeapFromMemory && funcs.MapHeap && funcs.UnmapHeap && funcs.QueryAdapterCaps
                 && funcs.QueryLinearImage && funcs.CreateLinearPlacedResource
                 && funcs.CreatePartialGraphicsLibrary && funcs.AddRefPartialGraphicsLibrary
-                && funcs.ReleasePartialGraphicsLibrary && funcs.CreateLinkedGraphicsPipeline,
-                "GetFuncs(1.%u) fills all entries and reports provider ABI", k);
+                && funcs.ReleasePartialGraphicsLibrary && funcs.CreateLinkedGraphicsPipeline
+                && (funcs.QueryLinearImageLayouts == NULL) == (k < 11)
+                && (funcs.CreateLinearPlacedResource2 == NULL) == (k < 11),
+                "GetFuncs(1.%u) fills the entries up to 1.%u, the 1.11 entries %s, and reports provider ABI", k, k,
+                k < 11 ? "NULL" : "set");
     }
+    /* A 1.10 shell's table ends before QueryLinearImageLayouts; the engine fills that much and no more. */
+    memset(&funcs, 0x5e, sizeof(funcs));
+    funcs.Size = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_10;
+    check(get_funcs(ABI_1_11, &funcs) == S_OK && funcs.CreateLinkedGraphicsPipeline,
+            "GetFuncs(1.11) with the 1.10 Size");
+    for (k = BC250_VKD3D_ENGINE_FUNCS_SIZE_1_10, tail_kept = TRUE; k < sizeof(funcs); ++k)
+        tail_kept &= ((const BYTE *)&funcs)[k] == 0x5e;
+    checkf(funcs.Size == BC250_VKD3D_ENGINE_FUNCS_SIZE_1_10 && tail_kept,
+            "GetFuncs(1.11) with the 1.10 Size (%u) writes nothing past it",
+            (unsigned int)BC250_VKD3D_ENGINE_FUNCS_SIZE_1_10);
+    memset(&funcs, 0, sizeof(funcs));
+    funcs.Size = sizeof(funcs);
+    check(get_funcs(ABI_1_11, &funcs) == S_OK && funcs.QueryLinearImageLayouts && funcs.CreateLinearPlacedResource2,
+            "GetFuncs(1.11) fills the 1.11 entries; the suites use this table");
     if (!funcs.CreateDevice || !funcs.CreateCommandQueue || !funcs.GetVulkanHandles || !funcs.CreateHeapFromMemory
             || !funcs.MapHeap || !funcs.UnmapHeap || !funcs.QueryAdapterCaps || !funcs.QueryLinearImage
             || !funcs.CreateLinearPlacedResource)
@@ -4236,6 +4794,27 @@ int main(int argc, char **argv)
 
     /* The Vulkan wrapper's driver; the THREADED suite puts the wrapper in front only where it says so. */
     vkw.gipa = gipa;
+    if (linear_mode)
+    {
+        enum linear_layouts_result result = LINEAR_LAYOUTS_FAIL;
+        static const char *const names[] = {"PASS", "SKIP", "FAIL"};
+
+        printf("mode: %u-byte CreateInfo, AbiVersion 1.1, THREADED, V15 linear layouts only\n",
+                (unsigned int)sizeof(info));
+        hr = funcs.CreateDevice(&info, &IID_ID3D12Device, (void **)&device);
+        checkf(SUCCEEDED(hr) && device, "CreateDevice on the adapter's LUID (hr %08lx)", (unsigned long)hr);
+        print_icd_modules();
+        if (SUCCEEDED(hr) && device)
+        {
+            result = linear_layouts(&funcs, device, info.GetInstanceProcAddr, NULL, WAIT_EVENT, "linear layouts: ");
+            check(ID3D12Device_Release(device) == 0, "device final Release returns 0");
+        }
+        if (failures)
+            result = LINEAR_LAYOUTS_FAIL;
+        /* A SKIP is not a PASS: it has an exit code of its own. */
+        printf("LINEAR-LAYOUTS %s (%u failures)\n", names[result], failures);
+        return result == LINEAR_LAYOUTS_PASS ? 0 : result == LINEAR_LAYOUTS_SKIP ? 4 : 1;
+    }
     if (inline_mode || hang_mode)
     {
         /* The Vulkan wrapper sits in front of the entry point. */

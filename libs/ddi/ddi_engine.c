@@ -643,6 +643,115 @@ static HRESULT APIENTRY bc250_create_linear_placed_resource(void *device, void *
     return hr;
 }
 
+/* V15: the layouts go through an array of libvkd3d's structure. layoutCount is bounded by D3D12's limits (15 mip
+ * levels, 2048 layers); libvkd3d checks it against the description. */
+#define BC250_MAX_LINEAR_LAYOUTS (15u * 2048u)
+
+static void bc250_subresource_layouts(const struct vkd3d_linear_subresource_layout *in, UINT32 count,
+        BC250_VKD3D_SUBRESOURCE_LAYOUT *out)
+{
+    UINT32 i;
+
+    for (i = 0; i < count; ++i)
+    {
+        out[i].Offset = in[i].offset;
+        out[i].Size = in[i].size;
+        out[i].RowPitch = in[i].row_pitch;
+        out[i].ArrayPitch = in[i].array_pitch;
+        out[i].DepthPitch = in[i].depth_pitch;
+    }
+}
+
+/* V15: on failure create keeps its Size and is zero otherwise, as info. */
+static bool bc250_reset_linear_image_create(BC250_VKD3D_LINEAR_IMAGE_CREATE *create)
+{
+    UINT32 size;
+
+    if (!create || create->Size < sizeof(*create))
+        return false;
+    size = create->Size;
+    memset(create, 0, sizeof(*create));
+    create->Size = size;
+    return true;
+}
+
+static void bc250_linear_image_create(const struct vkd3d_linear_image_info *in, BC250_VKD3D_LINEAR_IMAGE_CREATE *out)
+{
+    out->VkFormat = in->vk_format;
+    out->CreateFlags = in->create_flags;
+    out->CreateUsage = in->create_usage;
+}
+
+/* V15: the caller's layouts are zero on every failure, when they can be addressed. */
+static BOOL bc250_linear_layouts_valid(UINT32 count, BC250_VKD3D_SUBRESOURCE_LAYOUT *layouts)
+{
+    if (!layouts || !count || count > BC250_MAX_LINEAR_LAYOUTS)
+        return FALSE;
+    memset(layouts, 0, count * sizeof(*layouts));
+    return TRUE;
+}
+
+static HRESULT APIENTRY bc250_query_linear_image_layouts(void *device, const struct D3D12_RESOURCE_DESC1 *desc,
+        BC250_VKD3D_LINEAR_IMAGE_INFO *info, BC250_VKD3D_LINEAR_IMAGE_CREATE *create, UINT32 layout_count,
+        BC250_VKD3D_SUBRESOURCE_LAYOUT *layouts)
+{
+    struct vkd3d_linear_subresource_layout *image_layouts;
+    struct vkd3d_linear_image_info image;
+    bool info_valid, create_valid;
+    BOOL valid;
+    HRESULT hr;
+
+    valid = bc250_linear_layouts_valid(layout_count, layouts);
+    info_valid = bc250_reset_linear_image_info(info);
+    create_valid = bc250_reset_linear_image_create(create);
+    if (!info_valid || !create_valid || !device || !desc || !valid)
+        return E_INVALIDARG;
+    if (!(image_layouts = calloc(layout_count, sizeof(*image_layouts))))
+        return E_OUTOFMEMORY;
+    if (SUCCEEDED(hr = vkd3d_query_linear_image_layouts((ID3D12Device *)device, (const D3D12_RESOURCE_DESC1 *)desc,
+            &image, layout_count, image_layouts)))
+    {
+        bc250_linear_image_info(&image, info);
+        bc250_linear_image_create(&image, create);
+        bc250_subresource_layouts(image_layouts, layout_count, layouts);
+    }
+    free(image_layouts);
+    return hr;
+}
+
+static HRESULT APIENTRY bc250_create_linear_placed_resource2(void *device, void *heap, UINT64 heap_offset,
+        const struct D3D12_RESOURCE_DESC1 *desc, UINT32 initial_state,
+        const struct D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource,
+        BC250_VKD3D_LINEAR_IMAGE_INFO *info, BC250_VKD3D_LINEAR_IMAGE_CREATE *create, UINT32 layout_count,
+        BC250_VKD3D_SUBRESOURCE_LAYOUT *layouts)
+{
+    struct vkd3d_linear_subresource_layout *image_layouts;
+    struct vkd3d_linear_image_info image;
+    bool info_valid, create_valid;
+    BOOL valid;
+    HRESULT hr;
+
+    if (resource)
+        *resource = NULL;
+    valid = bc250_linear_layouts_valid(layout_count, layouts);
+    info_valid = bc250_reset_linear_image_info(info);
+    create_valid = bc250_reset_linear_image_create(create);
+    if (!info_valid || !create_valid || !device || !heap || !desc || !riid || !resource || !valid)
+        return E_INVALIDARG;
+    if (!(image_layouts = calloc(layout_count, sizeof(*image_layouts))))
+        return E_OUTOFMEMORY;
+    if (SUCCEEDED(hr = vkd3d_create_linear_placed_resource_layouts((ID3D12Device *)device, (ID3D12Heap *)heap,
+            heap_offset, (const D3D12_RESOURCE_DESC1 *)desc, (D3D12_RESOURCE_STATES)initial_state,
+            (const D3D12_CLEAR_VALUE *)optimized_clear_value, riid, resource, &image, layout_count, image_layouts)))
+    {
+        bc250_linear_image_info(&image, info);
+        bc250_linear_image_create(&image, create);
+        bc250_subresource_layouts(image_layouts, layout_count, layouts);
+    }
+    free(image_layouts);
+    return hr;
+}
+
 static HRESULT APIENTRY bc250_create_partial_graphics_library(void *device,
         const BC250_VKD3D_PARTIAL_GRAPHICS_DESC *desc, void **library)
 {
@@ -767,6 +876,11 @@ HRESULT APIENTRY Bc250Vkd3dEngineGetFuncs(UINT32 abiVersion, BC250_VKD3D_ENGINE_
         out.AddRefPartialGraphicsLibrary = bc250_add_ref_partial_graphics_library;
         out.ReleasePartialGraphicsLibrary = bc250_release_partial_graphics_library;
         out.CreateLinkedGraphicsPipeline = bc250_create_linked_graphics_pipeline;
+    }
+    if (minor >= 11)
+    {
+        out.QueryLinearImageLayouts = bc250_query_linear_image_layouts;
+        out.CreateLinearPlacedResource2 = bc250_create_linear_placed_resource2;
     }
     /* Fill at most Size bytes: a 1.0 structure ends before CreateCommandQueue, a 1.1 structure before
      * GetVulkanHandles, a 1.2 structure before QueryLinearImage, and a larger one keeps its zeroed tail. */

@@ -244,6 +244,10 @@ struct vkd3d_linear_image_info
     uint64_t memory_size;
     uint64_t memory_alignment;
     uint32_t memory_type_bits;
+    /* V15: the image's VkImageCreateInfo format, flags and usage. */
+    uint32_t vk_format;
+    uint32_t create_flags;
+    uint32_t create_usage;
 };
 
 /* What an image of desc would be, from an image that is created unbound and destroyed before the call returns.
@@ -256,6 +260,28 @@ HRESULT vkd3d_create_linear_placed_resource(ID3D12Device *device, ID3D12Heap *he
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
         const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID iid, void **resource,
         struct vkd3d_linear_image_info *info);
+
+/* Linear mip chains and arrays (amdgpu-wddm fork, engine ABI 1.11 QueryLinearImageLayouts and
+ * CreateLinearPlacedResource2; rule V15). The same as the two functions above, but the image may have mip levels
+ * and array layers, and layouts receives the VkSubresourceLayout of every subresource, layer-major then mip:
+ * layouts[layer * desc->MipLevels + mip]. layout_count must be desc->MipLevels * desc->DepthOrArraySize, and
+ * desc->MipLevels must not be 0; otherwise E_INVALIDARG. info->vk_format, create_flags and create_usage are those of
+ * the image's VkImageCreateInfo. On failure info and the layouts are zero. */
+struct vkd3d_linear_subresource_layout
+{
+    uint64_t offset;
+    uint64_t size;
+    uint64_t row_pitch;
+    uint64_t array_pitch;
+    uint64_t depth_pitch;
+};
+
+HRESULT vkd3d_query_linear_image_layouts(ID3D12Device *device, const D3D12_RESOURCE_DESC1 *desc,
+        struct vkd3d_linear_image_info *info, uint32_t layout_count, struct vkd3d_linear_subresource_layout *layouts);
+HRESULT vkd3d_create_linear_placed_resource_layouts(ID3D12Device *device, ID3D12Heap *heap, UINT64 heap_offset,
+        const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+        const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID iid, void **resource,
+        struct vkd3d_linear_image_info *info, uint32_t layout_count, struct vkd3d_linear_subresource_layout *layouts);
 
 ULONG vkd3d_resource_decref(ID3D12Resource *resource);
 ULONG vkd3d_resource_incref(ID3D12Resource *resource);
