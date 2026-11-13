@@ -2139,8 +2139,19 @@ static UINT32 linear_texel(UINT x, UINT y, UINT mip, UINT layer)
     return (x & 0xffu) | ((y & 0xffu) << 8) | ((mip | (layer << 4)) << 16) | ((0xa5u ^ ((x + y) & 0xffu)) << 24);
 }
 
+/* The bytes that the texels of subresource i occupy from its offset: RowPitch for each row but the last, and the
+ * texels of the last row. This is the extent that the check below uses, not Size: Vulkan defines VkSubresourceLayout.size as the size of the subresource, but RADV gives
+ * the size of the whole layer for every mip of a GFX9 or later image (radv_GetImageSubresourceLayout2), so Size has
+ * two meanings (bc250_vkd3d_engine.h, V15, Layouts). Size must still cover the rows, which both meanings do. */
+static UINT64 linear_rows_extent(const struct linear_shape *shape, const BC250_VKD3D_SUBRESOURCE_LAYOUT *l, UINT i)
+{
+    UINT mip = i % shape->mips;
+
+    return l->RowPitch * (max(1u, shape->height >> mip) - 1) + max(1u, shape->width >> mip) * 4u;
+}
+
 /* The layouts of one image: every row of each subresource fits, the subresources do not overlap and the memory
- * holds them. Prints every layout. */
+ * holds them, by the extent of the rows. Prints every layout when tag is not NULL. */
 static BOOL linear_layouts_sane(const struct linear_shape *shape, const BC250_VKD3D_LINEAR_IMAGE_INFO *info,
         const BC250_VKD3D_SUBRESOURCE_LAYOUT *layouts, const char *tag)
 {
@@ -2151,20 +2162,72 @@ static BOOL linear_layouts_sane(const struct linear_shape *shape, const BC250_VK
     {
         const BC250_VKD3D_SUBRESOURCE_LAYOUT *l = &layouts[i];
         UINT mip = i % shape->mips, layer = i / shape->mips;
-        UINT w = max(1u, shape->width >> mip), h = max(1u, shape->height >> mip);
+        UINT w = max(1u, shape->width >> mip);
+        UINT64 extent = linear_rows_extent(shape, l, i);
 
-        printf("%s%ux%u mips %u layers %u: subresource mip %u layer %u offset %llu size %llu row pitch %llu "
-                "array pitch %llu depth pitch %llu\n", tag, shape->width, shape->height, shape->mips, shape->layers,
-                mip, layer, (unsigned long long)l->Offset, (unsigned long long)l->Size,
-                (unsigned long long)l->RowPitch, (unsigned long long)l->ArrayPitch, (unsigned long long)l->DepthPitch);
-        ok &= l->RowPitch >= w * 4u && l->Size >= l->RowPitch * (h - 1) + w * 4u
-                && l->Offset + l->Size <= info->MemorySize;
+        if (tag)
+            printf("%s%ux%u mips %u layers %u: subresource mip %u layer %u offset %llu size %llu row pitch %llu "
+                    "array pitch %llu depth pitch %llu, rows end at %llu\n", tag, shape->width, shape->height,
+                    shape->mips, shape->layers, mip, layer, (unsigned long long)l->Offset,
+                    (unsigned long long)l->Size, (unsigned long long)l->RowPitch, (unsigned long long)l->ArrayPitch,
+                    (unsigned long long)l->DepthPitch, (unsigned long long)(l->Offset + extent));
+        ok &= l->RowPitch >= w * 4u && l->Size >= extent && l->Offset + extent <= info->MemorySize;
         for (j = 0; j < i; ++j)
-            ok &= l->Offset >= layouts[j].Offset + layouts[j].Size || layouts[j].Offset >= l->Offset + l->Size;
+            ok &= l->Offset >= layouts[j].Offset + linear_rows_extent(shape, &layouts[j], j)
+                    || layouts[j].Offset >= l->Offset + extent;
     }
     ok &= layouts[0].Offset == info->Offset && layouts[0].RowPitch == info->RowPitch
             && layouts[0].Size == info->LayoutSize;
     return ok;
+}
+
+/* The check above on the numbers RADV gave on unit A (2026-11-13, 64x64 R8G8B8A8_UINT, 7 mips, 1 layer): the rows
+ * tile the 32512 bytes, and Size is 32512 for every mip. Then the same layouts with each Size the rows of its mip,
+ * the value Vulkan defines. Both pass. Two negative controls: an overlap of one row, and a mip past the memory. */
+static void linear_layouts_vector(const char *tag)
+{
+    static const struct linear_shape shape = {64, 64, 7, 1};
+    static const UINT64 offsets[7] = {16128, 7936, 3840, 1792, 768, 256, 0};
+    BC250_VKD3D_SUBRESOURCE_LAYOUT radv[7], spec[7], bad[7];
+    BC250_VKD3D_LINEAR_IMAGE_INFO info;
+    UINT i;
+
+    memset(&info, 0, sizeof(info));
+    info.Size = sizeof(info);
+    info.MemorySize = 32512;
+    info.Offset = 16128;
+    info.RowPitch = 256;
+    info.LayoutSize = 32512;
+    for (i = 0; i < 7; ++i)
+    {
+        memset(&radv[i], 0, sizeof(radv[i]));
+        radv[i].Offset = offsets[i];
+        radv[i].Size = 32512;
+        radv[i].RowPitch = 256;
+        radv[i].ArrayPitch = 32512;
+        radv[i].DepthPitch = 32512;
+        spec[i] = radv[i];
+        spec[i].Size = 256u * max(1u, 64u >> i);
+    }
+    checkf(linear_layouts_sane(&shape, &info, radv, NULL),
+            "%slinear layouts vector: RADV's 64x64 7-mip layouts, Size the layer, pass by the rows", tag);
+    info.LayoutSize = spec[0].Size;
+    checkf(linear_layouts_sane(&shape, &info, spec, NULL),
+            "%slinear layouts vector: the same layouts with Size the mip's rows pass", tag);
+    info.LayoutSize = 32512;
+    memcpy(bad, radv, sizeof(bad));
+    bad[1].Offset += 256;
+    checkf(!linear_layouts_sane(&shape, &info, bad, NULL),
+            "%slinear layouts vector: mip 1 one row into mip 0 is refused", tag);
+    memcpy(bad, radv, sizeof(bad));
+    info.MemorySize = 32512 - 256;
+    checkf(!linear_layouts_sane(&shape, &info, bad, NULL),
+            "%slinear layouts vector: memory one row short of mip 0 is refused", tag);
+    info.MemorySize = 32512;
+    memcpy(bad, spec, sizeof(bad));
+    bad[3].Size = 256u * 7u;
+    checkf(!linear_layouts_sane(&shape, &info, bad, NULL),
+            "%slinear layouts vector: a Size short of the rows of mip 3 is refused", tag);
 }
 
 static enum linear_layouts_result linear_layouts_shape(const BC250_VKD3D_ENGINE_FUNCS *funcs,
@@ -2524,6 +2587,7 @@ static enum linear_layouts_result linear_layouts(const BC250_VKD3D_ENGINE_FUNCS 
     BOOL zero;
     HRESULT hr;
 
+    linear_layouts_vector(tag);
     if (!funcs->QueryLinearImageLayouts || !funcs->CreateLinearPlacedResource2)
     {
         checkf(FALSE, "%sthe 1.11 entries are in the table", tag);

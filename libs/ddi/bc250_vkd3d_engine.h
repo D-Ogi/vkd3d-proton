@@ -345,6 +345,12 @@
  *         + mip] receives the VkSubresourceLayout of (mip, layer) of the colour aspect: layer-major, then mip, the
  *         order of Bc250SharedResourceLayoutAdd. info is V13's structure: subresource (0, 0) and the image's
  *         memory requirements. On failure info keeps its Size and is zero otherwise, and the layouts are zero.
+ *       - Size. Each layout's Size is the size that the ICD gives, without a change. Vulkan defines it as the size
+ *         of the subresource, but RADV gives the size of the whole layer for every mip of a GFX9 or later image
+ *         (radv_GetImageSubresourceLayout2), so Size can be larger than the subresource and pass the end of the
+ *         memory. Do not use Size as the extent of a subresource. The extent of (mip, layer) is RowPitch for each
+ *         row but the last, plus the texels of the last row, from Offset. Size is never less than that extent.
+ *         Bc250SharedResourceLayoutAdd does not hash Size: it hashes Offset, RowPitch, ArrayPitch and DepthPitch.
  *       - Create facts. create receives the VkFormat, the VkImageCreateFlags and the VkImageUsageFlags of the
  *         VkImageCreateInfo of the image. A shell that opens a texture of another engine compares them with the
  *         creator's record (S26R). On failure create keeps its Size and is zero otherwise.
